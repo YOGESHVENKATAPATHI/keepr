@@ -29,7 +29,7 @@ class FolderUploadService {
         } else {
           logicalPath = "$safeParent/${file.name}";
         }
-        
+
         final sizeMb = file.size / (1024 * 1024);
 
         // Fetch token specifically for this file size
@@ -222,9 +222,9 @@ class FolderUploadService {
         String relativePath = p.relative(file.path, from: dir.path);
         // Correctslashes for Dropbox (forward slash)
         String dropboxPath = "/$relativePath".replaceAll(r'\', '/');
-        
+
         final sizeMb = (await file.length()) / (1024 * 1024);
-        
+
         // Dynamic Token Allocation per file
         String dropboxToken = await _getBestStorageToken(sizeMb: sizeMb);
 
@@ -274,7 +274,8 @@ class FolderUploadService {
       final data = jsonDecode(response.body);
       return data['access_token'];
     } else {
-      throw Exception('Failed to get eligible storage account: ${response.body}');
+      throw Exception(
+          'Failed to get eligible storage account: ${response.body}');
     }
   }
 

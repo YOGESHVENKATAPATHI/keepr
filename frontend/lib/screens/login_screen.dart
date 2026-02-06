@@ -23,13 +23,13 @@ class _LoginScreenState extends State<LoginScreen> {
   // Services
   // NOTE: In production, configure these via environment variables or a DI container
   final _uploadService =
-      FolderUploadService(backendUrl: 'http://localhost:3000');
+      FolderUploadService(backendUrl: 'https://keepr-gold.vercel.app');
   late final ApiService _api;
 
   @override
   void initState() {
     super.initState();
-    _api = ApiService(backendBase: 'http://localhost:3000');
+    _api = ApiService(backendBase: 'https://keepr-gold.vercel.app');
   }
 
   @override
