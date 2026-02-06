@@ -1,0 +1,369 @@
+import 'dart:ui';
+import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:percent_indicator/percent_indicator.dart';
+
+import '../services/folder_upload_service.dart';
+
+class UploadDialog extends StatefulWidget {
+  final FolderUploadService uploader;
+  final String userId;
+  final String currentPath;
+  final VoidCallback onUploadComplete;
+
+  const UploadDialog({
+    super.key,
+    required this.uploader,
+    required this.userId,
+    required this.currentPath,
+    required this.onUploadComplete,
+  });
+
+  @override
+  State<UploadDialog> createState() => _UploadDialogState();
+}
+
+class _UploadTask {
+  final PlatformFile file;
+  double progress = 0.0;
+  bool isCompleted = false;
+  bool isFailed = false;
+  String? errorMessage;
+
+  _UploadTask(this.file);
+}
+
+class _UploadDialogState extends State<UploadDialog> {
+  final List<_UploadTask> _tasks = [];
+  bool _isPicking = false;
+
+  Future<void> _pickFiles() async {
+    if (_isPicking) return;
+    _isPicking = true;
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        allowMultiple: true,
+        withReadStream: true,
+      );
+
+      if (result != null) {
+        final newTasks = result.files.map((f) => _UploadTask(f)).toList();
+        setState(() {
+          _tasks.addAll(newTasks);
+        });
+
+        _startUploads(newTasks);
+      }
+    } finally {
+      if (mounted) setState(() => _isPicking = false);
+    }
+  }
+
+  Future<void> _startUploads(List<_UploadTask> newTasks) async {
+    for (final task in newTasks) {
+      await _processTask(task);
+    }
+    widget.onUploadComplete();
+  }
+
+  Future<void> _processTask(_UploadTask task) async {
+    try {
+      await widget.uploader
+          .uploadWebFiles([task.file], widget.userId, widget.currentPath,
+              onFileProgress: (name, prog) {
+        if (mounted) {
+          setState(() {
+            task.progress = prog;
+          });
+        }
+      });
+      if (mounted) {
+        setState(() {
+          task.progress = 1.0;
+          task.isCompleted = true;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          task.isFailed = true;
+          task.errorMessage = e.toString();
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final width = MediaQuery.of(context).size.width;
+    final isMobile = width < 600;
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      elevation: 0,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+          child: Container(
+            width: isMobile ? width * 0.95 : 600,
+            height: 550,
+            decoration: BoxDecoration(
+                color: const Color(0xFF1E293B).withOpacity(0.85),
+                borderRadius: BorderRadius.circular(20),
+                border:
+                    Border.all(color: Colors.white.withOpacity(0.1), width: 1),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.3),
+                    blurRadius: 20,
+                    spreadRadius: 5,
+                  )
+                ]),
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              children: [
+                // Header
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text("Select Files",
+                        style: GoogleFonts.zillaSlab(
+                            color: Colors.white,
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold)),
+                    InkWell(
+                      onTap: () => Navigator.pop(context),
+                      child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.1),
+                              shape: BoxShape.circle),
+                          child: const Icon(Icons.close,
+                              color: Colors.white, size: 20)),
+                    )
+                  ],
+                ),
+                const SizedBox(height: 24),
+
+                // Dashed Upload Area
+                GestureDetector(
+                  onTap: _pickFiles,
+                  child: CustomPaint(
+                    painter: _DashedBorderPainter(
+                        color: const Color(0xFF6366F1), strokeWidth: 2, gap: 5),
+                    child: Container(
+                      width: double.infinity,
+                      height: 140,
+                      decoration: BoxDecoration(
+                          color: const Color(0xFF6366F1).withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(16)),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF6366F1).withOpacity(0.2),
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(Icons.cloud_upload_outlined,
+                                color: Color(0xFF818CF8), size: 32),
+                          ),
+                          const SizedBox(height: 12),
+                          RichText(
+                              text: TextSpan(children: [
+                            TextSpan(
+                                text: "Click here",
+                                style: GoogleFonts.inter(
+                                    color: const Color(0xFF818CF8),
+                                    fontWeight: FontWeight.bold)),
+                            TextSpan(
+                                text: " to upload your file.",
+                                style: GoogleFonts.inter(color: Colors.white70))
+                          ])),
+                          const SizedBox(height: 6),
+                          Text("Supported Format: Any (max 1GB)",
+                              style: GoogleFonts.inter(
+                                  color: Colors.white24, fontSize: 11))
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 24),
+
+                // File List
+                Expanded(
+                  child: _tasks.isEmpty
+                      ? Center(
+                          child: Text("No files waiting.",
+                              style: GoogleFonts.inter(color: Colors.white12)))
+                      : ListView.separated(
+                          itemCount: _tasks.length,
+                          separatorBuilder: (_, __) =>
+                              const SizedBox(height: 12),
+                          itemBuilder: (ctx, i) => _buildTaskItem(_tasks[i]),
+                        ),
+                )
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTaskItem(_UploadTask task) {
+    // Safety check for size > 0
+    final sizeBytes = task.file.size > 0 ? task.file.size : 1;
+    final sizeMb = sizeBytes / (1024 * 1024);
+
+    // Calculate precise uploaded amounts
+    final uploadedBytes = (sizeBytes * task.progress).round();
+    final double uploadedMb = uploadedBytes / (1024 * 1024);
+
+    // Status Logic
+    Color barColor = const Color(0xFF6366F1); // Indigo
+    IconData statusIcon = Icons.upload_file;
+    Color iconColor = const Color(0xFF818CF8);
+    Color loadingBg = Colors.white.withOpacity(0.05);
+
+    if (task.isFailed) {
+      barColor = Colors.redAccent;
+      statusIcon = Icons.error_outline;
+      iconColor = Colors.redAccent;
+      loadingBg = Colors.redAccent.withOpacity(0.1);
+    } else if (task.isCompleted) {
+      barColor = const Color(0xFF10B981); // Emerald
+      statusIcon = Icons.check_circle;
+      iconColor = const Color(0xFF10B981);
+      loadingBg = const Color(0xFF10B981).withOpacity(0.1);
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.03),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(0.05)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                    color: loadingBg, borderRadius: BorderRadius.circular(10)),
+                child: Icon(statusIcon, color: iconColor, size: 20),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      task.file.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.inter(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13),
+                    ),
+                    const SizedBox(height: 4),
+                    // Progress Bar
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(2),
+                      child: LinearProgressIndicator(
+                        value: task.progress > 1
+                            ? 1
+                            : (task.progress < 0 ? 0 : task.progress),
+                        minHeight: 4,
+                        backgroundColor: Colors.white10,
+                        valueColor: AlwaysStoppedAnimation(barColor),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              if (task.isCompleted)
+                const Icon(Icons.check, color: Color(0xFF10B981), size: 18)
+              else if (task.isFailed)
+                Icon(Icons.refresh,
+                    color: Colors.white54, size: 18) // Retry placeholder
+              else
+                Text("${(task.progress * 100).toStringAsFixed(0)}%",
+                    style: GoogleFonts.inter(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold))
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                  task.isFailed
+                      ? "Error: ${task.errorMessage ?? 'Unknown'}"
+                      : (task.isCompleted
+                          ? "Upload Successful!"
+                          : "${uploadedMb.toStringAsFixed(2)} MB / ${sizeMb.toStringAsFixed(2)} MB"),
+                  style: GoogleFonts.inter(
+                      color: task.isFailed ? Colors.redAccent : Colors.white38,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w500)),
+            ],
+          )
+        ],
+      ),
+    );
+  }
+}
+
+class _DashedBorderPainter extends CustomPainter {
+  final Color color;
+  final double strokeWidth;
+  final double gap;
+
+  _DashedBorderPainter(
+      {required this.color, this.strokeWidth = 1.0, this.gap = 5.0});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint paint = Paint()
+      ..color = color
+      ..strokeWidth = strokeWidth
+      ..style = PaintingStyle.stroke;
+
+    final Path path = Path()
+      ..addRRect(RRect.fromRectAndRadius(
+          Rect.fromLTWH(0, 0, size.width, size.height),
+          const Radius.circular(16)));
+
+    Path dashPath = Path();
+    double dashWidth = 10.0;
+    double dashSpace = gap;
+    double distance = 0.0;
+    for (PathMetric pathMetric in path.computeMetrics()) {
+      while (distance < pathMetric.length) {
+        dashPath.addPath(
+          pathMetric.extractPath(distance, distance + dashWidth),
+          Offset.zero,
+        );
+        distance += dashWidth;
+        distance += dashSpace;
+      }
+    }
+    canvas.drawPath(dashPath, paint);
+  }
+
+  @override
+  bool shouldRepaint(CustomPainter oldDelegate) => false;
+}
