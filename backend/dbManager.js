@@ -174,6 +174,9 @@ async function getFittestDB() {
             try {
                 const workerClient = await tryConnectWithRetries(shard.connection_string, 2);
                 console.log(`[DB] Connected to Worker DB (shard id=${shard.id})`);
+                // Attach shard info to client for usage tracking
+                workerClient._shardId = shard.id;
+                workerClient._connectionString = shard.connection_string;
                 return workerClient;
             } catch (e) {
                 console.warn(`[DB] Failed to connect to shard ${shard.id}, trying next...`);
@@ -246,10 +249,22 @@ async function getAllWorkerDBs() {
  * Updates the usage stats for a specific shard (simplified estimation)
  */
 async function updateShardUsage(connectionString, sizeDeltaMB) {
+    if (!connectionString) return;
     const masterClient = new Client({ connectionString: MASTER_DB_URL });
     try {
-        await masterClient.connect();
-        await masterClient.query(`
+        // Must use tryConnect logic if simple Client fails with SSL, but simplified here for generic helper
+        // Re-using tryConnectWithRetries logic would be better but circular dep risk?
+        // No, we are in dbManager.
+        
+        // We really should use tryConnectWithRetries for the master client too
+        // But for update usage (fire and forget), we can implement a lighter version or just use the exported tryConnect
+    } catch (e) {/* */}
+
+    // Use proper connection
+    let client = null;
+    try {
+        client = await tryConnectWithRetries(MASTER_DB_URL, 2);
+        await client.query(`
             UPDATE db_shards 
             SET current_usage_mb = current_usage_mb + $1 
             WHERE connection_string = $2
@@ -257,7 +272,23 @@ async function updateShardUsage(connectionString, sizeDeltaMB) {
     } catch (err) {
         console.error("Failed to update shard usage:", err);
     } finally {
-        await masterClient.end();
+        if (client) await client.end();
+    }
+}
+
+async function updateStorageShardUsage(shardId, sizeDeltaMB) {
+    let client = null;
+    try {
+        client = await tryConnectWithRetries(MASTER_DB_URL, 2);
+        await client.query(`
+            UPDATE storage_shards 
+            SET current_usage_mb = current_usage_mb + $1 
+            WHERE id = $2
+        `, [sizeDeltaMB, shardId]);
+    } catch (err) {
+        console.error("Failed to update storage shard usage:", err);
+    } finally {
+        if (client) await client.end();
     }
 }
 
@@ -266,7 +297,10 @@ async function getAllActiveStorageShards() {
     try {
         client = await tryConnectWithRetries(MASTER_DB_URL);
         const res = await client.query(`
-            SELECT * FROM storage_shards WHERE is_active = TRUE ORDER BY current_usage_mb ASC
+            SELECT * FROM storage_shards 
+            WHERE is_active = TRUE 
+              AND current_usage_mb < max_capacity_mb
+            ORDER BY current_usage_mb ASC
         `);
         return res.rows;
     } catch (e) {
@@ -283,6 +317,7 @@ module.exports = {
     getAllWorkerDBs,
     getAllActiveStorageShards,
     updateShardUsage,
+    updateStorageShardUsage,
     tryConnect: tryConnectWithRetries, // Export as generic helper
     MASTER_DB_URL
 };

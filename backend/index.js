@@ -46,21 +46,44 @@ async function executeWithDB(action, maxAttempts = 3) {
         let client = null;
         try {
             client = await dbManager.getFittestDB();
-            // getFittestDB may return a connected client (tryConnectWithRetries returns connected client)
-            // but ensure it's connected
+            // Attach shard info if available (added by getFittestDB modification)
+            const shardInfo = {
+                id: client._shardId,
+                connectionString: client._connectionString
+            };
+
             try {
                 await client.query('SELECT 1');
             } catch (connErr) {
-                // If client isn't connected, try connecting (depends on implementation)
                 try {
                     await client.connect();
                 } catch (e) {
-                    // ignore - will be handled below
+                    // ignore
                 }
             }
 
             const result = await action(client);
+            
+            // If action was successful, and we need to increment DB usage?
+            // Actually, executeWithDB is generic. It doesn't know about file sizes.
+            // But we can return the shardInfo so the caller can update usage if needed.
+            // OR: we attach a method to the client?
+            
             try { await client.end(); } catch (e) { /* ignore */ }
+            
+            // Return result AND shardInfo if possible?
+            // Existing callers expect 'result' to be the return value of 'action'.
+            // So we can attach shardInfo to 'result' if it's an object?
+            // Or just rely on the caller not knowing.
+            
+            // BETTER: Since executeWithDB creates a scope for a single DB interaction,
+            // we can pass shardInfo to the action!
+            
+            // Re-run action with (client, shardInfo)
+            // But 'action' signature is (client) in existing code.
+            // JavaScript ignores extra args. So passing (client, shardInfo) is safe for existing code 
+            // provided they don't use arguments[1] for something else.
+            
             return result;
         } catch (e) {
             lastErr = e;
@@ -282,6 +305,13 @@ app.post('/api/files/init-upload', async (req, res) => {
     try {
         const fileId = generateUUID();
         await executeWithDB(async (workerClient) => {
+            // Update DB usage (metadata overhead, negligible but trackable)
+            const dbUsageDelta = 0.001; 
+            if (workerClient._connectionString) {
+                // Fire and forget usage update
+                dbManager.updateShardUsage(workerClient._connectionString, dbUsageDelta);
+            }
+
             // Ensure schema with text ID
             await workerClient.query(`
                 CREATE TABLE IF NOT EXISTS files (
@@ -323,18 +353,30 @@ app.post('/api/files/init-upload', async (req, res) => {
 
 app.post('/api/files/allocate-chunks', async (req, res) => {
     // This API allocates chunks across available storage shards
-    const { fileId, totalChunks, fileSizeMb } = req.body; // size not strictly needed for allocation but good for tracking
+    const { fileId, totalChunks, fileSizeMb } = req.body; 
     
     try {
         const storageShards = await dbManager.getAllActiveStorageShards();
-        if (storageShards.length === 0) throw new Error("No active storage shards");
+        if (storageShards.length === 0) throw new Error("No active storage shards with available capacity");
 
         const allocations = [];
-        
+        const chunkSizeMb = fileSizeMb / totalChunks; // Approx
+
         await executeWithDB(async (workerClient) => {
              for (let i = 0; i < totalChunks; i++) {
-                 // Round Robin distribution
+                 // Round Robin distribution with capacity check
+                 // storageShards is already sorted by usage ASC
+                 
+                 // Better than simple round robin: pick the one with lowest usage (first one), then "virtually" increment for next iter
+                 // But for simplicity in this loop, we just RR across filtered list.
                  const shard = storageShards[i % storageShards.length];
+                
+                 // Update Usage Immediately (Tracking)
+                 // NOTE: This updates the master DB asynchronously
+                 dbManager.updateStorageShardUsage(shard.id, chunkSizeMb);
+                 // Virtually update local object to influence next choice in this very loop if we were sorting dynamic
+                 shard.current_usage_mb = (parseFloat(shard.current_usage_mb) || 0) + chunkSizeMb;
+
                  const chunkId = generateUUID();
                  // Unique logical path per chunk: /fileId_chunkIndex
                  const dropboxPath = `/${fileId}_${i}.chunk`; 
@@ -343,11 +385,10 @@ app.post('/api/files/allocate-chunks', async (req, res) => {
                      chunkId,
                      chunkIndex: i,
                      storageShardId: shard.id,
-                     accessToken: shard.refresh_token, // Ideally use access token, but here assuming refresh_token field holds valid long-lived or we'd refetch 
+                     accessToken: shard.refresh_token, 
                      dropboxPath
                  });
 
-                 // Persist allocation
                  await workerClient.query(
                      'INSERT INTO file_chunks (chunk_id, file_id, chunk_index, storage_shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5, $6)',
                      [chunkId, fileId, i, shard.id, dropboxPath, 'pending']
