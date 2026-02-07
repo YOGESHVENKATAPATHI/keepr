@@ -1,4 +1,7 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
+import 'dart:async';
+import 'package:universal_html/html.dart' as html;
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -29,11 +32,18 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
   String currentPath = '/';
   List<dynamic> items = [];
   bool loading = false;
+  final StreamController<double> _downloadProgressController = StreamController<double>.broadcast();
 
   @override
   void initState() {
     super.initState();
     _refresh();
+  }
+
+  @override
+  void dispose() {
+    _downloadProgressController.close();
+    super.dispose();
   }
 
   Future<void> _refresh() async {
@@ -117,27 +127,75 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     final dropboxPath = item['dropbox_path'] ?? item['path'];
     final name = item['name'];
 
+
     // Check for distributed file
     if (dropboxPath == 'distributed' && item['file_id_ref'] != null) {
+      // Show progress dialog
+      showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) {
+            return StatefulBuilder(builder: (context, setState) {
+              return StreamBuilder<double>(
+                  stream: _downloadProgressController.stream,
+                  initialData: 0.0,
+                  builder: (context, snapshot) {
+                    final p = snapshot.data ?? 0.0;
+                    return AlertDialog(
+                      backgroundColor: KeeprTheme.surface,
+                      title: Text("Downloading...",
+                          style: GoogleFonts.inter(color: Colors.white)),
+                      content: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          LinearProgressIndicator(
+                              value: p,
+                              backgroundColor: Colors.white10,
+                              color: KeeprTheme.primary),
+                          const SizedBox(height: 10),
+                          Text("${(p * 100).toStringAsFixed(1)}%",
+                              style: GoogleFonts.inter(color: Colors.white70))
+                        ],
+                      ),
+                    );
+                  });
+            });
+          });
+
       try {
-        _showSnack('Downloading distributed file (Merging chunks)...');
-        final bytes = await widget.uploader
-            .downloadDistributedFile(item['file_id_ref'], onProgress: (p) {
-          // Optional: Show percent
+        double sizeMb =
+            double.tryParse(item['size_mb']?.toString() ?? '0') ?? 0;
+
+        final bytes = await widget.uploader.downloadDistributedFile(
+            item['file_id_ref'], sizeMb, onProgress: (p) {
+          if (!_downloadProgressController.isClosed)
+            _downloadProgressController.add(p);
         });
+        
+        Navigator.pop(context); // Close dialog
 
-        // Prompt save
-        String? savePath = await FilePicker.platform.saveFile(
-          dialogTitle: 'Save $name',
-          fileName: name,
-        );
-
-        if (savePath != null) {
-          final f = File(savePath);
-          await f.writeAsBytes(bytes);
-          _showSnack('Saved to $savePath');
+        if (kIsWeb) {
+          final blob = html.Blob([bytes]);
+          final url = html.Url.createObjectUrlFromBlob(blob);
+          final anchor = html.AnchorElement(href: url)
+            ..setAttribute("download", name)
+            ..click();
+          html.Url.revokeObjectUrl(url);
+          _showSnack('Download started');
         } else {
-          _showSnack('Save cancelled');
+          // Prompt save
+          String? savePath = await FilePicker.platform.saveFile(
+            dialogTitle: 'Save $name',
+            fileName: name,
+          );
+
+          if (savePath != null) {
+            final f = File(savePath);
+            await f.writeAsBytes(bytes);
+            _showSnack('Saved to $savePath');
+          } else {
+            _showSnack('Save cancelled');
+          }
         }
       } catch (e) {
         _showSnack('Distributed download failed: $e', isError: true);

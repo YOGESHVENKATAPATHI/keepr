@@ -197,7 +197,7 @@ class FolderUploadService {
   }
 
   // --- Distributed Download Logic ---
-  Future<List<int>> downloadDistributedFile(String fileIdRef,
+  Future<List<int>> downloadDistributedFile(String fileIdRef, double totalSizeMb,
       {Function(double)? onProgress}) async {
     // 1. Get Chunk Info
     final infoResp = await http.post(
@@ -209,10 +209,28 @@ class FolderUploadService {
 
     final data = jsonDecode(infoResp.body);
     final chunks = (data['chunks'] as List).cast<Map<String, dynamic>>();
+    
+    // Deduplicate chunks locally just in case backend sends duplicates
+    final uniqueChunks = <int, Map<String, dynamic>>{};
+    for (var c in chunks) {
+      uniqueChunks[c['index']] = c;
+    }
+    final sortedUnique = uniqueChunks.values.toList()
+      ..sort((a, b) => (a['index'] as int).compareTo(b['index'] as int));
+
+    // Determine max index to size the list correctly
+    // If indices are 0,1,2,3 -> max is 3, size is 4.
+    int maxIndex = -1;
+    for (var c in sortedUnique) {
+      int idx = c['index'];
+      if (idx > maxIndex) maxIndex = idx;
+    }
 
     // 2. Download Chunks (Parallel)
-    final List<List<int>> parts = List.filled(chunks.length, []);
-    int completed = 0;
+    final List<List<int>> parts = List.filled(maxIndex + 1, []);
+    final client = http.Client();
+    int totalBytesReceived = 0;
+    int expectedBytes = (totalSizeMb * 1024 * 1024).round(); // approx
 
     Future<void> fetchChunk(int index, String path, String token) async {
       final url = 'https://content.dropboxapi.com/2/files/download';
@@ -220,27 +238,44 @@ class FolderUploadService {
         'Authorization': 'Bearer $token',
         'Dropbox-API-Arg': jsonEncode({"path": path}),
       };
-      final resp = await http.post(Uri.parse(url), headers: headers);
-      if (resp.statusCode != 200) throw Exception("Chunk download failed");
+      
+      final request = http.Request('POST', Uri.parse(url));
+      request.headers.addAll(headers);
+      
+      final streamedResponse = await client.send(request);
+      if (streamedResponse.statusCode != 200) {
+        throw Exception("Chunk download failed: ${streamedResponse.reasonPhrase}");
+      }
 
-      parts[index] = resp.bodyBytes;
-      completed++;
-      if (onProgress != null) onProgress(completed / chunks.length);
+      final List<int> chunkBytes = [];
+      await streamedResponse.stream.listen((data) {
+        chunkBytes.addAll(data);
+        totalBytesReceived += data.length;
+        if (onProgress != null && expectedBytes > 0) {
+           double p = totalBytesReceived / expectedBytes;
+           if (p > 1.0) p = 1.0;
+           onProgress(p);
+        }
+      }).asFuture();
+
+      parts[index] = chunkBytes;
     }
 
     int i = 0;
-    while (i < chunks.length) {
+    while (i < sortedUnique.length) {
       final batch = <Future>[];
-      for (int k = 0; k < 4 && i < chunks.length; k++) {
-        final c = chunks[i];
+      for (int k = 0; k < 4 && i < sortedUnique.length; k++) {
+        final c = sortedUnique[i];
         batch.add(fetchChunk(c['index'], c['path'], c['token']));
         i++;
       }
       await Future.wait(batch);
     }
+    client.close();
 
     // 3. Merge
-    return parts.expand((x) => x).toList();
+    // Filter any empty parts if gaps exist (shouldn't happen if logic is correct)
+    return parts.where((p) => p.isNotEmpty).expand((x) => x).toList();
   }
 
   // Helper to upload simple text content (for code editor)

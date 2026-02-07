@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
+import 'package:universal_html/html.dart' as html;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
@@ -276,21 +278,30 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
               if (_downloadUrl != null) {
                 await launchUrl(Uri.parse(_downloadUrl!));
               } else if (_fileBytes != null) {
-                try {
-                  final tempDir = await getTemporaryDirectory();
-                  final tempFile = File('${tempDir.path}/${widget.fileName}');
-                  await tempFile.writeAsBytes(_fileBytes!);
-                  final uri = Uri.file(tempFile.path);
-                  if (!await launchUrl(uri)) {
-                    if (context.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                          content: Text("Could not open file.")));
+                if (kIsWeb) {
+                  final blob = html.Blob([_fileBytes!]);
+                  final url = html.Url.createObjectUrlFromBlob(blob);
+                  final anchor = html.AnchorElement(href: url)
+                    ..setAttribute("download", widget.fileName)
+                    ..click();
+                  html.Url.revokeObjectUrl(url);
+                } else {
+                  try {
+                    final tempDir = await getTemporaryDirectory();
+                    final tempFile = File('${tempDir.path}/${widget.fileName}');
+                    await tempFile.writeAsBytes(_fileBytes!);
+                    final uri = Uri.file(tempFile.path);
+                    if (!await launchUrl(uri)) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                            content: Text("Could not open file.")));
+                      }
                     }
-                  }
-                } catch (e) {
-                  if (context.mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text("Error: $e")));
+                  } catch (e) {
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text("Error: $e")));
+                    }
                   }
                 }
               }
