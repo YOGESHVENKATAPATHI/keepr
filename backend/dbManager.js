@@ -318,6 +318,31 @@ async function ensureWorkerSchema(client) {
                 created_at TIMESTAMP DEFAULT NOW()
             );
         `);
+        
+        // MIGRATION: Ensure columns exist if table was already there
+        try {
+            await client.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS status TEXT DEFAULT \'pending\'');
+            await client.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS parent_path TEXT');
+            await client.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS dropbox_path TEXT');
+            // Try to convert ID to TEXT if it's integer (Warning: might break sequences if used mixed)
+            // But since we are moving to UUIDs, we need TEXT. 
+            // This is a "best effort" migration for dev env.
+            await client.query('ALTER TABLE files ALTER COLUMN id TYPE TEXT');
+        } catch (e) {
+            console.warn("[DB] Migration warning (non-fatal):", e.message);
+        }
+
+        await client.query(`
+                CREATE TABLE IF NOT EXISTS file_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                chunk_index INT NOT NULL,
+                storage_shard_id INT NOT NULL,
+                dropbox_path TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        `);
         await client.query(`
                 CREATE TABLE IF NOT EXISTS file_chunks (
                 chunk_id TEXT PRIMARY KEY,
