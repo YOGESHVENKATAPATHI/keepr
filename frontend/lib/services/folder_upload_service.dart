@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
@@ -161,7 +162,10 @@ class FolderUploadService {
                 if (file.bytes != null) {
                     return file.bytes!.sublist(start, end);
                 }
-                if (file.path != null) {
+                
+                // On Web, path is not available and throws error if accessed.
+                // We rely on bytes being present for Web in this implementation.
+                if (!kIsWeb && file.path != null) {
                     // Fallback for Desktop if bytes not loaded
                     final f = File(file.path!);
                     final raf = await f.open();
@@ -172,6 +176,18 @@ class FolderUploadService {
                         await raf.close();
                     }
                 }
+                
+                if (kIsWeb && file.readStream != null) {
+                   // If bytes are null on web but we have a stream (large file), 
+                   // we can't easily seek a stream for parallel chunks without buffering.
+                   // For now, we throw. Ideally, we would read the stream linearly and buffer chunks, 
+                   // but 'chunkReader' interface expects random access (start, end).
+                   // To support streams, we would need to redesign uploadDistributedFile to consume stream sequentially.
+                   // OR: Buffer the needed chunk from stream (impossible if random access requested out of order).
+                   // Since allocations are processed in parallel batches, we might request chunks vaguely in order but not strictly.
+                   throw Exception("Large file stream upload on Web is not yet fully supported. Use files small enough for memory (<50MB) or switch to Desktop app.");
+                }
+
                 throw Exception("Cannot read file data: No bytes and no path (Stream not supported here)");
             }
         );
