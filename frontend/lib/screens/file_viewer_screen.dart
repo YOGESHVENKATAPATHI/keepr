@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
@@ -12,6 +13,7 @@ class FileViewerScreen extends StatefulWidget {
   final String fileName;
   final String path;
   final String dropboxPath;
+  final String? fileIdRef;
   final FolderUploadService uploader;
 
   const FileViewerScreen({
@@ -20,6 +22,7 @@ class FileViewerScreen extends StatefulWidget {
     required this.fileName,
     required this.path,
     required this.dropboxPath,
+    this.fileIdRef,
     required this.uploader,
   });
 
@@ -30,6 +33,7 @@ class FileViewerScreen extends StatefulWidget {
 class _FileViewerScreenState extends State<FileViewerScreen> {
   bool _loading = true;
   String? _downloadUrl;
+  List<int>? _fileBytes;
   String? _textContent;
   bool _saving = false;
   late TextEditingController _codeController;
@@ -49,17 +53,32 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
 
   Future<void> _init() async {
     try {
-      final url = await widget.uploader.getTemporaryLink(widget.dropboxPath);
-      setState(() {
-        _downloadUrl = url;
-      });
+      if (widget.dropboxPath == 'distributed' && widget.fileIdRef != null) {
+        // Distributed: Download bytes directly
+        final bytes =
+            await widget.uploader.downloadDistributedFile(widget.fileIdRef!);
+        setState(() {
+          _fileBytes = bytes;
+        });
 
-      if (_isCodeFile) {
-        // fetch content
-        final resp = await http.get(Uri.parse(url));
-        if (resp.statusCode == 200) {
-          _textContent = resp.body;
+        if (_isCodeFile) {
+          _textContent = utf8.decode(bytes);
           _codeController.text = _textContent!;
+        }
+      } else {
+        // Standard / Legacy
+        final url = await widget.uploader.getTemporaryLink(widget.dropboxPath);
+        setState(() {
+          _downloadUrl = url;
+        });
+
+        if (_isCodeFile) {
+          // fetch content
+          final resp = await http.get(Uri.parse(url));
+          if (resp.statusCode == 200) {
+            _textContent = resp.body;
+            _codeController.text = _textContent!;
+          }
         }
       }
     } catch (e) {
@@ -128,6 +147,12 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
     return widget.fileName.toLowerCase().endsWith('.pdf');
   }
 
+  Future<void> _saveLocal() async {
+    if (_fileBytes == null) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text("To save file, please use the 'Download' option in File Manager.")));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -150,12 +175,21 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
                   : Icon(Icons.save),
               tooltip: "Save Changes",
             ),
+          // If we have a download URL, show external open
           if (_downloadUrl != null)
             IconButton(
-              icon: Icon(Icons.download),
+              icon: Icon(Icons.open_in_new),
               onPressed: () => launchUrl(Uri.parse(_downloadUrl!)),
-              tooltip: "open in Browser",
-            )
+              tooltip: "Open External",
+            ),
+          // If distributed (bytes only), show a 'save' hint or just nothing (since we have Download in Manager)
+          if (_fileBytes != null && !_isCodeFile)
+             IconButton(
+               icon: Icon(Icons.info_outline),
+               onPressed: () {
+                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Distributed file. View only mode.")));
+               },
+             )
         ],
       ),
       body: _loading
@@ -165,29 +199,53 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
   }
 
   Widget _buildContent() {
-    if (_downloadUrl == null) {
+    if (_downloadUrl == null && _fileBytes == null) {
       return Center(
           child: Text("Could not load file.",
               style: GoogleFonts.inter(color: Colors.white54)));
     }
 
+    if (_isPdf) {
+      if (_fileBytes != null) {
+        return SfPdfViewer.memory(
+              Uint8List.fromList(_fileBytes!),
+              onDocumentLoadFailed: (details) => ScaffoldMessenger.of(context)
+                  .showSnackBar(SnackBar(
+                      content: Text("Failed to load PDF: ${details.error}"))));
+      } else {
+        return SfPdfViewer.network(
+              _downloadUrl!,
+              onDocumentLoadFailed: (details) => ScaffoldMessenger.of(context)
+                  .showSnackBar(SnackBar(
+                      content: Text("Failed to load PDF: ${details.error}"))));
+      }
+    }
+
     if (_isImage) {
       return Center(
         child: InteractiveViewer(
-          child: Image.network(
-            _downloadUrl!,
-            loadingBuilder: (ctx, child, chunk) {
-              if (chunk == null) return child;
-              return Center(
-                  child: CircularProgressIndicator(
-                      value: chunk.expectedTotalBytes != null
-                          ? chunk.cumulativeBytesLoaded /
-                              chunk.expectedTotalBytes!
-                          : null));
-            },
-            errorBuilder: (ctx, err, stack) =>
-                Icon(Icons.broken_image, size: 64, color: Colors.white24),
-          ),
+          minScale: 0.1,
+          maxScale: 5.0,
+          child: _fileBytes != null
+              ? Image.memory(
+                  Uint8List.fromList(_fileBytes!),
+                  errorBuilder: (ctx, err, stack) =>
+                      Icon(Icons.broken_image, size: 64, color: Colors.white24),
+                )
+              : Image.network(
+                  _downloadUrl!,
+                  loadingBuilder: (ctx, child, chunk) {
+                    if (chunk == null) return child;
+                    return Center(
+                        child: CircularProgressIndicator(
+                            value: chunk.expectedTotalBytes != null
+                                ? chunk.cumulativeBytesLoaded /
+                                    chunk.expectedTotalBytes!
+                                : null));
+                  },
+                  errorBuilder: (ctx, err, stack) =>
+                      Icon(Icons.broken_image, size: 64, color: Colors.white24),
+                ),
         ),
       );
     }
@@ -208,45 +266,36 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
         ),
       );
     }
-
-    if (_isPdf) {
-      return SfPdfViewer.network(
-        _downloadUrl!,
-        onDocumentLoadFailed: (PdfDocumentLoadFailedDetails details) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-              content: Text("Failed to load PDF: ${details.error}")));
-        },
+    
+    // Video Stub
+    if (_isVideo) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+             Icon(Icons.play_circle_outline, size: 64, color: Colors.white),
+             SizedBox(height: 16),
+             Text("Video preview not supported yet.", style: TextStyle(color: Colors.white70))
+          ],
+        )
       );
     }
 
-    // Fallback for Video/Other
-    IconData icon = Icons.insert_drive_file;
-    String actionLabel = "OPEN FILE";
-
-    if (_isVideo) {
-      icon = Icons.play_circle_outline;
-      actionLabel = "PLAY VIDEO";
-    }
-
+    // Default Fallback
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 80, color: Colors.white24),
-          const SizedBox(height: 20),
-          Text("Preview not supported natively.",
-              style: GoogleFonts.inter(color: Colors.white54)),
-          const SizedBox(height: 20),
-          ElevatedButton.icon(
-            onPressed: () => launchUrl(Uri.parse(_downloadUrl!)),
-            icon: Icon(Icons.open_in_new),
-            label: Text(actionLabel),
-            style: ElevatedButton.styleFrom(
-                backgroundColor: KeeprTheme.primary.withOpacity(0.8),
-                foregroundColor: Colors.white),
-          )
+          Icon(Icons.insert_drive_file, size: 64, color: Colors.white24),
+          SizedBox(height: 16),
+          Text("Preview not available", style: GoogleFonts.inter(color: Colors.white54)),
+          if (_downloadUrl != null)
+            ElevatedButton(
+              onPressed: () => launchUrl(Uri.parse(_downloadUrl!)),
+              child: Text("Open External"),
+            )
         ],
-      ),
+      )
     );
   }
 }

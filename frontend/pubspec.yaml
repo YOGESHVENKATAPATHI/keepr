@@ -21,6 +21,7 @@ dependencies:
   percent_indicator: ^4.2.5
   dio: ^5.9.1
   syncfusion_flutter_pdfviewer: ^32.2.3
+  universal_html: ^2.3.0
 
 dev_dependencies:
   flutter_test:
