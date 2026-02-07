@@ -61,12 +61,13 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
     try {
       if (widget.dropboxPath == 'distributed' && widget.fileIdRef != null) {
         // Distributed: Download bytes directly
-        final bytes =
-            await widget.uploader.downloadDistributedFile(widget.fileIdRef!, widget.sizeMb);
+        final bytes = await widget.uploader
+            .downloadDistributedFile(widget.fileIdRef!, widget.sizeMb);
         setState(() {
           _fileBytes = bytes;
         });
-        debugPrint('[FileViewer] downloaded bytes length=${bytes.length} (expected ${(widget.sizeMb*1024*1024).round()})');
+        debugPrint(
+            '[FileViewer] downloaded bytes length=${bytes.length} (expected ${(widget.sizeMb * 1024 * 1024).round()})');
 
         if (_isCodeFile) {
           _textContent = utf8.decode(bytes);
@@ -226,7 +227,7 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
 
     if (_isCodeFile) {
       return Container(
-        color: Colors.black.withOpacity(0.3), // Darker editor bg
+        color: Colors.black.withAlpha((0.3 * 255).round()), // Darker editor bg
         padding: const EdgeInsets.all(16),
         child: TextField(
           controller: _codeController,
@@ -296,14 +297,15 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
                     final uri = Uri.file(tempFile.path);
                     if (!await launchUrl(uri)) {
                       if (context.mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                            content: Text("Could not open file.")));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text("Could not open file.")));
                       }
                     }
                   } catch (e) {
                     if (context.mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text("Error: $e")));
+                      ScaffoldMessenger.of(context)
+                          .showSnackBar(SnackBar(content: Text("Error: $e")));
                     }
                   }
                 }
@@ -312,7 +314,8 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
             icon: Icon(Icons.open_in_new),
             label: Text(actionLabel),
             style: ElevatedButton.styleFrom(
-                backgroundColor: KeeprTheme.primary.withOpacity(0.8),
+                backgroundColor:
+                    KeeprTheme.primary.withAlpha((0.8 * 255).round()),
                 foregroundColor: Colors.white),
           )
         ],

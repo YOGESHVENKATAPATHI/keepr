@@ -86,8 +86,9 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
   void _showSnack(String msg, {bool isError = false}) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text(msg, style: GoogleFonts.inter(color: Colors.white)),
-      backgroundColor:
-          isError ? Colors.redAccent.withOpacity(0.8) : const Color(0xFF15294a),
+      backgroundColor: isError
+          ? Colors.redAccent.withAlpha((0.8 * 255).round())
+          : const Color(0xFF15294a),
       behavior: SnackBarBehavior.floating,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
     ));
@@ -282,11 +283,12 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                       style: const TextStyle(color: Colors.white),
                       decoration: InputDecoration(
                         hintText: 'FOLDER NAME',
-                        hintStyle:
-                            TextStyle(color: Colors.white.withOpacity(0.3)),
+                        hintStyle: TextStyle(
+                            color: Colors.white.withAlpha((0.3 * 255).round())),
                         enabledBorder: UnderlineInputBorder(
                             borderSide: BorderSide(
-                                color: Colors.white.withOpacity(0.2))),
+                                color: Colors.white
+                                    .withAlpha((0.2 * 255).round()))),
                         focusedBorder: const UnderlineInputBorder(
                             borderSide: BorderSide(color: Colors.white)),
                       )),
@@ -351,7 +353,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
       width: double.infinity,
-      color: Colors.black.withOpacity(0.2), // Darker strip
+      color: Colors.black.withAlpha((0.2 * 255).round()), // Darker strip
       child: Row(
         children: [
           GestureDetector(
@@ -466,14 +468,16 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     return TextButton(
       onPressed: onTap,
       style: TextButton.styleFrom(
-          backgroundColor:
-              highlight ? Colors.white.withOpacity(0.1) : Colors.transparent,
+          backgroundColor: highlight
+              ? Colors.white.withAlpha((0.1 * 255).round())
+              : Colors.transparent,
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
           shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(4),
               side: highlight
                   ? BorderSide.none
-                  : BorderSide(color: Colors.white.withOpacity(0.1)))),
+                  : BorderSide(
+                      color: Colors.white.withAlpha((0.1 * 255).round())))),
       child: Text(label,
           style: GoogleFonts.inter(
               color: highlight ? Colors.white : Colors.white70,
@@ -517,12 +521,13 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                         )));
           }
         },
-        hoverColor: Colors.white.withOpacity(0.05),
+        hoverColor: Colors.white.withAlpha((0.05 * 255).round()),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
           decoration: BoxDecoration(
               border: Border(
-                  bottom: BorderSide(color: Colors.white.withOpacity(0.05)))),
+                  bottom: BorderSide(
+                      color: Colors.white.withAlpha((0.05 * 255).round())))),
           child: Row(
             children: [
               // Type Indicator (No Icon)
@@ -555,7 +560,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                                 horizontal: 6, vertical: 2),
                             decoration: BoxDecoration(
                                 color: isFolder
-                                    ? Colors.blue.withOpacity(0.1)
+                                    ? Colors.blue.withAlpha((0.1 * 255).round())
                                     : Colors.white10,
                                 borderRadius: BorderRadius.circular(2)),
                             child: Text(isFolder ? 'DIR' : 'FILE',

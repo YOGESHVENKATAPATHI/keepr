@@ -3,8 +3,10 @@ import 'package:glassmorphism/glassmorphism.dart';
 import 'theme/keepr_theme.dart';
 import 'services/folder_upload_service.dart';
 import 'services/api_service.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'screens/file_manager_screen.dart';
 import 'screens/login_screen.dart';
+import 'screens/pin_entry_screen.dart';
 
 // Entry Point
 void main() {
@@ -14,13 +16,41 @@ void main() {
 class KeeprApp extends StatelessWidget {
   const KeeprApp({super.key});
 
+  Future<Widget> _initialScreen() async {
+    // Check for stored user email - if present, show PIN entry to unlock session
+    final storage = const FlutterSecureStorage();
+    final email = await storage.read(key: 'user_email');
+
+    final api = ApiService.forEnv();
+    final uploader = FolderUploadService(
+        backendUrl: const String.fromEnvironment('BACKEND_BASE',
+            defaultValue: 'http://localhost:3000'));
+
+    if (email != null) {
+      return PinEntryScreen(api: api, uploader: uploader);
+    }
+    return const LoginScreen();
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Keepr',
       debugShowCheckedModeBanner: false,
       theme: KeeprTheme.darkTheme,
-      home: const LoginScreen(),
+      home: FutureBuilder<Widget>(
+        future: _initialScreen(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Scaffold(
+                body: Center(child: CircularProgressIndicator()));
+          }
+          return snapshot.data ?? const LoginScreen();
+        },
+      ),
+      routes: {
+        '/login': (ctx) => const LoginScreen(),
+      },
     );
   }
 }
@@ -41,14 +71,14 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
 
   // NOTE: In production, use env variables
   final uploadService =
-      FolderUploadService(backendUrl: 'https://keepr-gold.vercel.app');
+      FolderUploadService(backendUrl: 'http://localhost:3000');
   // API client for auth
   late final ApiService api;
 
   @override
   void initState() {
     super.initState();
-    api = ApiService(backendBase: 'https://keepr-gold.vercel.app');
+    api = ApiService(backendBase: 'http://localhost:3000');
   }
 
   void _showSnack(String message, {bool error = false}) {
@@ -89,8 +119,13 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
       isLoading = true;
     });
     try {
-      final ok = await api.verifyOtp(email, otp);
-      if (ok) {
+      final token = await api.verifyOtp(email, otp);
+      if (token != null) {
+        // Persist token and user email so session unlocks via PIN on refresh
+        final storage = const FlutterSecureStorage();
+        await storage.write(key: 'auth_token', value: token);
+        await storage.write(key: 'user_email', value: email);
+
         _showSnack('Login successful');
         // Navigate to File Manager
         Navigator.of(context).pushReplacement(MaterialPageRoute(
@@ -140,8 +175,8 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
                 colors: [
-                  Colors.white.withOpacity(0.1),
-                  Colors.white.withOpacity(0.05),
+                  Colors.white.withAlpha((0.1 * 255).round()),
+                  Colors.white.withAlpha((0.05 * 255).round()),
                 ],
                 stops: [0.1, 1],
               ),

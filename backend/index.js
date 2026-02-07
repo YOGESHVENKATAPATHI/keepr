@@ -5,11 +5,28 @@ const dbManager = require('./dbManager');
 const { tryConnect, MASTER_DB_URL } = dbManager;
 const storageManager = require('./storageManager');
 const auth = require('./auth');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 const fetch = require('node-fetch'); // Ensure node-fetch is available
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+
+// Helpful startup checks
+const requiredEnv = ['GOOGLE_CLIENT_ID', 'EMAIL_USER', 'EMAIL_PASS', 'FRONTEND_BASE_URL'];
+const missing = requiredEnv.filter(k => !process.env[k]);
+if (missing.length > 0) {
+    console.warn('[Startup] Warning: Missing env vars:', missing.join(', '));
+    console.warn('[Startup] Please add these to your .env to ensure features (Google sign-in, email) work.');
+}
+
+process.on('unhandledRejection', (reason, p) => {
+    console.error('[Startup] Unhandled Rejection at:', p, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[Startup] Uncaught Exception:', err);
+});
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -104,6 +121,16 @@ async function executeOnAllDBs(action) {
     return resultsArray.flat(); 
 }
 
+// --- DB Migration Utilities ---
+// Ensure users table has expected columns on older schemas
+async function ensureUsersSchema(client) {
+    // NOTE: We use ALTER TABLE ADD COLUMN IF NOT EXISTS to migrate older worker schemas
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pin_hash TEXT");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_failed_pin_attempts INT DEFAULT 0");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pin_locked_until TIMESTAMP NULL");
+}
+
 // --- AUTH ROUTES ---
 
 app.post('/api/auth/send-otp', async (req, res) => {
@@ -137,21 +164,53 @@ app.post('/api/auth/verify-otp', async (req, res) => {
                     CREATE TABLE IF NOT EXISTS users (
                         id SERIAL PRIMARY KEY,
                         email TEXT UNIQUE NOT NULL,
+                        email_verified BOOLEAN DEFAULT FALSE,
+                        pin_hash TEXT,
+                        last_failed_pin_attempts INT DEFAULT 0,
+                        pin_locked_until TIMESTAMP NULL,
                         created_at TIMESTAMP DEFAULT NOW()
                     );
                 `);
+                // Ensure existing worker schema has all required columns
+                await ensureUsersSchema(workerClient);
                 
                 // key-value style check or just insert-on-conflict
                 const check = await workerClient.query('SELECT id FROM users WHERE email = $1', [email]);
                 if (check.rows.length === 0) {
-                    await workerClient.query('INSERT INTO users (email) VALUES ($1)', [email]);
+                    await workerClient.query('INSERT INTO users (email, email_verified) VALUES ($1, true)', [email]);
                     console.log(`[Auth] New user created: ${email}`);
                 } else {
+                    // ensure email_verified true
+                    await workerClient.query('UPDATE users SET email_verified = TRUE WHERE email = $1', [email]);
                     console.log(`[Auth] User exists: ${email}`);
                 }
+
+                // Ensure auth tables exist
+                await workerClient.query(`
+                    CREATE TABLE IF NOT EXISTS auth_tokens (
+                        id SERIAL PRIMARY KEY,
+                        user_id INT NOT NULL,
+                        token TEXT UNIQUE NOT NULL,
+                        device_info TEXT,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        revoked BOOLEAN DEFAULT FALSE
+                    );
+                `);
+
+                await workerClient.query(`
+                    CREATE TABLE IF NOT EXISTS pin_resets (
+                        id SERIAL PRIMARY KEY,
+                        user_id INT NOT NULL,
+                        reset_token TEXT UNIQUE NOT NULL,
+                        expires_at TIMESTAMP NOT NULL,
+                        used BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                `);
             });
 
             console.log(`[Auth] login success for ${email}`);
+            // For backwards compatibility we still return a mock token here; clients should transition to real tokens via Google Sign-In or PIN flows.
             res.status(200).send({ message: 'Login successful', token: 'mock-jwt-token' });
         } catch (e) {
             console.error(e);
@@ -160,6 +219,320 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     } else {
         console.warn(`[Auth] Invalid OTP for ${email}`);
         res.status(401).send({ message: 'Invalid OTP' });
+    }
+});
+
+// --- New Auth Endpoints ---
+
+// Middleware: Verify Revocable Token
+async function verifyAuthToken(req, res, next) {
+    const header = req.headers['authorization'] || req.headers['Authorization'];
+    if (!header) return res.status(401).send({ message: 'Authorization required' });
+    const parts = header.split(' ');
+    if (parts.length !== 2) return res.status(401).send({ message: 'Invalid Authorization format' });
+    const token = parts[1];
+
+    try {
+        const row = await executeWithDB(async (client) => {
+            const r = await client.query('SELECT user_id, revoked FROM auth_tokens WHERE token = $1', [token]);
+            return r.rows[0];
+        });
+        if (!row || row.revoked) return res.status(401).send({ message: 'Invalid or revoked token' });
+        req.user = { id: row.user_id, token };
+        next();
+    } catch (e) {
+        console.error('Token verification error', e);
+        res.status(500).send({ message: 'Token verification failed' });
+    }
+}
+
+// POST /api/auth/google-signin
+app.post('/api/auth/google-signin', async (req, res) => {
+    // Accept either an idToken (JWT) or an accessToken (Bearer) from client
+    const { idToken, accessToken, deviceInfo } = req.body;
+    console.log('[Auth] google-signin called');
+
+    let payload = null;
+
+    try {
+        if (idToken) {
+            console.log('[Auth] Verifying Google id_token');
+            const verified = await auth.verifyGoogleIdToken(idToken);
+            if (!verified.ok) return res.status(401).send({ message: 'Invalid Google ID token' });
+            payload = verified.payload;
+        } else if (accessToken) {
+            console.log('[Auth] Verifying Google access_token via userinfo endpoint');
+            // Fetch userinfo from Google using access token
+            const ures = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { 'Authorization': `Bearer ${accessToken}` }
+            });
+            if (!ures.ok) {
+                const t = await ures.text();
+                console.error('[Auth] google userinfo failed:', ures.status, t);
+                return res.status(401).send({ message: 'Invalid Google access token' });
+            }
+            payload = await ures.json();
+        } else {
+            return res.status(400).send({ message: 'idToken or accessToken required' });
+        }
+
+        const email = payload.email;
+
+        const token = await executeWithDB(async (client) => {
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    email TEXT UNIQUE NOT NULL,
+                    email_verified BOOLEAN DEFAULT FALSE,
+                    pin_hash TEXT,
+                    last_failed_pin_attempts INT DEFAULT 0,
+                    pin_locked_until TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            `);
+            // Ensure existing worker schema has all required columns
+            await ensureUsersSchema(client);
+
+            // insert or update user (we identify users by email only)
+            const q = await client.query('SELECT id FROM users WHERE email = $1', [email]);
+            let userId;
+            if (q.rows.length === 0) {
+                const ins = await client.query('INSERT INTO users (email, email_verified) VALUES ($1, TRUE) RETURNING id', [email]);
+                userId = ins.rows[0].id;
+                console.log('[Auth] created user via Google:', email);
+            } else {
+                userId = q.rows[0].id;
+                await client.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [userId]);
+                console.log('[Auth] updated user via Google:', email);
+            }
+
+            // ensure auth_tokens table
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS auth_tokens (
+                    id SERIAL PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    token TEXT UNIQUE NOT NULL,
+                    device_info TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    revoked BOOLEAN DEFAULT FALSE
+                );
+            `);
+
+            const tokenValue = uuidv4();
+            await client.query('INSERT INTO auth_tokens (user_id, token, device_info) VALUES ($1, $2, $3)', [userId, tokenValue, deviceInfo || null]);
+            return tokenValue;
+        });
+
+        res.json({ token });
+    } catch (e) {
+        console.error('Google sign-in failed', e);
+        res.status(500).send({ message: 'Google sign-in failed', error: e.message });
+    }
+});
+
+// POST /api/auth/set-pin (authenticated)
+app.post('/api/auth/set-pin', verifyAuthToken, async (req, res) => {
+    const { pin } = req.body;
+    if (!pin || !/^\d{6}$/.test(pin)) return res.status(400).send({ message: 'Pin must be 6 digits' });
+    const hash = await bcrypt.hash(pin, 10);
+
+    try {
+        await executeWithDB(async (client) => {
+            await client.query('UPDATE users SET pin_hash=$1 WHERE id=$2', [hash, req.user.id]);
+        });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Set pin failed', e);
+        res.status(500).send({ message: 'Failed to set pin' });
+    }
+});
+
+// GET /api/auth/profile - returns basic profile if token is valid
+app.get('/api/auth/profile', verifyAuthToken, async (req, res) => {
+    try {
+        const profile = await executeWithDB(async (client) => {
+            const u = await client.query('SELECT email, (pin_hash IS NOT NULL) AS has_pin FROM users WHERE id=$1', [req.user.id]);
+            if (u.rows.length === 0) throw new Error('User not found');
+            return { email: u.rows[0].email, has_pin: u.rows[0].has_pin };
+        });
+        res.json({ profile });
+    } catch (e) {
+        console.error('Profile fetch failed', e);
+        res.status(500).send({ message: 'Failed to fetch profile' });
+    }
+});
+
+// POST /api/auth/pin-login
+app.post('/api/auth/pin-login', async (req, res) => {
+    const { email, pin, deviceInfo } = req.body;
+    if (!email || !pin) return res.status(400).send({ message: 'Email and pin required' });
+
+    try {
+        const result = await executeWithDB(async (client) => {
+            const u = await client.query('SELECT id, pin_hash, last_failed_pin_attempts, pin_locked_until FROM users WHERE email=$1', [email]);
+            if (u.rows.length === 0) return { error: 'User not found' };
+            const user = u.rows[0];
+
+            // optional: check lockout
+            if (user.pin_locked_until && new Date(user.pin_locked_until) > new Date()) return { error: 'Too many failed attempts. Try later.' };
+
+            if (!user.pin_hash) return { error: 'Pin not set' };
+
+            const ok = await bcrypt.compare(pin, user.pin_hash);
+            if (!ok) {
+                const attempts = (user.last_failed_pin_attempts || 0) + 1;
+                let lockUntil = null;
+                if (attempts >= 5) {
+                    // lock for 15 minutes
+                    const d = new Date(Date.now() + 15 * 60 * 1000);
+                    lockUntil = d.toISOString();
+                }
+                await client.query('UPDATE users SET last_failed_pin_attempts=$1, pin_locked_until=$2 WHERE id=$3', [attempts, lockUntil, user.id]);
+                return { error: 'Invalid pin' };
+            }
+
+            // success: reset attempts and issue token
+            await client.query('UPDATE users SET last_failed_pin_attempts=0, pin_locked_until=NULL WHERE id=$1', [user.id]);
+
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS auth_tokens (
+                    id SERIAL PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    token TEXT UNIQUE NOT NULL,
+                    device_info TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    revoked BOOLEAN DEFAULT FALSE
+                );
+            `);
+
+            const tokenValue = uuidv4();
+            await client.query('INSERT INTO auth_tokens (user_id, token, device_info) VALUES ($1, $2, $3)', [user.id, tokenValue, deviceInfo || null]);
+            return { token: tokenValue };
+        });
+
+        if (result.error) return res.status(401).send({ message: result.error });
+        res.json({ token: result.token });
+    } catch (e) {
+        console.error('Pin login failed', e);
+        res.status(500).send({ message: 'Pin login failed', error: e.message });
+    }
+});
+
+// POST /api/auth/request-pin-reset
+app.post('/api/auth/request-pin-reset', async (req, res) => {
+    const { email, resetUrlBase } = req.body;
+    if (!email) return res.status(400).send({ message: 'Email required' });
+
+    try {
+        const ok = await executeWithDB(async (client) => {
+            const u = await client.query('SELECT id FROM users WHERE email=$1', [email]);
+            if (u.rows.length === 0) return false;
+            const userId = u.rows[0].id;
+            const token = uuidv4();
+            const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
+            await client.query('INSERT INTO pin_resets (user_id, reset_token, expires_at) VALUES ($1, $2, $3)', [userId, token, expiresAt]);
+
+            // send email
+            const base = resetUrlBase || process.env.PIN_RESET_URL || 'http://localhost:3000/pin-reset?token=';
+            const sent = await auth.sendPinResetEmail(email, token, base);
+            return sent;
+        });
+
+        if (!ok) return res.status(400).send({ message: 'Email not found or failed to send' });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Request pin reset failed', e);
+        res.status(500).send({ message: 'Request pin reset failed' });
+    }
+});
+
+// POST /api/auth/confirm-pin-reset
+app.post('/api/auth/confirm-pin-reset', async (req, res) => {
+    const { resetToken, newPin } = req.body;
+    if (!resetToken || !newPin || !/^\d{6}$/.test(newPin)) return res.status(400).send({ message: 'Invalid input' });
+
+    try {
+        const ok = await executeWithDB(async (client) => {
+            const r = await client.query('SELECT id, user_id, expires_at, used FROM pin_resets WHERE reset_token=$1', [resetToken]);
+            if (r.rows.length === 0) return { error: 'Invalid token' };
+            const row = r.rows[0];
+            if (row.used) return { error: 'Token already used' };
+            if (new Date(row.expires_at) < new Date()) return { error: 'Token expired' };
+
+            const hash = await bcrypt.hash(newPin, 10);
+            await client.query('UPDATE users SET pin_hash=$1 WHERE id=$2', [hash, row.user_id]);
+            await client.query('UPDATE pin_resets SET used=true WHERE id=$1', [row.id]);
+            return { ok: true };
+        });
+
+        if (ok.error) return res.status(400).send({ message: ok.error });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Confirm pin reset failed', e);
+        res.status(500).send({ message: 'Confirm pin reset failed' });
+    }
+});
+
+// POST /api/auth/revoke-token
+app.post('/api/auth/revoke-token', verifyAuthToken, async (req, res) => {
+    const token = req.user.token;
+    try {
+        await executeWithDB(async (client) => {
+            await client.query('UPDATE auth_tokens SET revoked = TRUE WHERE token = $1', [token]);
+            // Optionally remove tokens from sessions or cleanup
+        });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Revoke token failed', e);
+        res.status(500).send({ message: 'Failed to revoke token' });
+    }
+});
+
+// --- DEBUG: Echo Google token payload (DEVELOPMENT ONLY)
+// Usage: POST /api/debug/google-payload  { idToken?: string, accessToken?: string }
+// Enabled only when env var DEBUG_AUTH is set to 'true'
+app.post('/api/debug/google-payload', async (req, res) => {
+    if (process.env.DEBUG_AUTH !== 'true') {
+        return res.status(404).send({ message: 'Not found' });
+    }
+
+    const { idToken, accessToken } = req.body || {};
+    if (!idToken && !accessToken) return res.status(400).send({ message: 'idToken or accessToken required' });
+
+    try {
+        if (idToken) {
+            const verified = await auth.verifyGoogleIdToken(idToken);
+            if (!verified.ok) return res.status(400).send({ ok: false, error: verified.error });
+            return res.json({ ok: true, method: 'id_token', payload: verified.payload });
+        }
+
+        // access token path
+        const ures = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+            headers: { 'Authorization': `Bearer ${accessToken}` }
+        });
+        if (!ures.ok) {
+            const t = await ures.text();
+            return res.status(400).send({ ok: false, error: t });
+        }
+        const payload = await ures.json();
+        return res.json({ ok: true, method: 'access_token', payload });
+    } catch (e) {
+        console.error('Debug google payload failed', e);
+        res.status(500).send({ ok: false, error: e.message });
+    }
+});
+
+// GET /api/auth/me - returns basic profile for current token
+app.get('/api/auth/me', verifyAuthToken, async (req, res) => {
+    try {
+        const profile = await executeWithDB(async (client) => {
+            const r = await client.query('SELECT id, email, email_verified, (pin_hash IS NOT NULL) AS has_pin FROM users WHERE id=$1', [req.user.id]);
+            return r.rows[0];
+        });
+        res.json({ profile });
+    } catch (e) {
+        console.error('Get profile failed', e);
+        res.status(500).send({ message: 'Get profile failed' });
     }
 });
 

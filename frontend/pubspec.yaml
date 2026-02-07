@@ -22,6 +22,8 @@ dependencies:
   dio: ^5.9.1
   syncfusion_flutter_pdfviewer: ^32.2.3
   universal_html: ^2.3.0
+  google_sign_in: ^6.1.1
+  flutter_secure_storage: ^8.0.0
 
 dev_dependencies:
   flutter_test:

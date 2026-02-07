@@ -1,5 +1,7 @@
 require('dotenv').config();
 const nodemailer = require('nodemailer');
+const { OAuth2Client } = require('google-auth-library');
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID || '');
 
 const transporter = nodemailer.createTransport({
     service: 'gmail',
@@ -69,8 +71,45 @@ async function verifyTransport() {
     });
 }
 
+// Google id_token verification helper
+async function verifyGoogleIdToken(idToken) {
+    if (!idToken) return { ok: false, error: 'idToken required' };
+    try {
+        const ticket = await googleClient.verifyIdToken({ idToken, audience: process.env.GOOGLE_CLIENT_ID });
+        const payload = ticket.getPayload();
+        // Contains: email, email_verified, sub (google id), name, picture
+        return { ok: true, payload };
+    } catch (e) {
+        console.error('[Auth] verifyGoogleIdToken failed:', e.message || e);
+        return { ok: false, error: e.message || 'Invalid token' };
+    }
+}
+
+// Send PIN reset email (resetToken should be an opaque token generated server-side)
+async function sendPinResetEmail(email, resetToken, resetUrlBase) {
+    // resetUrlBase example: https://yourapp.com/pin-reset?token=
+    const resetUrl = `${resetUrlBase}${encodeURIComponent(resetToken)}`;
+    const mailOptions = {
+        from: 'keeprofficialservices@gmail.com',
+        to: email,
+        subject: 'Reset your Keepr PIN',
+        text: `You requested a PIN reset. Click the link to reset your 6-digit PIN: ${resetUrl}\n\nIf you did not request this, ignore this email.`
+    };
+
+    try {
+        await transporter.sendMail(mailOptions);
+        console.log(`PIN reset email sent to ${email}`);
+        return true;
+    } catch (error) {
+        console.error('Error sending PIN reset email:', error);
+        return false;
+    }
+}
+
 module.exports = {
     sendOTP,
     verifyOTP,
-    verifyTransport
+    verifyTransport,
+    verifyGoogleIdToken,
+    sendPinResetEmail
 };

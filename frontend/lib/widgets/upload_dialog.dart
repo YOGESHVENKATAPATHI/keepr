@@ -110,13 +110,14 @@ class _UploadDialogState extends State<UploadDialog> {
             width: isMobile ? width * 0.95 : 600,
             height: 550,
             decoration: BoxDecoration(
-                color: const Color(0xFF1E293B).withOpacity(0.85),
+                color: const Color(0xFF1E293B).withAlpha((0.85 * 255).round()),
                 borderRadius: BorderRadius.circular(20),
-                border:
-                    Border.all(color: Colors.white.withOpacity(0.1), width: 1),
+                border: Border.all(
+                    color: Colors.white.withAlpha((0.1 * 255).round()),
+                    width: 1),
                 boxShadow: [
                   BoxShadow(
-                    color: Colors.black.withOpacity(0.3),
+                    color: Colors.black.withAlpha((0.3 * 255).round()),
                     blurRadius: 20,
                     spreadRadius: 5,
                   )
@@ -157,7 +158,8 @@ class _UploadDialogState extends State<UploadDialog> {
                       width: double.infinity,
                       height: 140,
                       decoration: BoxDecoration(
-                          color: const Color(0xFF6366F1).withOpacity(0.1),
+                          color: const Color(0xFF6366F1)
+                              .withAlpha((0.1 * 255).round()),
                           borderRadius: BorderRadius.circular(16)),
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
@@ -165,7 +167,8 @@ class _UploadDialogState extends State<UploadDialog> {
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF6366F1).withOpacity(0.2),
+                              color: const Color(0xFF6366F1)
+                                  .withAlpha((0.2 * 255).round()),
                               shape: BoxShape.circle,
                             ),
                             child: const Icon(Icons.cloud_upload_outlined,
@@ -229,26 +232,26 @@ class _UploadDialogState extends State<UploadDialog> {
     Color barColor = const Color(0xFF6366F1); // Indigo
     IconData statusIcon = Icons.upload_file;
     Color iconColor = const Color(0xFF818CF8);
-    Color loadingBg = Colors.white.withOpacity(0.05);
+    Color loadingBg = Colors.white.withAlpha((0.05 * 255).round());
 
     if (task.isFailed) {
       barColor = Colors.redAccent;
       statusIcon = Icons.error_outline;
       iconColor = Colors.redAccent;
-      loadingBg = Colors.redAccent.withOpacity(0.1);
+      loadingBg = Colors.redAccent.withAlpha((0.1 * 255).round());
     } else if (task.isCompleted) {
       barColor = const Color(0xFF10B981); // Emerald
       statusIcon = Icons.check_circle;
       iconColor = const Color(0xFF10B981);
-      loadingBg = const Color(0xFF10B981).withOpacity(0.1);
+      loadingBg = const Color(0xFF10B981).withAlpha((0.1 * 255).round());
     }
 
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.03),
+        color: Colors.white.withAlpha((0.03 * 255).round()),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
+        border: Border.all(color: Colors.white.withAlpha((0.05 * 255).round())),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
