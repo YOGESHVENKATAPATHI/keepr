@@ -510,20 +510,13 @@ app.post('/api/upload/finalize', async (req, res) => {
             // DB MIGRATION FIX: Ensure no strict constraints block us if schema drifted
             try {
                 await client.query('ALTER TABLE file_chunks ALTER COLUMN shard_id DROP NOT NULL');
-            } catch(e) { console.warn('Fix shard_id failed', e.message); }
-            
+            } catch(e) {}
             try {
-                // Ensure chunk_id is nullable OR sequence
+                await client.query('ALTER TABLE file_chunks ALTER COLUMN storage_shard_id DROP NOT NULL');
+            } catch(e) {}
+            try {
                 await client.query('ALTER TABLE file_chunks ALTER COLUMN chunk_id DROP NOT NULL');
-            } catch(e) { 
-                 // If that failed, maybe column doesn't exist? or locked
-                 console.warn('Fix chunk_id drop not null failed', e.message);
-            }
-
-            // CRITICAL FIX: If table has chunk_id as PK but no sequence, we must drop it or ignore it.
-            // Let's try to set a default just in case it is required
-            try {
-                 await client.query("ALTER TABLE file_chunks ALTER COLUMN chunk_id SET DEFAULT 0");
+                await client.query("ALTER TABLE file_chunks ALTER COLUMN chunk_id SET DEFAULT 0");
             } catch(e) {}
 
             // Log chunks
@@ -531,22 +524,46 @@ app.post('/api/upload/finalize', async (req, res) => {
                 // Handle case where shardId is missing (legacy/error)
                 const safeShardId = c.shardId || c.shard_id || 0; 
                 
-                // Try STANDARD insert first
+                // DATA INTEGRITY: Insert into BOTH shard_id and storage_shard_id 
+                // to ensure we cover whatever column the current DB schema is using.
+                // STARTING with the failing one (storage_shard_id) + shard_id
+                
                 try {
+                    // Try robust insert aiming for all potential columns
                     await client.query(
-                        'INSERT INTO file_chunks (file_id, chunk_index, shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5)',
-                        [fileId, c.index, safeShardId, c.path, 'completed']
+                        `INSERT INTO file_chunks 
+                          (file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, status) 
+                         VALUES ($1, $2, $3, $3, $4, 'completed')`,
+                        [fileId, c.index, safeShardId, c.path]
                     );
                 } catch (insertErr) {
-                    // FALLBACK: If insert fails on chunk_id not null, try explicit
-                    if (insertErr.message && insertErr.message.includes('chunk_id')) {
+                    
+                    // FALLBACK 1: Maybe 'shard_id' column doesn't exist? Try only storage_shard_id
+                    if (insertErr.message && insertErr.message.includes('shard_id')) {
+                         try {
+                            await client.query(
+                                `INSERT INTO file_chunks 
+                                  (file_id, chunk_index, storage_shard_id, dropbox_path, status) 
+                                 VALUES ($1, $2, $3, $4, 'completed')`,
+                                [fileId, c.index, safeShardId, c.path]
+                            );
+                            continue; // Success
+                         } catch (e2) { /* ignore, try next fallback */ }
+                    }
+
+                    // FALLBACK 2: Explicit chunk_id needed?
+                    if (insertErr.message && (insertErr.message.includes('chunk_id') || insertErr.message.includes('violate'))) {
                         console.warn('Fallback insert with manual chunk_id');
                         await client.query(
-                            'INSERT INTO file_chunks (chunk_id, file_id, chunk_index, shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5, $6)',
-                            [Math.floor(Math.random() * 10000000), fileId, c.index, safeShardId, c.path, 'completed']
+                            `INSERT INTO file_chunks 
+                              (chunk_id, file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, status) 
+                             VALUES ($1, $2, $3, $4, $4, $5, 'completed')`,
+                            [Math.floor(Math.random() * 10000000), fileId, c.index, safeShardId, c.path] // $1..$5
                         );
                     } else {
-                        throw insertErr;
+                        console.error("Unknown Insert Error detail:", insertErr);
+                         // Last ditch: try basic insert again in case transient
+                         throw insertErr;
                     }
                 }
             }
