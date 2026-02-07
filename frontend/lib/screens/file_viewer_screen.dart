@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 import '../services/folder_upload_service.dart';
 import '../theme/keepr_theme.dart';
@@ -270,7 +272,29 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
               style: GoogleFonts.inter(color: Colors.white54)),
           const SizedBox(height: 20),
           ElevatedButton.icon(
-            onPressed: () => launchUrl(Uri.parse(_downloadUrl!)),
+            onPressed: () async {
+              if (_downloadUrl != null) {
+                await launchUrl(Uri.parse(_downloadUrl!));
+              } else if (_fileBytes != null) {
+                try {
+                  final tempDir = await getTemporaryDirectory();
+                  final tempFile = File('${tempDir.path}/${widget.fileName}');
+                  await tempFile.writeAsBytes(_fileBytes!);
+                  final uri = Uri.file(tempFile.path);
+                  if (!await launchUrl(uri)) {
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                          content: Text("Could not open file.")));
+                    }
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text("Error: $e")));
+                  }
+                }
+              }
+            },
             icon: Icon(Icons.open_in_new),
             label: Text(actionLabel),
             style: ElevatedButton.styleFrom(

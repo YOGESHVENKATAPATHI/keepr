@@ -326,6 +326,9 @@ app.get('/api/files/list', async (req, res) => {
             try {
                 await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS parent_path TEXT');
             } catch (e) { /* ignore */ }
+            try {
+                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS file_id_ref TEXT');
+            } catch (e) { /* ignore */ }
 
             // Temporary Fix: Backfill root parent_path for old files
             // Logic: Files at root (start with / and no other /) should have parent_path = '/'
@@ -343,7 +346,7 @@ app.get('/api/files/list', async (req, res) => {
             // Query this specific shard
             // Also leniently allow NULL parent_path if we are looking for root ('/')
             const q = await workerClient.query(
-                `SELECT id, user_id, path, name, is_folder, size_mb, dropbox_path, created_at 
+                `SELECT id, user_id, path, name, is_folder, size_mb, dropbox_path, file_id_ref, created_at 
                  FROM files 
                  WHERE user_id = $1 
                    AND (parent_path = $2 OR ($2 = '/' AND parent_path IS NULL))
