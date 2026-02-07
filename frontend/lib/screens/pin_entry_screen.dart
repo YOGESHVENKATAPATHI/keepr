@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../services/api_service.dart';
+import '../utils/storage_helper.dart';
 import '../services/folder_upload_service.dart';
 import 'file_manager_screen.dart';
 
@@ -168,6 +169,10 @@ class _PinEntryScreenState extends State<PinEntryScreen> {
                   // Clear stored session to go back to login
                   await _secureStorage.delete(key: 'auth_token');
                   await _secureStorage.delete(key: 'user_email');
+                  try {
+                    await removeLocalStorageValue('auth_token');
+                    await removeLocalStorageValue('user_email');
+                  } catch (_) {}
                   if (!mounted) return;
                   Navigator.of(context).pushReplacementNamed('/login');
                 },

@@ -7,6 +7,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'screens/file_manager_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/pin_entry_screen.dart';
+import 'utils/storage_helper.dart';
 
 // Entry Point
 void main() {
@@ -19,12 +20,38 @@ class KeeprApp extends StatelessWidget {
   Future<Widget> _initialScreen() async {
     // Check for stored user email - if present, show PIN entry to unlock session
     final storage = const FlutterSecureStorage();
-    final email = await storage.read(key: 'user_email');
+    String? email;
+    try {
+      email = await storage.read(key: 'user_email');
+      if (email == null) {
+        // Fallback for web: check localStorage
+        email = await getLocalStorageValue('user_email');
+      }
+    } catch (e) {
+      // Storage might fail on some envs; fallback to localStorage if possible
+      email = await getLocalStorageValue('user_email');
+    }
 
     final api = ApiService.forEnv();
     final uploader = FolderUploadService(
         backendUrl: const String.fromEnvironment('BACKEND_BASE',
             defaultValue: 'http://localhost:3000'));
+
+    // If we found an email in local storage, ensure auth token exists as well (read fallback)
+    if (email != null) {
+      // Ensure auth_token presence
+      try {
+        final token = await storage.read(key: 'auth_token') ??
+            await getLocalStorageValue('auth_token');
+        if (token == null) {
+          // If token missing, don't treat as an active session (clear user email fallback)
+          await removeLocalStorageValue('user_email');
+          email = null;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
 
     if (email != null) {
       return PinEntryScreen(api: api, uploader: uploader);

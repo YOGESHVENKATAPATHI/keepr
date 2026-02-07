@@ -95,11 +95,26 @@ class FolderUploadService {
       // For simplicity in this prompt, let's use a batching approach.
     }
 
-    // Processing using a pool
+    // Processing using a pool with per-chunk progress reporting
     int activeUploads = 0;
     int chunkIndex = 0;
     Completer<void> doneCompleter = Completer<void>();
     List<dynamic> fatalErrors = [];
+
+    // Throttling helpers: emit at most once per second or when at least 1KB progress made
+    int lastEmitMs = DateTime.now().millisecondsSinceEpoch;
+    int lastEmittedBytes = 0;
+    void emitProgressIfNeeded() {
+      if (onProgress == null) return;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (bytesUploaded - lastEmittedBytes >= 1024 ||
+          now - lastEmitMs >= 1000 ||
+          bytesUploaded >= totalSize) {
+        lastEmitMs = now;
+        lastEmittedBytes = bytesUploaded;
+        onProgress(bytesUploaded / totalSize);
+      }
+    }
 
     void startNext() async {
       if (fatalErrors.isNotEmpty) return;
@@ -113,6 +128,9 @@ class FolderUploadService {
       activeUploads++;
 
       try {
+        // Keep track of the last sent bytes for this chunk to compute deltas
+        int prevSentForChunk = 0;
+
         await _processChunk(
             fileId: fileId,
             chunkIndex: i,
@@ -121,10 +139,24 @@ class FolderUploadService {
                 (i * chunkSize + chunkSize < totalSize
                     ? i * chunkSize + chunkSize
                     : totalSize)),
+            onChunkProgress: (sent, total) {
+              // sent is bytes sent for this chunk
+              final int delta = sent - prevSentForChunk;
+              if (delta > 0) {
+                prevSentForChunk = sent;
+                bytesUploaded += delta;
+                emitProgressIfNeeded();
+              }
+            },
             onChunkComplete: (result) {
               completedChunks.add(result);
-              bytesUploaded += (result['size'] as int); // Approximate or exact
-              if (onProgress != null) onProgress(bytesUploaded / totalSize);
+              // If some bytes weren't accounted for via progress callbacks (edge cases), add remainder
+              final int chunkSizeBytes = result['size'] as int;
+              final int remainder = chunkSizeBytes - prevSentForChunk;
+              if (remainder > 0) {
+                bytesUploaded += remainder;
+              }
+              emitProgressIfNeeded();
             });
       } catch (e) {
         print("Chunk $i failed: $e");
@@ -157,13 +189,17 @@ class FolderUploadService {
         body: jsonEncode({'fileId': fileId, 'chunks': completedChunks}));
     if (finalizeResp.statusCode != 200)
       throw Exception("Finalize failed: ${finalizeResp.body}");
+
+    // Ensure we emit a final 100% progress update
+    if (onProgress != null) onProgress(1.0);
   }
 
   Future<void> _processChunk(
       {required String fileId,
       required int chunkIndex,
       required List<int> chunkData,
-      required Function(Map<String, dynamic>) onChunkComplete}) async {
+      required Function(Map<String, dynamic>) onChunkComplete,
+      Function(int sent, int total)? onChunkProgress}) async {
     final sizeMb = chunkData.length / (1024 * 1024);
 
     // A. Allocate
@@ -178,11 +214,10 @@ class FolderUploadService {
 
     // B. Upload to Dropbox
     final dio = Dio();
-    // dio.options.connectTimeout = 5000;
 
+    // Use onSendProgress to receive per-byte progress updates
     await dio.post('https://content.dropboxapi.com/2/files/upload',
-        data: Stream.fromIterable(
-            [chunkData]), // Wrap as stream or just data? Dio handles List<int>
+        data: Stream.fromIterable([chunkData]),
         options: Options(headers: {
           'Authorization': 'Bearer ${alloc['accessToken']}',
           'Dropbox-API-Arg': jsonEncode({
@@ -192,7 +227,15 @@ class FolderUploadService {
             "mute": true
           }),
           'Content-Type': 'application/octet-stream'
-        }));
+        }), onSendProgress: (int sent, int total) {
+      try {
+        if (onChunkProgress != null)
+          onChunkProgress(sent, total <= 0 ? chunkData.length : total);
+      } catch (e) {
+        // Protect progress handler from throwing errors
+        print('[Upload] onChunkProgress handler error: $e');
+      }
+    });
 
     // C. Report Success
     // Attach a per-chunk identifier to make it easier to trace and dedupe
@@ -266,11 +309,29 @@ class FolderUploadService {
     final client = http.Client();
     int totalBytesReceived = 0;
 
-    // Prefer accurate expected size from server metadata if present
+    // Prepare expected size vars before progress emitter so the emitter can reference them
     int expectedBytes = 0;
     // Try to compute sum of chunk sizes returned by server (size_mb) if available
     int sumChunkBytes = 0;
     bool haveChunkSizes = false;
+
+    // Throttle download progress: at most once per second or per 1KB delta
+    int lastDownloadEmitMs = DateTime.now().millisecondsSinceEpoch;
+    int lastDownloadEmittedBytes = 0;
+    void emitDownloadProgressIfNeeded() {
+      if (onProgress == null || expectedBytes <= 0) return;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (totalBytesReceived - lastDownloadEmittedBytes >= 1024 ||
+          now - lastDownloadEmitMs >= 1000 ||
+          totalBytesReceived >= expectedBytes) {
+        lastDownloadEmitMs = now;
+        lastDownloadEmittedBytes = totalBytesReceived;
+        double p = totalBytesReceived / expectedBytes;
+        if (p > 1.0) p = 1.0;
+        onProgress(p);
+      }
+    }
+
     for (var c in sortedUnique) {
       if (c.containsKey('size_mb') && c['size_mb'] != null) {
         // Server may return size_mb as number or string (e.g. "4"). Parse robustly.
@@ -323,11 +384,8 @@ class FolderUploadService {
         totalBytesReceived += data.length;
         print(
             '[Download] chunk $index received ${data.length} bytes (running total: $totalBytesReceived)');
-        if (onProgress != null && expectedBytes > 0) {
-          double p = totalBytesReceived / expectedBytes;
-          if (p > 1.0) p = 1.0;
-          onProgress(p);
-        }
+        // Emit progress in a throttled manner
+        emitDownloadProgressIfNeeded();
       }).asFuture();
 
       parts[index] = chunkBytes;

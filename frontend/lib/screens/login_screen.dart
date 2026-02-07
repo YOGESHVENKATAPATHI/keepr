@@ -3,6 +3,7 @@ import 'package:glassmorphism/glassmorphism.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import '../utils/storage_helper.dart';
 
 import '../theme/keepr_theme.dart';
 import '../services/api_service.dart';
@@ -171,6 +172,11 @@ class _LoginScreenState extends State<LoginScreen> {
       // Persist token securely and save user email for PIN flows
       await _secureStorage.write(key: 'auth_token', value: serverToken);
       await _secureStorage.write(key: 'user_email', value: account.email);
+      // Also mirror into localStorage on web so refresh reliably shows PIN unlock
+      try {
+        await setLocalStorageValue('user_email', account.email ?? '');
+        await setLocalStorageValue('auth_token', serverToken);
+      } catch (_) {}
 
       // Fetch profile to check if PIN is set
       final profileResp = await _api.getProfile(serverToken);
