@@ -174,9 +174,6 @@ async function getFittestDB() {
             try {
                 const workerClient = await tryConnectWithRetries(shard.connection_string, 2);
                 console.log(`[DB] Connected to Worker DB (shard id=${shard.id})`);
-                // Attach shard info to client for usage tracking
-                workerClient._shardId = shard.id;
-                workerClient._connectionString = shard.connection_string;
                 return workerClient;
             } catch (e) {
                 console.warn(`[DB] Failed to connect to shard ${shard.id}, trying next...`);
@@ -249,22 +246,10 @@ async function getAllWorkerDBs() {
  * Updates the usage stats for a specific shard (simplified estimation)
  */
 async function updateShardUsage(connectionString, sizeDeltaMB) {
-    if (!connectionString) return;
     const masterClient = new Client({ connectionString: MASTER_DB_URL });
     try {
-        // Must use tryConnect logic if simple Client fails with SSL, but simplified here for generic helper
-        // Re-using tryConnectWithRetries logic would be better but circular dep risk?
-        // No, we are in dbManager.
-        
-        // We really should use tryConnectWithRetries for the master client too
-        // But for update usage (fire and forget), we can implement a lighter version or just use the exported tryConnect
-    } catch (e) {/* */}
-
-    // Use proper connection
-    let client = null;
-    try {
-        client = await tryConnectWithRetries(MASTER_DB_URL, 2);
-        await client.query(`
+        await masterClient.connect();
+        await masterClient.query(`
             UPDATE db_shards 
             SET current_usage_mb = current_usage_mb + $1 
             WHERE connection_string = $2
@@ -272,141 +257,7 @@ async function updateShardUsage(connectionString, sizeDeltaMB) {
     } catch (err) {
         console.error("Failed to update shard usage:", err);
     } finally {
-        if (client) await client.end();
-    }
-}
-
-async function updateStorageShardUsage(shardId, sizeDeltaMB) {
-    let client = null;
-    try {
-        client = await tryConnectWithRetries(MASTER_DB_URL, 2);
-        await client.query(`
-            UPDATE storage_shards 
-            SET current_usage_mb = current_usage_mb + $1 
-            WHERE id = $2
-        `, [sizeDeltaMB, shardId]);
-    } catch (err) {
-        console.error("Failed to update storage shard usage:", err);
-    } finally {
-        if (client) await client.end();
-    }
-}
-
-// Ensure schema on a specific client
-async function ensureWorkerSchema(client) {
-    try {
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                email TEXT UNIQUE NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-        `);
-        // Note: We use the TEXT ID version for files to support mixed content
-        // If table exists (from older logical branch), this skips.
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS files (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                parent_path TEXT,
-                name TEXT NOT NULL,
-                is_folder BOOLEAN DEFAULT FALSE,
-                size_mb NUMERIC DEFAULT 0,
-                status TEXT DEFAULT 'pending',
-                dropbox_path TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-        `);
-        
-        // MIGRATION: Ensure columns exist if table was already there
-        try {
-            await client.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS status TEXT DEFAULT \'pending\'');
-            await client.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS parent_path TEXT');
-            await client.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS dropbox_path TEXT');
-            // Try to convert ID to TEXT if it's integer (Warning: might break sequences if used mixed)
-            // But since we are moving to UUIDs, we need TEXT. 
-            // This is a "best effort" migration for dev env.
-            await client.query('ALTER TABLE files ALTER COLUMN id TYPE TEXT');
-        } catch (e) {
-            console.warn("[DB] Migration warning (non-fatal):", e.message);
-        }
-
-        await client.query(`
-                CREATE TABLE IF NOT EXISTS file_chunks (
-                chunk_id TEXT PRIMARY KEY,
-                file_id TEXT NOT NULL,
-                chunk_index INT NOT NULL,
-                storage_shard_id INT NOT NULL,
-                dropbox_path TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-        `);
-        await client.query(`
-                CREATE TABLE IF NOT EXISTS file_chunks (
-                chunk_id TEXT PRIMARY KEY,
-                file_id TEXT NOT NULL,
-                chunk_index INT NOT NULL,
-                storage_shard_id INT NOT NULL,
-                dropbox_path TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-        `);
-        console.log(`[DB] Schema ensured on ${client._connectionString || 'db'}`);
-    } catch (e) {
-        console.error("Schema sync error:", e.message);
-    }
-}
-
-// Run schema sync on ALL active db shards
-async function syncAllShardsSchema() {
-    console.log("[DB] Starting Schema Sync on all shards...");
-    const clients = await getAllWorkerDBs();
-    for (const { client, id } of clients) {
-        try {
-            await ensureWorkerSchema(client);
-        } finally {
-            if(client) await client.end();
-        }
-    }
-    console.log("[DB] Schema Sync Complete.");
-}
-
-async function getAllActiveStorageShards() {
-    let client = null;
-    try {
-        client = await tryConnectWithRetries(MASTER_DB_URL);
-        const res = await client.query(`
-            SELECT * FROM storage_shards 
-            WHERE is_active = TRUE 
-              AND current_usage_mb < max_capacity_mb
-            ORDER BY current_usage_mb ASC
-        `);
-        return res.rows;
-    } catch (e) {
-        console.error("Failed to get storage shards:", e);
-        return [];
-    } finally {
-        if (client) await client.end();
-    }
-}
-
-async function getAllStorageShardsMap() {
-    // Returns a Map of id -> shard for ALL shards (even full or inactive, as long as they exist for retrieval)
-    let client = null;
-    try {
-        client = await tryConnectWithRetries(MASTER_DB_URL);
-        const res = await client.query(`SELECT * FROM storage_shards`);
-        const map = new Map();
-        res.rows.forEach(r => map.set(r.id, r));
-        return map;
-    } catch (e) {
-        console.error("Failed to get all storage shards:", e);
-        return new Map();
-    } finally {
-        if (client) await client.end();
+        await masterClient.end();
     }
 }
 
@@ -414,11 +265,7 @@ module.exports = {
     initMasterRegistry,
     getFittestDB,
     getAllWorkerDBs,
-    getAllActiveStorageShards,
-    getAllStorageShardsMap,
     updateShardUsage,
-    updateStorageShardUsage,
-    syncAllShardsSchema,
     tryConnect: tryConnectWithRetries, // Export as generic helper
     MASTER_DB_URL
 };

@@ -19,11 +19,9 @@ app.use((req, res, next) => {
 
 // Initialize Registry on Start
 // Run init but don't crash the server if Master DB is unreachable; start in degraded mode and allow health checks / admin fixes
-dbManager.initMasterRegistry()
-    .then(() => dbManager.syncAllShardsSchema()) // ADDED: Sync schema across all workers
-    .catch(err => {
-        console.error('Master Registry init (or schema sync) failed, starting in degraded mode:', err.message);
-    });
+dbManager.initMasterRegistry().catch(err => {
+    console.error('Master Registry init failed, starting in degraded mode:', err.message);
+});
 
 // Health test for DB connectivity
 app.get('/api/health/db', async (req, res) => {
@@ -48,44 +46,21 @@ async function executeWithDB(action, maxAttempts = 3) {
         let client = null;
         try {
             client = await dbManager.getFittestDB();
-            // Attach shard info if available (added by getFittestDB modification)
-            const shardInfo = {
-                id: client._shardId,
-                connectionString: client._connectionString
-            };
-
+            // getFittestDB may return a connected client (tryConnectWithRetries returns connected client)
+            // but ensure it's connected
             try {
                 await client.query('SELECT 1');
             } catch (connErr) {
+                // If client isn't connected, try connecting (depends on implementation)
                 try {
                     await client.connect();
                 } catch (e) {
-                    // ignore
+                    // ignore - will be handled below
                 }
             }
 
             const result = await action(client);
-            
-            // If action was successful, and we need to increment DB usage?
-            // Actually, executeWithDB is generic. It doesn't know about file sizes.
-            // But we can return the shardInfo so the caller can update usage if needed.
-            // OR: we attach a method to the client?
-            
             try { await client.end(); } catch (e) { /* ignore */ }
-            
-            // Return result AND shardInfo if possible?
-            // Existing callers expect 'result' to be the return value of 'action'.
-            // So we can attach shardInfo to 'result' if it's an object?
-            // Or just rely on the caller not knowing.
-            
-            // BETTER: Since executeWithDB creates a scope for a single DB interaction,
-            // we can pass shardInfo to the action!
-            
-            // Re-run action with (client, shardInfo)
-            // But 'action' signature is (client) in existing code.
-            // JavaScript ignores extra args. So passing (client, shardInfo) is safe for existing code 
-            // provided they don't use arguments[1] for something else.
-            
             return result;
         } catch (e) {
             lastErr = e;
@@ -294,215 +269,6 @@ app.post('/api/files/create-folder', async (req, res) => {
     }
 });
 
-// Generate UUID helper
-const generateUUID = () => {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-        var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
-        return v.toString(16);
-    });
-};
-
-app.post('/api/files/init-upload', async (req, res) => {
-    const { user_id, path, name, size_mb, is_folder } = req.body;
-    try {
-        const fileId = generateUUID();
-        await executeWithDB(async (workerClient) => {
-            // Update DB usage (metadata overhead, negligible but trackable)
-            const dbUsageDelta = 0.001; 
-            if (workerClient._connectionString) {
-                // Fire and forget usage update
-                dbManager.updateShardUsage(workerClient._connectionString, dbUsageDelta);
-            }
-
-            // Ensure schema with text ID
-            await workerClient.query(`
-                CREATE TABLE IF NOT EXISTS files (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    parent_path TEXT,
-                    name TEXT NOT NULL,
-                    is_folder BOOLEAN DEFAULT FALSE,
-                    size_mb NUMERIC DEFAULT 0,
-                    status TEXT DEFAULT 'pending',
-                    dropbox_path TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
-            `);
-
-            // SELF-HEALING MIGRATION: Ensure columns exist even if table was created previously
-            try {
-                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS status TEXT DEFAULT \'pending\'');
-                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS parent_path TEXT');
-                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS dropbox_path TEXT');
-                // Ensure ID is TEXT (migrating from SERIAL if needed, though rare for 'init-upload' flow)
-                // We skip checking ID type to avoid blocking, but the INSERT below inserts a string UUID.
-                // If ID is integer, it will throw. 
-            } catch (migErr) {
-                 // Ignore if columns exist or other minor errors, but log
-                 console.warn('[Files] Schema self-healing warning:', migErr.message);
-            }
-
-            await workerClient.query(`
-                 CREATE TABLE IF NOT EXISTS file_chunks (
-                    chunk_id TEXT PRIMARY KEY,
-                    file_id TEXT NOT NULL,
-                    chunk_index INT NOT NULL,
-                    storage_shard_id INT NOT NULL,
-                    dropbox_path TEXT NOT NULL,
-                    status TEXT DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
-            `);
-
-            const parentPath = getParentPath(path);
-            await workerClient.query(
-                'INSERT INTO files (id, user_id, path, parent_path, name, is_folder, size_mb, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-                [fileId, user_id, path, parentPath, name, is_folder || false, size_mb, 'pending']
-            );
-        });
-        res.json({ ok: true, fileId });
-    } catch (e) {
-        console.error('[Files] init-upload error:', e);
-        res.status(500).json({ ok: false, error: e.message });
-    }
-});
-
-app.post('/api/files/allocate-chunks', async (req, res) => {
-    // This API allocates chunks across available storage shards
-    const { fileId, totalChunks, fileSizeMb } = req.body; 
-    
-    try {
-        const storageShards = await dbManager.getAllActiveStorageShards();
-        if (storageShards.length === 0) throw new Error("No active storage shards with available capacity");
-
-        const allocations = [];
-        const chunkSizeMb = fileSizeMb / totalChunks; // Approx
-
-        await executeWithDB(async (workerClient) => {
-             for (let i = 0; i < totalChunks; i++) {
-                 // Round Robin distribution with capacity check
-                 // storageShards is already sorted by usage ASC
-                 
-                 // Better than simple round robin: pick the one with lowest usage (first one), then "virtually" increment for next iter
-                 // But for simplicity in this loop, we just RR across filtered list.
-                 const shard = storageShards[i % storageShards.length];
-                
-                 // Update Usage Immediately (Tracking)
-                 // NOTE: This updates the master DB asynchronously
-                 dbManager.updateStorageShardUsage(shard.id, chunkSizeMb);
-                 // Virtually update local object to influence next choice in this very loop if we were sorting dynamic
-                 shard.current_usage_mb = (parseFloat(shard.current_usage_mb) || 0) + chunkSizeMb;
-
-                 const chunkId = generateUUID();
-                 // Unique logical path per chunk: /fileId_chunkIndex
-                 const dropboxPath = `/${fileId}_${i}.chunk`; 
-                 
-                 allocations.push({
-                     chunkId,
-                     chunkIndex: i,
-                     storageShardId: shard.id,
-                     accessToken: shard.refresh_token, 
-                     dropboxPath
-                 });
-
-                 await workerClient.query(
-                     'INSERT INTO file_chunks (chunk_id, file_id, chunk_index, storage_shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5, $6)',
-                     [chunkId, fileId, i, shard.id, dropboxPath, 'pending']
-                 );
-             }
-        });
-
-        res.json({ ok: true, allocations });
-    } catch (e) {
-        console.error('[Files] allocate-chunks error:', e);
-        res.status(500).json({ ok: false, error: e.message });
-    }
-});
-
-app.post('/api/files/finalize-upload', async (req, res) => {
-    const { fileId } = req.body;
-    try {
-        await executeWithDB(async (workerClient) => {
-            await workerClient.query("UPDATE files SET status = 'completed' WHERE id = $1", [fileId]);
-            await workerClient.query("UPDATE file_chunks SET status = 'completed' WHERE file_id = $1", [fileId]);
-        });
-        res.json({ ok: true });
-    } catch (e) {
-        res.status(500).json({ ok: false, error: e.message });
-    }
-});
-
-app.get('/api/files/download-info/:fileId', async (req, res) => {
-    const { fileId } = req.params;
-    try {
-        let fileData, chunks;
-        await executeWithDB(async (client) => {
-            const fRes = await client.query('SELECT * FROM files WHERE id = $1', [fileId]);
-            fileData = fRes.rows[0];
-            
-            const cRes = await client.query('SELECT * FROM file_chunks WHERE file_id = $1 ORDER BY chunk_index ASC', [fileId]);
-            chunks = cRes.rows;
-        });
-
-        if (!fileData) return res.status(404).json({ ok: false, message: 'File not found' });
-
-        // 1. Get Shard Map (ALL shards, not just active/non-full ones)
-        const shardMap = await dbManager.getAllStorageShardsMap();
-
-        const downloadChunks = await Promise.all(chunks.map(async (chunk) => {
-            const shard = shardMap.get(chunk.storage_shard_id);
-            // If shard is missing, we can't download.
-            if (!shard) {
-                console.error(`Missing shard info for chunk ${chunk.chunk_id}, shard_id=${chunk.storage_shard_id}`);
-                return null;
-            }
-
-            const token = shard.refresh_token; 
-            // In a real app we would exchange refresh_token for access_token here if expired,
-            // but assuming refresh_token is actually a long-lived access token for this MVP/Demo context,
-            // (Dropbox refresh tokens don't work directly in bearer auth without exchange, but maybe user stored access token in that column)
-            // If it is indeed a refresh token, we need to acquire access token. 
-            // Assuming the stored value works as Bearer for now (Long-Lived Access Token).
-
-            try {
-                // Fetch Temp Link from Dropbox
-                const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${token}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ path: chunk.dropbox_path })
-                });
-                if(response.ok) {
-                    const data = await response.json();
-                    return {
-                        index: chunk.chunk_index,
-                        url: data.link
-                    };
-                } else {
-                    const err = await response.text();
-                    console.error(`Dropbox link failed for ${chunk.dropbox_path}: ${err}`);
-                }
-            } catch (e) { 
-                console.error("Temp link failed", e);
-            }
-            return null;
-        }));
-
-        res.json({ 
-            ok: true, 
-            file: { name: fileData.name, size_mb: fileData.size_mb },
-            chunks: downloadChunks.filter(c => c !== null) 
-        });
-
-    } catch (e) {
-        res.status(500).json({ ok: false, error: e.message });
-    }
-});
-
-// Legacy backward compatibility route (optional, or just replace functionality)
 app.post('/api/files/upload-metadata', async (req, res) => {
     const { user_id, path, name, size_mb, dropbox_path } = req.body;
     console.log('[Files] upload-metadata', { user_id, path, name, size_mb, dropbox_path });
