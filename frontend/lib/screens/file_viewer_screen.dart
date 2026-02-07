@@ -66,6 +66,7 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
         setState(() {
           _fileBytes = bytes;
         });
+        debugPrint('[FileViewer] downloaded bytes length=${bytes.length} (expected ${(widget.sizeMb*1024*1024).round()})');
 
         if (_isCodeFile) {
           _textContent = utf8.decode(bytes);

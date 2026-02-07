@@ -307,6 +307,12 @@ class FolderUploadService {
 
     int i = 0;
     while (i < sortedUnique.length) {
+      // If we already received expected bytes, avoid scheduling more downloads
+      if (expectedBytes > 0 && totalBytesReceived >= expectedBytes) {
+        print('[Download] received expected bytes ($totalBytesReceived >= $expectedBytes), skipping remaining chunks');
+        break;
+      }
+
       final batch = <Future>[];
       for (int k = 0; k < 4 && i < sortedUnique.length; k++) {
         final c = sortedUnique[i];
