@@ -147,6 +147,12 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
     return widget.fileName.toLowerCase().endsWith('.pdf');
   }
 
+  Future<void> _saveLocal() async {
+    if (_fileBytes == null) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text("To save file, please use the 'Download' option in File Manager.")));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -169,12 +175,21 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
                   : Icon(Icons.save),
               tooltip: "Save Changes",
             ),
+          // If we have a download URL, show external open
           if (_downloadUrl != null)
             IconButton(
-              icon: Icon(Icons.download),
+              icon: Icon(Icons.open_in_new),
               onPressed: () => launchUrl(Uri.parse(_downloadUrl!)),
-              tooltip: "open in Browser",
-            )
+              tooltip: "Open External",
+            ),
+          // If distributed (bytes only), show a 'save' hint or just nothing (since we have Download in Manager)
+          if (_fileBytes != null && !_isCodeFile)
+             IconButton(
+               icon: Icon(Icons.info_outline),
+               onPressed: () {
+                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Distributed file. View only mode.")));
+               },
+             )
         ],
       ),
       body: _loading
@@ -190,9 +205,27 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
               style: GoogleFonts.inter(color: Colors.white54)));
     }
 
+    if (_isPdf) {
+      if (_fileBytes != null) {
+        return SfPdfViewer.memory(
+              Uint8List.fromList(_fileBytes!),
+              onDocumentLoadFailed: (details) => ScaffoldMessenger.of(context)
+                  .showSnackBar(SnackBar(
+                      content: Text("Failed to load PDF: ${details.error}"))));
+      } else {
+        return SfPdfViewer.network(
+              _downloadUrl!,
+              onDocumentLoadFailed: (details) => ScaffoldMessenger.of(context)
+                  .showSnackBar(SnackBar(
+                      content: Text("Failed to load PDF: ${details.error}"))));
+      }
+    }
+
     if (_isImage) {
       return Center(
         child: InteractiveViewer(
+          minScale: 0.1,
+          maxScale: 5.0,
           child: _fileBytes != null
               ? Image.memory(
                   Uint8List.fromList(_fileBytes!),
@@ -233,52 +266,36 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
         ),
       );
     }
-
-    if (_isPdf) {
-      return _fileBytes != null
-          ? SfPdfViewer.memory(
-              Uint8List.fromList(_fileBytes!),
-              onDocumentLoadFailed: (details) => ScaffoldMessenger.of(context)
-                  .showSnackBar(SnackBar(
-                      content: Text("Failed to load PDF: ${details.error}"))),
-            )
-          : SfPdfViewer.network(
-              _downloadUrl!,
-              onDocumentLoadFailed: (PdfDocumentLoadFailedDetails details) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text("Failed to load PDF: ${details.error}")));
-              },
-            );
-    }
-
-    // Fallback for Video/Other
-    IconData icon = Icons.insert_drive_file;
-    String actionLabel = "OPEN FILE";
-
+    
+    // Video Stub
     if (_isVideo) {
-      icon = Icons.play_circle_outline;
-      actionLabel = "PLAY VIDEO";
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+             Icon(Icons.play_circle_outline, size: 64, color: Colors.white),
+             SizedBox(height: 16),
+             Text("Video preview not supported yet.", style: TextStyle(color: Colors.white70))
+          ],
+        )
+      );
     }
 
+    // Default Fallback
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 80, color: Colors.white24),
-          const SizedBox(height: 20),
-          Text("Preview not supported natively.",
-              style: GoogleFonts.inter(color: Colors.white54)),
-          const SizedBox(height: 20),
-          ElevatedButton.icon(
-            onPressed: () => launchUrl(Uri.parse(_downloadUrl!)),
-            icon: Icon(Icons.open_in_new),
-            label: Text(actionLabel),
-            style: ElevatedButton.styleFrom(
-                backgroundColor: KeeprTheme.primary.withOpacity(0.8),
-                foregroundColor: Colors.white),
-          )
+          Icon(Icons.insert_drive_file, size: 64, color: Colors.white24),
+          SizedBox(height: 16),
+          Text("Preview not available", style: GoogleFonts.inter(color: Colors.white54)),
+          if (_downloadUrl != null)
+            ElevatedButton(
+              onPressed: () => launchUrl(Uri.parse(_downloadUrl!)),
+              child: Text("Open External"),
+            )
         ],
-      ),
+      )
     );
   }
 }
