@@ -311,11 +311,29 @@ async function getAllActiveStorageShards() {
     }
 }
 
+async function getAllStorageShardsMap() {
+    // Returns a Map of id -> shard for ALL shards (even full or inactive, as long as they exist for retrieval)
+    let client = null;
+    try {
+        client = await tryConnectWithRetries(MASTER_DB_URL);
+        const res = await client.query(`SELECT * FROM storage_shards`);
+        const map = new Map();
+        res.rows.forEach(r => map.set(r.id, r));
+        return map;
+    } catch (e) {
+        console.error("Failed to get all storage shards:", e);
+        return new Map();
+    } finally {
+        if (client) await client.end();
+    }
+}
+
 module.exports = {
     initMasterRegistry,
     getFittestDB,
     getAllWorkerDBs,
     getAllActiveStorageShards,
+    getAllStorageShardsMap,
     updateShardUsage,
     updateStorageShardUsage,
     tryConnect: tryConnectWithRetries, // Export as generic helper

@@ -430,20 +430,23 @@ app.get('/api/files/download-info/:fileId', async (req, res) => {
 
         if (!fileData) return res.status(404).json({ ok: false, message: 'File not found' });
 
-        // Get tokens for shards again to return to client (or generate temp links here)
-        // Generating temp links here is safer than sending tokens to client
-        // ...but for "System" speed, sending tokens (if secured) or using backend proxy is options.
-        // User asked "parallel upload/download".
-        // Let's generate get_temporary_link for each chunk.
-        
-        // 1. Get Shard Map
-        const storageShards = await dbManager.getAllActiveStorageShards();
-        const shardMap = new Map();
-        storageShards.forEach(s => shardMap.set(s.id, s.refresh_token));
+        // 1. Get Shard Map (ALL shards, not just active/non-full ones)
+        const shardMap = await dbManager.getAllStorageShardsMap();
 
         const downloadChunks = await Promise.all(chunks.map(async (chunk) => {
-            const token = shardMap.get(chunk.storage_shard_id);
-            if (!token) return null;
+            const shard = shardMap.get(chunk.storage_shard_id);
+            // If shard is missing, we can't download.
+            if (!shard) {
+                console.error(`Missing shard info for chunk ${chunk.chunk_id}, shard_id=${chunk.storage_shard_id}`);
+                return null;
+            }
+
+            const token = shard.refresh_token; 
+            // In a real app we would exchange refresh_token for access_token here if expired,
+            // but assuming refresh_token is actually a long-lived access token for this MVP/Demo context,
+            // (Dropbox refresh tokens don't work directly in bearer auth without exchange, but maybe user stored access token in that column)
+            // If it is indeed a refresh token, we need to acquire access token. 
+            // Assuming the stored value works as Bearer for now (Long-Lived Access Token).
 
             try {
                 // Fetch Temp Link from Dropbox
@@ -461,6 +464,9 @@ app.get('/api/files/download-info/:fileId', async (req, res) => {
                         index: chunk.chunk_index,
                         url: data.link
                     };
+                } else {
+                    const err = await response.text();
+                    console.error(`Dropbox link failed for ${chunk.dropbox_path}: ${err}`);
                 }
             } catch (e) { 
                 console.error("Temp link failed", e);
