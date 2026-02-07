@@ -41,14 +41,14 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
 
   // NOTE: In production, use env variables
   final uploadService =
-      FolderUploadService(backendUrl: 'https://keepr-gold.vercel.app');
+      FolderUploadService(backendUrl: 'http://localhost:3000');
   // API client for auth
   late final ApiService api;
 
   @override
   void initState() {
     super.initState();
-    api = ApiService(backendBase: 'https://keepr-gold.vercel.app');
+    api = ApiService(backendBase: 'http://localhost:3000');
   }
 
   void _showSnack(String message, {bool error = false}) {

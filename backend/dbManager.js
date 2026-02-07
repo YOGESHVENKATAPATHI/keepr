@@ -261,10 +261,27 @@ async function updateShardUsage(connectionString, sizeDeltaMB) {
     }
 }
 
+async function getAllActiveStorageShards() {
+    let client = null;
+    try {
+        client = await tryConnectWithRetries(MASTER_DB_URL);
+        const res = await client.query(`
+            SELECT * FROM storage_shards WHERE is_active = TRUE ORDER BY current_usage_mb ASC
+        `);
+        return res.rows;
+    } catch (e) {
+        console.error("Failed to get storage shards:", e);
+        return [];
+    } finally {
+        if (client) await client.end();
+    }
+}
+
 module.exports = {
     initMasterRegistry,
     getFittestDB,
     getAllWorkerDBs,
+    getAllActiveStorageShards,
     updateShardUsage,
     tryConnect: tryConnectWithRetries, // Export as generic helper
     MASTER_DB_URL

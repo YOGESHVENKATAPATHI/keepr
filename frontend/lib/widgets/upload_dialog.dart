@@ -311,17 +311,17 @@ class _UploadDialogState extends State<UploadDialog> {
             children: [
               Expanded(
                 child: Text(
-                    task.isFailed
-                        ? "Error: ${task.errorMessage ?? 'Unknown'}"
-                        : (task.isCompleted
-                            ? "Upload Successful!"
-                            : "${uploadedMb.toStringAsFixed(2)} MB / ${sizeMb.toStringAsFixed(2)} MB"),
-                    style: GoogleFonts.inter(
-                        color: task.isFailed ? Colors.redAccent : Colors.white38,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w500),
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 2,
+                  task.isFailed
+                      ? "Error: ${task.errorMessage ?? 'Unknown'}"
+                      : (task.isCompleted
+                          ? "Upload Successful!"
+                          : "${uploadedMb.toStringAsFixed(2)} MB / ${sizeMb.toStringAsFixed(2)} MB"),
+                  style: GoogleFonts.inter(
+                      color: task.isFailed ? Colors.redAccent : Colors.white38,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w500),
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 2,
                 ),
               ),
             ],

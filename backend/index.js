@@ -269,6 +269,176 @@ app.post('/api/files/create-folder', async (req, res) => {
     }
 });
 
+// Generate UUID helper
+const generateUUID = () => {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
+};
+
+app.post('/api/files/init-upload', async (req, res) => {
+    const { user_id, path, name, size_mb, is_folder } = req.body;
+    try {
+        const fileId = generateUUID();
+        await executeWithDB(async (workerClient) => {
+            // Ensure schema with text ID
+            await workerClient.query(`
+                CREATE TABLE IF NOT EXISTS files (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    parent_path TEXT,
+                    name TEXT NOT NULL,
+                    is_folder BOOLEAN DEFAULT FALSE,
+                    size_mb NUMERIC DEFAULT 0,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            `);
+            await workerClient.query(`
+                 CREATE TABLE IF NOT EXISTS file_chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    file_id TEXT NOT NULL,
+                    chunk_index INT NOT NULL,
+                    storage_shard_id INT NOT NULL,
+                    dropbox_path TEXT NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            `);
+
+            const parentPath = getParentPath(path);
+            await workerClient.query(
+                'INSERT INTO files (id, user_id, path, parent_path, name, is_folder, size_mb, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+                [fileId, user_id, path, parentPath, name, is_folder || false, size_mb, 'pending']
+            );
+        });
+        res.json({ ok: true, fileId });
+    } catch (e) {
+        console.error('[Files] init-upload error:', e);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+app.post('/api/files/allocate-chunks', async (req, res) => {
+    // This API allocates chunks across available storage shards
+    const { fileId, totalChunks, fileSizeMb } = req.body; // size not strictly needed for allocation but good for tracking
+    
+    try {
+        const storageShards = await dbManager.getAllActiveStorageShards();
+        if (storageShards.length === 0) throw new Error("No active storage shards");
+
+        const allocations = [];
+        
+        await executeWithDB(async (workerClient) => {
+             for (let i = 0; i < totalChunks; i++) {
+                 // Round Robin distribution
+                 const shard = storageShards[i % storageShards.length];
+                 const chunkId = generateUUID();
+                 // Unique logical path per chunk: /fileId_chunkIndex
+                 const dropboxPath = `/${fileId}_${i}.chunk`; 
+                 
+                 allocations.push({
+                     chunkId,
+                     chunkIndex: i,
+                     storageShardId: shard.id,
+                     accessToken: shard.refresh_token, // Ideally use access token, but here assuming refresh_token field holds valid long-lived or we'd refetch 
+                     dropboxPath
+                 });
+
+                 // Persist allocation
+                 await workerClient.query(
+                     'INSERT INTO file_chunks (chunk_id, file_id, chunk_index, storage_shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5, $6)',
+                     [chunkId, fileId, i, shard.id, dropboxPath, 'pending']
+                 );
+             }
+        });
+
+        res.json({ ok: true, allocations });
+    } catch (e) {
+        console.error('[Files] allocate-chunks error:', e);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+app.post('/api/files/finalize-upload', async (req, res) => {
+    const { fileId } = req.body;
+    try {
+        await executeWithDB(async (workerClient) => {
+            await workerClient.query("UPDATE files SET status = 'completed' WHERE id = $1", [fileId]);
+            await workerClient.query("UPDATE file_chunks SET status = 'completed' WHERE file_id = $1", [fileId]);
+        });
+        res.json({ ok: true });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+app.get('/api/files/download-info/:fileId', async (req, res) => {
+    const { fileId } = req.params;
+    try {
+        let fileData, chunks;
+        await executeWithDB(async (client) => {
+            const fRes = await client.query('SELECT * FROM files WHERE id = $1', [fileId]);
+            fileData = fRes.rows[0];
+            
+            const cRes = await client.query('SELECT * FROM file_chunks WHERE file_id = $1 ORDER BY chunk_index ASC', [fileId]);
+            chunks = cRes.rows;
+        });
+
+        if (!fileData) return res.status(404).json({ ok: false, message: 'File not found' });
+
+        // Get tokens for shards again to return to client (or generate temp links here)
+        // Generating temp links here is safer than sending tokens to client
+        // ...but for "System" speed, sending tokens (if secured) or using backend proxy is options.
+        // User asked "parallel upload/download".
+        // Let's generate get_temporary_link for each chunk.
+        
+        // 1. Get Shard Map
+        const storageShards = await dbManager.getAllActiveStorageShards();
+        const shardMap = new Map();
+        storageShards.forEach(s => shardMap.set(s.id, s.refresh_token));
+
+        const downloadChunks = await Promise.all(chunks.map(async (chunk) => {
+            const token = shardMap.get(chunk.storage_shard_id);
+            if (!token) return null;
+
+            try {
+                // Fetch Temp Link from Dropbox
+                const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ path: chunk.dropbox_path })
+                });
+                if(response.ok) {
+                    const data = await response.json();
+                    return {
+                        index: chunk.chunk_index,
+                        url: data.link
+                    };
+                }
+            } catch (e) { 
+                console.error("Temp link failed", e);
+            }
+            return null;
+        }));
+
+        res.json({ 
+            ok: true, 
+            file: { name: fileData.name, size_mb: fileData.size_mb },
+            chunks: downloadChunks.filter(c => c !== null) 
+        });
+
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+// Legacy backward compatibility route (optional, or just replace functionality)
 app.post('/api/files/upload-metadata', async (req, res) => {
     const { user_id, path, name, size_mb, dropbox_path } = req.body;
     console.log('[Files] upload-metadata', { user_id, path, name, size_mb, dropbox_path });
