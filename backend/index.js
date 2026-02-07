@@ -475,7 +475,7 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
         
         // Return instructions
         // We will store this chunk at /keepr_chunks/<fileId>/<index> on the chosen shard
-        const remotePath = \`/keepr_chunks/\${fileId}/\${chunkIndex}.bin\`;
+        const remotePath = `/keepr_chunks/${fileId}/${chunkIndex}.bin`;
         
         res.json({
             shardId: account.shard_id,
