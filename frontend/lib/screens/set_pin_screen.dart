@@ -56,7 +56,8 @@ class _SetPinScreenState extends State<SetPinScreen> {
                 userId: widget.userEmail,
                 api: widget.api,
                 uploader: widget.uploader ??
-                    FolderUploadService(backendUrl: 'http://localhost:3000'))));
+                    FolderUploadService(
+                        backendUrl: 'https://keepr-gold.vercel.app'))));
       } else {
         _showSnack('Failed to set PIN', error: true);
       }

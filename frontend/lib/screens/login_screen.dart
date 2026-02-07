@@ -3,6 +3,7 @@ import 'package:glassmorphism/glassmorphism.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import '../utils/storage_helper.dart';
 
 import '../theme/keepr_theme.dart';
@@ -16,7 +17,7 @@ const String kGoogleClientId = String.fromEnvironment('GOOGLE_CLIENT_ID',
     defaultValue:
         '75763106036-6d5kmkr59sn567mbe41okqikb458r6cm.apps.googleusercontent.com');
 const String kBackendBase = String.fromEnvironment('BACKEND_BASE',
-    defaultValue: 'http://localhost:3000');
+    defaultValue: 'https://keepr-gold.vercel.app');
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -91,7 +92,7 @@ class _LoginScreenState extends State<LoginScreen> {
     try {
       final ok = await _api.sendOtp(email);
       if (ok) {
-        setState(() => _isOtpSent = true);
+        if (mounted) setState(() => _isOtpSent = true);
         _showSnack('OTP sent to $email');
       } else {
         _showSnack('Failed to send OTP. Try again.', error: true);
@@ -99,7 +100,7 @@ class _LoginScreenState extends State<LoginScreen> {
     } catch (e) {
       _showSnack('Network error occurred', error: true);
     } finally {
-      setState(() => _isLoading = false);
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -132,16 +133,16 @@ class _LoginScreenState extends State<LoginScreen> {
     } catch (e) {
       _showSnack('Network error occurred', error: true);
     } finally {
-      setState(() => _isLoading = false);
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
   Future<void> _handleGoogleSignIn() async {
-    setState(() => _isGoogleLoading = true);
+    if (mounted) setState(() => _isGoogleLoading = true);
     try {
       final account = await _googleSignIn.signIn();
       if (account == null) {
-        setState(() => _isGoogleLoading = false);
+        if (mounted) setState(() => _isGoogleLoading = false);
         return;
       }
       final auth = await account.authentication;
@@ -165,21 +166,22 @@ class _LoginScreenState extends State<LoginScreen> {
           deviceInfo: 'flutter-app');
       if (serverToken == null) {
         _showSnack('Server rejected Google sign-in', error: true);
-        setState(() => _isGoogleLoading = false);
+        if (mounted) setState(() => _isGoogleLoading = false);
         return;
       }
 
       // Persist token securely and save user email for PIN flows
-      await _secureStorage.write(key: 'auth_token', value: serverToken);
+      final stoken = serverToken!;
+      await _secureStorage.write(key: 'auth_token', value: stoken);
       await _secureStorage.write(key: 'user_email', value: account.email);
       // Also mirror into localStorage on web so refresh reliably shows PIN unlock
       try {
         await setLocalStorageValue('user_email', account.email ?? '');
-        await setLocalStorageValue('auth_token', serverToken);
+        await setLocalStorageValue('auth_token', stoken);
       } catch (_) {}
 
       // Fetch profile to check if PIN is set
-      final profileResp = await _api.getProfile(serverToken);
+      final profileResp = await _api.getProfile(stoken);
       final hasPin = profileResp != null &&
           profileResp['profile'] != null &&
           profileResp['profile']['has_pin'] == true;
@@ -208,7 +210,7 @@ class _LoginScreenState extends State<LoginScreen> {
       print('[Login] Google sign-in error: $e');
       _showSnack('Google sign-in failed: ${e.toString()}', error: true);
     } finally {
-      setState(() => _isGoogleLoading = false);
+      if (mounted) setState(() => _isGoogleLoading = false);
     }
   }
 
@@ -444,7 +446,8 @@ class _LoginScreenState extends State<LoginScreen> {
 
                                     const SizedBox(height: 10),
 
-                                    // Google Sign-In
+// Google Sign-In (only on platforms where supported)
+                                  if (kIsWeb || defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS) ...[
                                     SizedBox(
                                       width: double.infinity,
                                       height: 48,
@@ -474,6 +477,23 @@ class _LoginScreenState extends State<LoginScreen> {
                                         ),
                                       ),
                                     ),
+                                  ],
+                                  // On unsupported platforms, optionally show nothing or a disabled hint
+                                  if (!(kIsWeb || defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS)) ...[
+                                    const SizedBox(height: 10),
+                                    SizedBox(
+                                      width: double.infinity,
+                                      height: 48,
+                                      child: OutlinedButton(
+                                        onPressed: null,
+                                        style: OutlinedButton.styleFrom(
+                                          foregroundColor: Colors.white54,
+                                          backgroundColor: Colors.white.withAlpha((0.03 * 255).round()),
+                                        ),
+                                        child: const Text('Sign in with Google (not available on desktop)'),
+                                      ),
+                                    ),
+                                  ],
 
                                     const SizedBox(height: 10),
 
@@ -499,8 +519,8 @@ class _LoginScreenState extends State<LoginScreen> {
                                                           idToken: _lastIdToken,
                                                           accessToken:
                                                               _lastAccessToken);
-                                                  Navigator.of(context).pop();
-                                                  await showDialog(
+                                                  if (mounted) Navigator.of(context).pop();
+                                                  if (mounted) await showDialog(
                                                       context: context,
                                                       builder:
                                                           (ctx) => AlertDialog(
@@ -520,8 +540,8 @@ class _LoginScreenState extends State<LoginScreen> {
                                                                 ],
                                                               ));
                                                 } catch (e) {
-                                                  Navigator.of(context).pop();
-                                                  _showSnack(
+                                                  if (mounted) Navigator.of(context).pop();
+                                                  if (mounted) _showSnack(
                                                       'Debug request failed: ${e.toString()}',
                                                       error: true);
                                                 }
