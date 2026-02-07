@@ -526,29 +526,37 @@ app.post('/api/upload/finalize', async (req, res) => {
             for (const c of chunks) {
                 // Handle case where shardId is missing (legacy/error)
                 const safeShardId = c.shardId || c.shard_id || 0; 
-                
-                // DATA INTEGRITY: Insert into BOTH shard_id and storage_shard_id 
-                // to ensure we cover whatever column the current DB schema is using.
-                // STARTING with the failing one (storage_shard_id) + shard_id
-                
+
+                // Convert size (bytes) if provided
+                const sizeBytes = c.size || c.size_bytes || 0;
+                const sizeMb = sizeBytes ? (sizeBytes / (1024 * 1024)) : null;
+
+                // CHECK: Avoid duplicate entries for same file_id + chunk_index
+                const existing = await client.query(
+                    'SELECT 1 FROM file_chunks WHERE file_id=$1 AND chunk_index=$2',
+                    [fileId, c.index]
+                );
+
+                if (existing.rowCount > 0) {
+                    console.log(`Skipping duplicate chunk for file=${fileId} index=${c.index}`);
+                    continue;
+                }
+
+                // DATA INTEGRITY: Insert into shard columns and persist size_mb when available
                 try {
-                    // Try robust insert aiming for all potential columns
-                    await client.query(
-                        `INSERT INTO file_chunks 
-                          (file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, status) 
-                         VALUES ($1, $2, $3, $3, $4, 'completed')`,
-                        [fileId, c.index, safeShardId, c.path]
-                    );
+                    const insertQuery = `INSERT INTO file_chunks 
+                      (file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, size_mb, status) 
+                     VALUES ($1, $2, $3, $3, $4, $5, 'completed')`;
+                    await client.query(insertQuery, [fileId, c.index, safeShardId, c.path, sizeMb]);
                 } catch (insertErr) {
-                    
                     // FALLBACK 1: Maybe 'shard_id' column doesn't exist? Try only storage_shard_id
                     if (insertErr.message && insertErr.message.includes('shard_id')) {
                          try {
                             await client.query(
                                 `INSERT INTO file_chunks 
-                                  (file_id, chunk_index, storage_shard_id, dropbox_path, status) 
-                                 VALUES ($1, $2, $3, $4, 'completed')`,
-                                [fileId, c.index, safeShardId, c.path]
+                                  (file_id, chunk_index, storage_shard_id, dropbox_path, size_mb, status) 
+                                 VALUES ($1, $2, $3, $4, $5, 'completed')`,
+                                [fileId, c.index, safeShardId, c.path, sizeMb]
                             );
                             continue; // Success
                          } catch (e2) { /* ignore, try next fallback */ }
@@ -559,9 +567,9 @@ app.post('/api/upload/finalize', async (req, res) => {
                         console.warn('Fallback insert with manual chunk_id');
                         await client.query(
                             `INSERT INTO file_chunks 
-                              (chunk_id, file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, status) 
-                             VALUES ($1, $2, $3, $4, $4, $5, 'completed')`,
-                            [Math.floor(Math.random() * 10000000), fileId, c.index, safeShardId, c.path] // $1..$5
+                              (chunk_id, file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, size_mb, status) 
+                             VALUES ($1, $2, $3, $4, $4, $5, $6, 'completed')`,
+                            [Math.floor(Math.random() * 10000000), fileId, c.index, safeShardId, c.path, sizeMb] // $1..$6
                         );
                     } else {
                         console.error("Unknown Insert Error detail:", insertErr);
@@ -619,7 +627,7 @@ app.post('/api/files/download-info', async (req, res) => {
     try {
         const chunks = await executeWithDB(async (client) => {
             const resChunks = await client.query(
-                'SELECT chunk_index, shard_id, dropbox_path FROM file_chunks WHERE file_id = $1 ORDER BY chunk_index ASC',
+                'SELECT chunk_index, shard_id, dropbox_path, size_mb FROM file_chunks WHERE file_id = $1 ORDER BY chunk_index ASC',
                 [fileIdRef]
             );
             return resChunks.rows;
@@ -643,13 +651,20 @@ app.post('/api/files/download-info', async (req, res) => {
                 chunksWithTokens.push({
                     index: c.chunk_index,
                     path: c.dropbox_path,
-                    token: tokenMap[c.shard_id]
+                    token: tokenMap[c.shard_id],
+                    size_mb: c.size_mb || null
                 });
             }
         });
         
+        // Optionally include file-level metadata to help the client verify integrity
+        const metaRes = await executeWithDB(async (client) => {
+            const r = await client.query('SELECT total_chunks, total_size_mb FROM file_uploads WHERE file_id=$1', [fileIdRef]);
+            return r.rows[0];
+        });
+
         chunksWithTokens.sort((a,b) => a.index - b.index);
-        res.json({ chunks: chunksWithTokens });
+        res.json({ chunks: chunksWithTokens, total_chunks: metaRes?.total_chunks || null, total_size_mb: metaRes?.total_size_mb || null });
 
     } catch(e) {
         console.error('Download Info Failed', e);

@@ -19,6 +19,7 @@ class FileViewerScreen extends StatefulWidget {
   final String dropboxPath;
   final String? fileIdRef;
   final FolderUploadService uploader;
+  final double sizeMb;
 
   const FileViewerScreen({
     super.key,
@@ -28,6 +29,7 @@ class FileViewerScreen extends StatefulWidget {
     required this.dropboxPath,
     this.fileIdRef,
     required this.uploader,
+    this.sizeMb = 0,
   });
 
   @override
@@ -60,7 +62,7 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
       if (widget.dropboxPath == 'distributed' && widget.fileIdRef != null) {
         // Distributed: Download bytes directly
         final bytes =
-            await widget.uploader.downloadDistributedFile(widget.fileIdRef!);
+            await widget.uploader.downloadDistributedFile(widget.fileIdRef!, widget.sizeMb);
         setState(() {
           _fileBytes = bytes;
         });

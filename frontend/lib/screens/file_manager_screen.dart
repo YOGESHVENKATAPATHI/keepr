@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:universal_html/html.dart' as html;
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
@@ -32,17 +33,20 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
   String currentPath = '/';
   List<dynamic> items = [];
   bool loading = false;
-  final StreamController<double> _downloadProgressController = StreamController<double>.broadcast();
+  StreamController<double>? _downloadProgressController;
 
   @override
   void initState() {
     super.initState();
+    _downloadProgressController = StreamController<double>.broadcast();
     _refresh();
   }
 
   @override
   void dispose() {
-    _downloadProgressController.close();
+    if (_downloadProgressController != null && !_downloadProgressController!.isClosed) {
+      _downloadProgressController!.close();
+    }
     super.dispose();
   }
 
@@ -137,7 +141,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
           builder: (ctx) {
             return StatefulBuilder(builder: (context, setState) {
               return StreamBuilder<double>(
-                  stream: _downloadProgressController.stream,
+                  stream: _downloadProgressController?.stream ?? Stream.value(0.0),
                   initialData: 0.0,
                   builder: (context, snapshot) {
                     final p = snapshot.data ?? 0.0;
@@ -168,14 +172,18 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
 
         final bytes = await widget.uploader.downloadDistributedFile(
             item['file_id_ref'], sizeMb, onProgress: (p) {
-          if (!_downloadProgressController.isClosed)
-            _downloadProgressController.add(p);
+          if (_downloadProgressController != null && !_downloadProgressController!.isClosed) {
+            _downloadProgressController!.add(p);
+          }
         });
         
         Navigator.pop(context); // Close dialog
 
         if (kIsWeb) {
-          final blob = html.Blob([bytes]);
+          // Ensure we pass a typed buffer to the JS Blob constructor to avoid JS string coercion
+          final u8 = Uint8List.fromList(bytes);
+          print('[Download] final assembled bytes: ${u8.length} (expected ${(sizeMb*1024*1024).round()})');
+          final blob = html.Blob([u8], 'application/octet-stream');
           final url = html.Url.createObjectUrlFromBlob(blob);
           final anchor = html.AnchorElement(href: url)
             ..setAttribute("download", name)
@@ -500,6 +508,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                           dropboxPath: it['dropbox_path'] ?? it['path'],
                           fileIdRef: it['file_id_ref'], // Pass distributed ID
                           uploader: widget.uploader,
+                          sizeMb: double.tryParse(it['size_mb']?.toString() ?? '0') ?? 0,
                         )));
           }
         },

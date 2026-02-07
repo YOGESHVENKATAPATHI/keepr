@@ -142,7 +142,9 @@ class FolderUploadService {
     await doneCompleter.future;
 
     // 3. Finalize
-    print("Finalizing upload for $fileId...");
+    print("Finalizing upload for $fileId... total chunks=${completedChunks.length}");
+    print('[Upload][DEBUG] chunks metadata: ${completedChunks.map((c)=>{'index':c['index'],'chunkId':c['chunkId'],'size':c['size'],'path':c['path']}).toList()}');
+
     final finalizeResp = await http.post(
         Uri.parse('$backendUrl/api/upload/finalize'),
         headers: {'Content-Type': 'application/json'},
@@ -187,8 +189,11 @@ class FolderUploadService {
         }));
 
     // C. Report Success
+    // Attach a per-chunk identifier to make it easier to trace and dedupe
+    final chunkId = '${fileId}_${chunkIndex}_${DateTime.now().millisecondsSinceEpoch}';
     onChunkComplete({
       'index': chunkIndex,
+      'chunkId': chunkId,
       'shardId': alloc['shardId'],
       'path': alloc['uploadPath'],
       'size': chunkData.length,
@@ -209,7 +214,20 @@ class FolderUploadService {
 
     final data = jsonDecode(infoResp.body);
     final chunks = (data['chunks'] as List).cast<Map<String, dynamic>>();
-    
+
+    print('[Download][DEBUG] raw chunks from server: ${chunks.map((c)=>{'index':c['index'], 'path': c['path'], 'size_mb': c['size_mb']}).toList()}');
+
+    // Detect duplicate indices returned by server
+    final dupCounts = <int, int>{};
+    for (var c in chunks) {
+      final idx = c['index'] as int;
+      dupCounts[idx] = (dupCounts[idx] ?? 0) + 1;
+    }
+    final duplicates = dupCounts.entries.where((e) => e.value > 1).toList();
+    if (duplicates.isNotEmpty) {
+      print('[Download][WARN] duplicate chunk indices found from server: ${duplicates.map((e)=>{'index': e.key, 'count': e.value}).toList()}');
+    }
+
     // Deduplicate chunks locally just in case backend sends duplicates
     final uniqueChunks = <int, Map<String, dynamic>>{};
     for (var c in chunks) {
@@ -227,12 +245,36 @@ class FolderUploadService {
     }
 
     // 2. Download Chunks (Parallel)
-    final List<List<int>> parts = List.filled(maxIndex + 1, []);
+    // Create unique empty lists per slot to avoid accidental shared references
+    final List<List<int>> parts = List.generate(maxIndex + 1, (_) => <int>[]);
     final client = http.Client();
     int totalBytesReceived = 0;
-    int expectedBytes = (totalSizeMb * 1024 * 1024).round(); // approx
+
+    // Prefer accurate expected size from server metadata if present
+    int expectedBytes = 0;
+    // Try to compute sum of chunk sizes returned by server (size_mb) if available
+    int sumChunkBytes = 0;
+    bool haveChunkSizes = false;
+    for (var c in sortedUnique) {
+      if (c.containsKey('size_mb') && c['size_mb'] != null) {
+        haveChunkSizes = true;
+        final n = (c['size_mb'] as num) * 1024 * 1024;
+        sumChunkBytes += n.round();
+      }
+    }
+
+    if (haveChunkSizes) {
+      expectedBytes = sumChunkBytes;
+    } else if (data.containsKey('total_size_mb') && data['total_size_mb'] != null) {
+      expectedBytes = (data['total_size_mb'] * 1024 * 1024).round();
+    } else {
+      expectedBytes = (totalSizeMb * 1024 * 1024).round(); // approx fallback
+    }
+
+    print('[Download] starting chunk downloads; chunks requested=${sortedUnique.length}, maxIndex=$maxIndex, expectedBytes=$expectedBytes');
 
     Future<void> fetchChunk(int index, String path, String token) async {
+      print('[Download] fetching chunk index=$index path=$path');
       final url = 'https://content.dropboxapi.com/2/files/download';
       final headers = {
         'Authorization': 'Bearer $token',
@@ -251,6 +293,7 @@ class FolderUploadService {
       await streamedResponse.stream.listen((data) {
         chunkBytes.addAll(data);
         totalBytesReceived += data.length;
+        print('[Download] chunk $index received ${data.length} bytes (running total: $totalBytesReceived)');
         if (onProgress != null && expectedBytes > 0) {
            double p = totalBytesReceived / expectedBytes;
            if (p > 1.0) p = 1.0;
@@ -259,6 +302,7 @@ class FolderUploadService {
       }).asFuture();
 
       parts[index] = chunkBytes;
+      print('[Download] chunk $index complete size=${chunkBytes.length}');
     }
 
     int i = 0;
@@ -274,8 +318,31 @@ class FolderUploadService {
     client.close();
 
     // 3. Merge
-    // Filter any empty parts if gaps exist (shouldn't happen if logic is correct)
-    return parts.where((p) => p.isNotEmpty).expand((x) => x).toList();
+    // Inspect parts before merge for diagnostics
+    int sumParts = 0;
+    final missingIndices = <int>[];
+    for (int idx = 0; idx < parts.length; idx++) {
+      final psize = parts[idx].length;
+      print('[Download] part $idx size=$psize');
+      if (psize == 0) missingIndices.add(idx);
+      sumParts += psize;
+    }
+
+    final assembled = parts.where((p) => p.isNotEmpty).expand((x) => x).toList();
+    print('[Download] assembled byte length=${assembled.length} expected=$expectedBytes totalReceived=$totalBytesReceived sumParts=$sumParts missingChunks=${missingIndices.length}');
+
+    if (expectedBytes > 0 && assembled.length != expectedBytes) {
+      print('[Download][WARN] assembled size (${assembled.length}) != expected size ($expectedBytes)');
+      print('[Download][WARN] chunk map: ${sortedUnique.map((c)=>{'index': c['index'], 'path': c['path'], 'size_mb': c['size_mb']}).toList()}');
+      print('[Download][WARN] missing indices: $missingIndices');
+      // Provide hint to developers: duplicates or mis-indexed chunks can cause this
+      final dupCheck = <int,int>{};
+      for (var c in chunks) { dupCheck[c['index']] = (dupCheck[c['index']] ?? 0) + 1; }
+      final dups = dupCheck.entries.where((e)=>e.value>1).map((e)=>{'index':e.key,'count':e.value}).toList();
+      if (dups.isNotEmpty) print('[Download][WARN] server returned duplicate chunk indices: $dups');
+    }
+
+    return assembled;
   }
 
   // Helper to upload simple text content (for code editor)
