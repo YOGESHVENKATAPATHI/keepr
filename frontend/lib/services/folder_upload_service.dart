@@ -118,6 +118,22 @@ class FolderUploadService {
     }
   }
 
+  // Upload String Content (Editor Save)
+  Future<void> uploadStringContent(String content, String userId, String logicalPath) async {
+    final bytes = utf8.encode(content);
+    final name = logicalPath.split('/').last;
+    
+    await uploadDistributedFile(
+      name: name,
+      logicalPath: logicalPath,
+      size: bytes.length,
+      userId: userId,
+      chunkReader: (start, end) async {
+         return bytes.sublist(start, end);
+      }
+    );
+  }
+
   // Web/Desktop File Picker Upload
   Future<void> uploadWebFiles(
       List<PlatformFile> files, String userId, String parentPath,

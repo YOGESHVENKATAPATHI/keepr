@@ -19,9 +19,11 @@ app.use((req, res, next) => {
 
 // Initialize Registry on Start
 // Run init but don't crash the server if Master DB is unreachable; start in degraded mode and allow health checks / admin fixes
-dbManager.initMasterRegistry().catch(err => {
-    console.error('Master Registry init failed, starting in degraded mode:', err.message);
-});
+dbManager.initMasterRegistry()
+    .then(() => dbManager.syncAllShardsSchema()) // ADDED: Sync schema across all workers
+    .catch(err => {
+        console.error('Master Registry init (or schema sync) failed, starting in degraded mode:', err.message);
+    });
 
 // Health test for DB connectivity
 app.get('/api/health/db', async (req, res) => {

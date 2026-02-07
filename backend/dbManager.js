@@ -292,6 +292,63 @@ async function updateStorageShardUsage(shardId, sizeDeltaMB) {
     }
 }
 
+// Ensure schema on a specific client
+async function ensureWorkerSchema(client) {
+    try {
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        `);
+        // Note: We use the TEXT ID version for files to support mixed content
+        // If table exists (from older logical branch), this skips.
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS files (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                parent_path TEXT,
+                name TEXT NOT NULL,
+                is_folder BOOLEAN DEFAULT FALSE,
+                size_mb NUMERIC DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                dropbox_path TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        `);
+        await client.query(`
+                CREATE TABLE IF NOT EXISTS file_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                chunk_index INT NOT NULL,
+                storage_shard_id INT NOT NULL,
+                dropbox_path TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        `);
+        console.log(`[DB] Schema ensured on ${client._connectionString || 'db'}`);
+    } catch (e) {
+        console.error("Schema sync error:", e.message);
+    }
+}
+
+// Run schema sync on ALL active db shards
+async function syncAllShardsSchema() {
+    console.log("[DB] Starting Schema Sync on all shards...");
+    const clients = await getAllWorkerDBs();
+    for (const { client, id } of clients) {
+        try {
+            await ensureWorkerSchema(client);
+        } finally {
+            if(client) await client.end();
+        }
+    }
+    console.log("[DB] Schema Sync Complete.");
+}
+
 async function getAllActiveStorageShards() {
     let client = null;
     try {
@@ -336,6 +393,7 @@ module.exports = {
     getAllStorageShardsMap,
     updateShardUsage,
     updateStorageShardUsage,
+    syncAllShardsSchema,
     tryConnect: tryConnectWithRetries, // Export as generic helper
     MASTER_DB_URL
 };
