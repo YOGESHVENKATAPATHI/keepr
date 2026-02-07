@@ -343,7 +343,7 @@ app.get('/api/files/list', async (req, res) => {
             // Query this specific shard
             // Also leniently allow NULL parent_path if we are looking for root ('/')
             const q = await workerClient.query(
-                `SELECT id, user_id, path, name, is_folder, size_mb, dropbox_path, file_id_ref, created_at 
+                `SELECT id, user_id, path, name, is_folder, size_mb, dropbox_path, created_at 
                  FROM files 
                  WHERE user_id = $1 
                    AND (parent_path = $2 OR ($2 = '/' AND parent_path IS NULL))

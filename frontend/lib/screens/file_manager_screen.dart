@@ -10,8 +10,6 @@ import 'file_viewer_screen.dart';
 import '../widgets/upload_dialog.dart';
 
 import 'package:url_launcher/url_launcher.dart';
-import 'package:universal_html/html.dart' as html;
-import 'package:flutter/foundation.dart' show kIsWeb;
 
 class FileManagerScreen extends StatefulWidget {
   final String userId;
@@ -128,28 +126,18 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
           // Optional: Show percent
         });
 
-        if (kIsWeb) {
-          final blob = html.Blob([bytes]);
-          final url = html.Url.createObjectUrlFromBlob(blob);
-          final anchor = html.AnchorElement(href: url)
-            ..setAttribute("download", name)
-            ..click();
-          html.Url.revokeObjectUrl(url);
-          _showSnack('Download started');
-        } else {
-          // Prompt save
-          String? savePath = await FilePicker.platform.saveFile(
-            dialogTitle: 'Save $name',
-            fileName: name,
-          );
+        // Prompt save
+        String? savePath = await FilePicker.platform.saveFile(
+          dialogTitle: 'Save $name',
+          fileName: name,
+        );
 
-          if (savePath != null) {
-            final f = File(savePath);
-            await f.writeAsBytes(bytes);
-            _showSnack('Saved to $savePath');
-          } else {
-            _showSnack('Save cancelled');
-          }
+        if (savePath != null) {
+          final f = File(savePath);
+          await f.writeAsBytes(bytes);
+          _showSnack('Saved to $savePath');
+        } else {
+          _showSnack('Save cancelled');
         }
       } catch (e) {
         _showSnack('Distributed download failed: $e', isError: true);
@@ -439,25 +427,20 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     return Material(
       color: Colors.transparent,
       child: InkWell(
-        onTap: () async {
+        onTap: () {
           if (isFolder) {
             setState(() => currentPath = it['path']);
             _refresh();
           } else {
-             // Ensure distributed parameters are passed correctly
-             // If dropbox_path is 'distributed', we MUST pass fileIdRef.
-             final String dPath = it['dropbox_path'] ?? it['path'];
-             final String? fRef = it['file_id_ref'];
-             
-             Navigator.push(
+            Navigator.push(
                 context,
                 MaterialPageRoute(
                     builder: (_) => FileViewerScreen(
                           userId: widget.userId,
                           fileName: name,
                           path: it['path'],
-                          dropboxPath: dPath,
-                          fileIdRef: fRef,
+                          dropboxPath: it['dropbox_path'] ?? it['path'],
+                          fileIdRef: it['file_id_ref'], // Pass distributed ID
                           uploader: widget.uploader,
                         )));
           }

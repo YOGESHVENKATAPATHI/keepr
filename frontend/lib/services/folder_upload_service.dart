@@ -100,18 +100,6 @@ class FolderUploadService {
     int chunkIndex = 0;
     Completer<void> doneCompleter = Completer<void>();
     List<dynamic> fatalErrors = [];
-    
-    // For granular progress tracking
-    Map<int, int> chunkProgressMap = {};
-    
-    void updateGranularProgress() {
-       if (onProgress == null) return;
-       int totalUploaded = chunkProgressMap.values.fold(0, (sum, val) => sum + val);
-       // Ensure we don't exceed 1.0 logic due to overhead
-       double p = totalUploaded / totalSize;
-       if (p > 1.0) p = 1.0;
-       onProgress(p);
-    }
 
     void startNext() async {
       if (fatalErrors.isNotEmpty) return;
@@ -123,7 +111,6 @@ class FolderUploadService {
 
       final i = chunkIndex++;
       activeUploads++;
-      chunkProgressMap[i] = 0; // Init progress for this chunk
 
       try {
         await _processChunk(
@@ -134,15 +121,10 @@ class FolderUploadService {
                 (i * chunkSize + chunkSize < totalSize
                     ? i * chunkSize + chunkSize
                     : totalSize)),
-            onSendProgress: (sent, total) {
-               chunkProgressMap[i] = sent;
-               updateGranularProgress();
-            },
             onChunkComplete: (result) {
               completedChunks.add(result);
-              // Ensure final size is recorded accurately (should match sent)
-              chunkProgressMap[i] = result['size'] as int; 
-              updateGranularProgress();
+              bytesUploaded += (result['size'] as int); // Approximate or exact
+              if (onProgress != null) onProgress(bytesUploaded / totalSize);
             });
       } catch (e) {
         print("Chunk $i failed: $e");
@@ -173,7 +155,6 @@ class FolderUploadService {
       {required String fileId,
       required int chunkIndex,
       required List<int> chunkData,
-      Function(int, int)? onSendProgress,
       required Function(Map<String, dynamic>) onChunkComplete}) async {
     final sizeMb = chunkData.length / (1024 * 1024);
 
@@ -194,7 +175,6 @@ class FolderUploadService {
     await dio.post('https://content.dropboxapi.com/2/files/upload',
         data: Stream.fromIterable(
             [chunkData]), // Wrap as stream or just data? Dio handles List<int>
-        onSendProgress: onSendProgress,
         options: Options(headers: {
           'Authorization': 'Bearer ${alloc['accessToken']}',
           'Dropbox-API-Arg': jsonEncode({
