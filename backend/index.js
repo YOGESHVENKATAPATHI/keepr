@@ -623,14 +623,15 @@ app.post('/api/files/download-info', async (req, res) => {
             // We need tokens for these shards to give to client
             // This is slightly inefficient (N queries), but simple. 
             // Better: fetch all active shards in memory map.
-            const shardsRes = await client.query('SELECT * FROM storage_shards');
-            const shardMap = {};
-            shardsRes.rows.forEach(s => {
+            // const shardsRes = await client.query('SELECT * FROM storage_shards');
+            // const shardMap = {};
+            // shardsRes.rows.forEach(s => {
                 // If using dbManager logic:
                 // We might need to decrypt or just use what we have. 
                 // Assuming simple schema for now as per `storageManager.js`
-                shardMap[s.id] = s.refresh_token; // Wait, we need access tokens.
-            });
+                // shardMap[s.id] = s.refresh_token; // Wait, we need access tokens.
+            // });
+            
             
             // To be secure, we should probably generate fresh short-lived links or 
             // give the client the access tokens (if trusted app). 
@@ -663,16 +664,8 @@ app.post('/api/files/download-info', async (req, res) => {
                  // It doesn't support that.
                  
                  // manual refresh logic (simplified):
-                 const sMetaRes = await client.query('SELECT * FROM storage_shards WHERE id=$1', [sId]);
-                 const sMeta = sMetaRes.rows[0];
-                 if(sMeta) {
-                     // We need a way to get a valid token.
-                     // For now, let's assume the token in DB is valid or the client deals with it?
-                     // No, tokens expire. 
-                     // We must create a new helper in storageManager or duplicate logic.
-                     
-                     // Let's use the `storageManager` to Refresh token if needed
-                     // We'll require `storageManager` to export a `getAccessTokenForShard(id)`
+                 // Use dbManager from storageManager (which uses MASTER DB) instead of local worker client
+                 try {
                      const token = await storageManager.getAccessTokenForShard(sId); 
                      
                      chunks.forEach(c => {
@@ -682,6 +675,11 @@ app.post('/api/files/download-info', async (req, res) => {
                              token: token
                          });
                      });
+                 } catch(shardErr) {
+                     console.error(`Failed to get token for shard ${sId}: ${shardErr.message}`);
+                     // Skip these chunks or error out? 
+                     // Partial file = corrupted. 
+                     // But maybe other shards work.
                  }
              }
              
