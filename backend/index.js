@@ -449,6 +449,15 @@ app.post('/api/upload/init', async (req, res) => {
                     status TEXT DEFAULT 'pending'
                 );
             `);
+
+            // Schema Evolution: Ensure columns exist if table was created previously
+            try {
+                await client.query('ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS shard_id INT');
+                await client.query('ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS size_mb NUMERIC');
+                await client.query('ALTER TABLE file_uploads ADD COLUMN IF NOT EXISTS total_chunks INT');
+            } catch (e) {
+                console.log('Schema update skipped/failed', e.message);
+            }
             
             await client.query(
                 'INSERT INTO file_uploads (file_id, user_id, path, name, total_size_mb, total_chunks) VALUES ($1, $2, $3, $4, $5, $6)',
