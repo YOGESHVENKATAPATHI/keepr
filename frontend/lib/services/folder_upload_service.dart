@@ -11,6 +11,7 @@ class FolderUploadService {
 
   FolderUploadService({required this.backendUrl});
 
+
   // Web-compatible upload for PlatformFiles (from file_picker)
   Future<void> uploadWebFiles(
       List<PlatformFile> files, String userId, String parentPath,
@@ -21,7 +22,6 @@ class FolderUploadService {
         final safeParent = parentPath.endsWith('/') && parentPath.length > 1
             ? parentPath.substring(0, parentPath.length - 1)
             : parentPath;
-        // if parent is just '/', we want '/filename'. if parent is '/foo', we want '/foo/filename'
 
         String logicalPath;
         if (safeParent == '/') {
@@ -30,29 +30,223 @@ class FolderUploadService {
           logicalPath = "$safeParent/${file.name}";
         }
 
-        final sizeMb = file.size / (1024 * 1024);
-
-        // Fetch token specifically for this file size
-        String dropboxToken = await _getBestStorageToken(sizeMb: sizeMb);
-
-        // Dropbox path
-        String dropboxPath = logicalPath;
-        await _uploadPlatformFile(file, dropboxPath, dropboxToken,
-            onProgress: (sent, total) {
-          if (onFileProgress != null) {
-            double p = sent / total;
-            onFileProgress(file.name, p);
-          }
-        });
-
-        // Save metadata to backend
-        await _saveFileMetadata(
-            userId, logicalPath, file.name, sizeMb, dropboxPath);
+        // Use Distributed Upload Logic
+        await _uploadFileDistributed(
+          file, 
+          userId, 
+          logicalPath, 
+          onProgress: (p) => onFileProgress?.call(file.name, p)
+        );
       }
     } catch (e) {
       print("Error uploading web files: $e");
       rethrow;
     }
+  }
+
+  // --- Distributed Upload Logic ---
+  
+  Future<void> _uploadFileDistributed(PlatformFile file, String userId, String logicalPath, {Function(double)? onProgress}) async {
+    final int chunkSize = 4 * 1024 * 1024; // 4MB
+    final int totalSize = file.size;
+    final int totalChunks = (totalSize / chunkSize).ceil();
+    final String fileName = file.name;
+    final double totalSizeMb = totalSize / (1024 * 1024);
+
+    // 1. Init Upload
+    final initResp = await http.post(
+      Uri.parse('$backendUrl/api/upload/init'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'user_id': userId,
+        'path': logicalPath,
+        'name': fileName,
+        'total_size_mb': totalSizeMb,
+        'total_chunks': totalChunks
+      })
+    );
+    
+    if (initResp.statusCode != 200) throw Exception("Init upload failed: ${initResp.body}");
+    final fileId = jsonDecode(initResp.body)['fileId'];
+    print("Initialized upload for $fileName (ID: $fileId) with $totalChunks chunks");
+
+    // 2. Prepare chunks
+    List<Future> uploadTasks = [];
+    List<Map<String, dynamic>> completedChunks = [];
+    int bytesUploaded = 0;
+    
+    // We need the file bytes. On web, file.bytes is usually populated.
+    // If not (large file on desktop), we might have issues with random access if using stream.
+    // Assuming bytes available for now (Web context).
+    final bytes = file.bytes;
+    if (bytes == null) throw Exception("File bytes not available for chunking. Ensure file is loaded in memory.");
+
+    // Semaphore for concurrency (limit 4 parallel uploads)
+    // Simple implementation: Custom batch runner or just careful loop
+    final int concurrency = 4;
+    
+    for (int i = 0; i < totalChunks; i++) {
+        final start = i * chunkSize;
+        final end = (start + chunkSize < totalSize) ? start + chunkSize : totalSize;
+        final chunkData = bytes.sublist(start, end);
+        
+        // We'll queue this work
+        // To strictly limit concurrency, we can use a Queue or pool.
+        // For simplicity in this prompt, let's use a batching approach.
+    }
+
+    // Processing using a pool
+    int activeUploads = 0;
+    int chunkIndex = 0;
+    Completer<void> doneCompleter = Completer<void>();
+    List<dynamic> fatalErrors = [];
+
+    void startNext() async {
+      if (fatalErrors.isNotEmpty) return;
+      if (chunkIndex >= totalChunks) {
+         if (activeUploads == 0 && !doneCompleter.isCompleted) doneCompleter.complete();
+         return;
+      }
+      
+      final i = chunkIndex++;
+      activeUploads++;
+      
+      try {
+        await _processChunk(
+          fileId: fileId, 
+          chunkIndex: i, 
+          chunkData: bytes.sublist(i * chunkSize, (i * chunkSize + chunkSize < totalSize ? i * chunkSize + chunkSize : totalSize)),
+          onChunkComplete: (result) {
+            completedChunks.add(result);
+            bytesUploaded += (result['size'] as int); // Approximate or exact
+            if(onProgress != null) onProgress(bytesUploaded / totalSize);
+          }
+        );
+      } catch (e) {
+        print("Chunk $i failed: $e");
+        fatalErrors.add(e);
+        if (!doneCompleter.isCompleted) doneCompleter.completeError(e);
+      } finally {
+        activeUploads--;
+        startNext();
+      }
+    }
+
+    // Start initial batch
+    for(int k=0; k<concurrency; k++) startNext();
+    
+    await doneCompleter.future;
+
+    // 3. Finalize
+    print("Finalizing upload for $fileId...");
+    final finalizeResp = await http.post(
+       Uri.parse('$backendUrl/api/upload/finalize'),
+       headers: {'Content-Type': 'application/json'},
+       body: jsonEncode({
+         'fileId': fileId,
+         'chunks': completedChunks
+       })
+    );
+     if (finalizeResp.statusCode != 200) throw Exception("Finalize failed: ${finalizeResp.body}");
+  }
+
+  Future<void> _processChunk({
+    required String fileId, 
+    required int chunkIndex, 
+    required List<int> chunkData, 
+    required Function(Map<String, dynamic>) onChunkComplete
+  }) async {
+    final sizeMb = chunkData.length / (1024 * 1024);
+    
+    // A. Allocate
+    final allocResp = await http.post(
+       Uri.parse('$backendUrl/api/upload/allocate-chunk'),
+       headers: {'Content-Type': 'application/json'},
+       body: jsonEncode({
+         'fileId': fileId,
+         'chunkIndex': chunkIndex,
+         'sizeMb': sizeMb
+       })
+    );
+    if (allocResp.statusCode != 200) throw Exception("Alloc chunk failed");
+    final alloc = jsonDecode(allocResp.body);
+    // Expects: { shardId, accessToken, uploadPath }
+    
+    // B. Upload to Dropbox
+    final dio = Dio(); 
+    // dio.options.connectTimeout = 5000;
+    
+    await dio.post(
+      'https://content.dropboxapi.com/2/files/upload',
+      data: Stream.fromIterable([chunkData]), // Wrap as stream or just data? Dio handles List<int>
+      options: Options(
+        headers: {
+          'Authorization': 'Bearer ${alloc['accessToken']}',
+          'Dropbox-API-Arg': jsonEncode({
+            "path": alloc['uploadPath'],
+            "mode": "overwrite", // chunks are immutable per index
+            "autorename": false,
+            "mute": true
+          }),
+          'Content-Type': 'application/octet-stream'
+        }
+      )
+    );
+    
+    // C. Report Success
+    onChunkComplete({
+       'index': chunkIndex,
+       'shardId': alloc['shardId'],
+       'path': alloc['uploadPath'],
+       'size': chunkData.length,
+       'success': true
+    });
+  }
+
+  // --- Distributed Download Logic ---
+  Future<List<int>> downloadDistributedFile(String fileIdRef, {Function(double)? onProgress}) async {
+    // 1. Get Chunk Info
+    final infoResp = await http.post(
+      Uri.parse('$backendUrl/api/files/download-info'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'fileIdRef': fileIdRef})
+    );
+     if (infoResp.statusCode != 200) throw Exception("Failed to get file info: ${infoResp.body}");
+    
+    final data = jsonDecode(infoResp.body);
+    final chunks = (data['chunks'] as List).cast<Map<String, dynamic>>();
+    
+    // 2. Download Chunks (Parallel)
+    final List<List<int>> parts = List.filled(chunks.length, []);
+    int completed = 0;
+    
+    Future<void> fetchChunk(int index, String path, String token) async {
+       final url = 'https://content.dropboxapi.com/2/files/download';
+       final headers = {
+         'Authorization': 'Bearer $token',
+         'Dropbox-API-Arg': jsonEncode({"path": path}),
+       };
+       final resp = await http.post(Uri.parse(url), headers: headers);
+       if(resp.statusCode != 200) throw Exception("Chunk download failed");
+       
+       parts[index] = resp.bodyBytes;
+       completed++;
+       if(onProgress != null) onProgress(completed / chunks.length);
+    }
+    
+    int i = 0;
+    while(i < chunks.length) {
+       final batch = <Future>[];
+       for(int k=0; k<4 && i<chunks.length; k++) {
+         final c = chunks[i];
+         batch.add(fetchChunk(c['index'], c['path'], c['token']));
+         i++;
+       }
+       await Future.wait(batch);
+    }
+    
+    // 3. Merge
+    return parts.expand((x) => x).toList();
   }
 
   // Helper to upload simple text content (for code editor)

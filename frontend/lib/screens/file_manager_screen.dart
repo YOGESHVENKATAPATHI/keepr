@@ -88,7 +88,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
 
     if (dirPath == null) {
       final result = await FilePicker.platform
-          .pickFiles(allowMultiple: true, withReadStream: true);
+          .pickFiles(allowMultiple: true, withData: true); // Force load into memory for chunking logic
       if (result == null) return;
 
       try {
@@ -112,27 +112,46 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     }
   }
 
-  Future<void> _downloadFile(dynamic fileData) async {
+
+  Future<void> _downloadFile(dynamic item) async {
+    final dropboxPath = item['dropbox_path'] ?? item['path'];
+    final name = item['name'];
+    
+    // Check for distributed file
+    if (dropboxPath == 'distributed' && item['file_id_ref'] != null) {
+       try {
+         _showSnack('Downloading distributed file (Merging chunks)...');
+         final bytes = await widget.uploader.downloadDistributedFile(item['file_id_ref'], onProgress: (p) {
+            // Optional: Show percent
+         });
+         
+         // Prompt save
+         String? savePath = await FilePicker.platform.saveFile(
+           dialogTitle: 'Save $name',
+           fileName: name,
+         );
+         
+         if (savePath != null) {
+            final f = File(savePath);
+            await f.writeAsBytes(bytes);
+            _showSnack('Saved to $savePath');
+         } else {
+            _showSnack('Save cancelled');
+         }
+       } catch (e) {
+         _showSnack('Distributed download failed: $e', isError: true);
+       }
+       return;
+    }
+
+    // Legacy / Single file download
     try {
       _showSnack('Preparing download...');
-      
-      // Heuristic: If ID is UUID length (36 chars) or from new table, try distributed
-      final id = fileData['id'].toString();
-      final isNewSystem = id.length > 10; // Simple heuristic, SERIAL usually small numbers
-
-      if (isNewSystem) {
-          await widget.uploader.downloadDistributedFile(id, fileData['name']);
-          _showSnack('File reassembled (Check console/memory)'); 
-          // Note: Real "save to disk" requires platform specific code (dart:html / dart:io)
+      final link = await widget.uploader.getTemporaryLink(dropboxPath);
+      if (await canLaunchUrl(Uri.parse(link))) {
+        await launchUrl(Uri.parse(link));
       } else {
-        // Legacy
-        final dropboxPath = fileData['dropbox_path'] ?? fileData['path'];
-        final link = await widget.uploader.getTemporaryLink(dropboxPath);
-        if (await canLaunchUrl(Uri.parse(link))) {
-            await launchUrl(Uri.parse(link));
-        } else {
-            throw Exception("Could not launch link");
-        }
+        throw Exception("Could not launch link");
       }
     } catch (e) {
       _showSnack('Download failed: $e', isError: true);
@@ -486,13 +505,8 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                 onPressed: () {
                   if (isFolder)
                     _downloadFolder(it['path']);
-                  else {
-                      // Check if it's a legacy file or distributed file
-                      // Legacy files have numeric ID usually (or we check ID format?)
-                      // Or simply try distributed download, fallback to legacy if "File not found" in chunks?
-                      // Better: pass the whole 'it' object to _downloadFile
-                      _downloadFile(it);
-                  }
+                  else
+                    _downloadFile(it);
                 },
                 child: Text('DOWNLOAD',
                     style: GoogleFonts.inter(

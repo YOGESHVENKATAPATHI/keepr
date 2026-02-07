@@ -138,6 +138,22 @@ async function startUploadSession(dbx, fileSize) {
 }
 
 
+
+async function getAccessTokenForShard(shardId) {
+    let masterClient = null;
+    try {
+        masterClient = await tryConnect(MASTER_DB_URL);
+        const res = await masterClient.query('SELECT * FROM storage_shards WHERE id = $1', [shardId]);
+        if (res.rows.length === 0) throw new Error(`Shard ${shardId} not found`);
+        
+        const account = res.rows[0];
+        return await refreshAccessToken(account.refresh_token, account.app_key, account.app_secret);
+    } finally {
+        if (masterClient) await masterClient.end();
+    }
+}
+
 module.exports = {
-    getFittestStorageAccount
+    getFittestStorageAccount,
+    getAccessTokenForShard
 };
