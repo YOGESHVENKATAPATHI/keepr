@@ -44,7 +44,7 @@ class _UploadDialogState extends State<UploadDialog> {
     try {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: true,
-        withReadStream: true,
+        withData: true, // Required for chunking
       );
 
       if (result != null) {
