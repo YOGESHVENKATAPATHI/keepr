@@ -617,80 +617,40 @@ app.post('/api/files/download-info', async (req, res) => {
     console.log('[Download] get info for', fileIdRef);
     
     try {
-        await executeWithDB(async (client) => {
+        const chunks = await executeWithDB(async (client) => {
             const resChunks = await client.query(
                 'SELECT chunk_index, shard_id, dropbox_path FROM file_chunks WHERE file_id = $1 ORDER BY chunk_index ASC',
                 [fileIdRef]
             );
-            
-            // We need tokens for these shards to give to client
-            // This is slightly inefficient (N queries), but simple. 
-            // Better: fetch all active shards in memory map.
-            const shardsRes = await client.query('SELECT * FROM storage_shards');
-            const shardMap = {};
-            shardsRes.rows.forEach(s => {
-                // If using dbManager logic:
-                // We might need to decrypt or just use what we have. 
-                // Assuming simple schema for now as per `storageManager.js`
-                shardMap[s.id] = s.refresh_token; // Wait, we need access tokens.
-            });
-            
-            // To be secure, we should probably generate fresh short-lived links or 
-            // give the client the access tokens (if trusted app). 
-            // For this project stage, we'll try to rely on storageManager to get tokens.
-            
-            // ACTUALLY: storageManager has `getAllActiveStorageShards` but it returns clients?
-            // Let's reuse `storageManager` logic if possible or just fetch raw.
-            // Since `storageManager` handles token refresh, we should ask it for tokens.
-            // But we don't have a batch method. 
-            
-            // Workaround: We will authorize the client to download by returning the list of { url, headers } ?
-            // No, Dropbox API needs token.
-            // Let's just return the list of chunks with Shard ID. 
-            // The Client will have to ask "Get Token for Shard X" or we include it here. 
-            
-            // Let's include tokens here.
-             const chunksWithTokens = [];
-             
-             // Optimize: Group by shard_id
-             const chunksByShard = {};
-             resChunks.rows.forEach(c => {
-                 if(!chunksByShard[c.shard_id]) chunksByShard[c.shard_id] = [];
-                 chunksByShard[c.shard_id].push(c);
-             });
-             
-             for (const [sId, chunks] of Object.entries(chunksByShard)) {
-                 // Get fresh token for this shard
-                 // usage of internal function or similar
-                 // We'll use storageManager.getFittestStorageAccount logic but forcing a shard ID? 
-                 // It doesn't support that.
-                 
-                 // manual refresh logic (simplified):
-                 const sMetaRes = await client.query('SELECT * FROM storage_shards WHERE id=$1', [sId]);
-                 const sMeta = sMetaRes.rows[0];
-                 if(sMeta) {
-                     // We need a way to get a valid token.
-                     // For now, let's assume the token in DB is valid or the client deals with it?
-                     // No, tokens expire. 
-                     // We must create a new helper in storageManager or duplicate logic.
-                     
-                     // Let's use the `storageManager` to Refresh token if needed
-                     // We'll require `storageManager` to export a `getAccessTokenForShard(id)`
-                     const token = await storageManager.getAccessTokenForShard(sId); 
-                     
-                     chunks.forEach(c => {
-                         chunksWithTokens.push({
-                             index: c.chunk_index,
-                             path: c.dropbox_path,
-                             token: token
-                         });
-                     });
-                 }
-             }
-             
-             chunksWithTokens.sort((a,b) => a.index - b.index);
-             res.json({ chunks: chunksWithTokens });
+            return resChunks.rows;
         });
+
+        const chunksWithTokens = [];
+        const uniqueShardIds = [...new Set(chunks.map(c => c.shard_id))];
+        const tokenMap = {};
+
+        // Fetch tokens for all shards involved (connecting to Master DB via storageManager)
+        for (const sId of uniqueShardIds) {
+            try {
+                tokenMap[sId] = await storageManager.getAccessTokenForShard(sId);
+            } catch(e) {
+                console.error(`Failed to get token for shard ${sId}`, e);
+            }
+        }
+
+        chunks.forEach(c => {
+            if (tokenMap[c.shard_id]) {
+                chunksWithTokens.push({
+                    index: c.chunk_index,
+                    path: c.dropbox_path,
+                    token: tokenMap[c.shard_id]
+                });
+            }
+        });
+        
+        chunksWithTokens.sort((a,b) => a.index - b.index);
+        res.json({ chunks: chunksWithTokens });
+
     } catch(e) {
         console.error('Download Info Failed', e);
         res.status(500).send(e.message);
