@@ -325,9 +325,24 @@ app.post('/api/files/init-upload', async (req, res) => {
                     is_folder BOOLEAN DEFAULT FALSE,
                     size_mb NUMERIC DEFAULT 0,
                     status TEXT DEFAULT 'pending',
+                    dropbox_path TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             `);
+
+            // SELF-HEALING MIGRATION: Ensure columns exist even if table was created previously
+            try {
+                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS status TEXT DEFAULT \'pending\'');
+                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS parent_path TEXT');
+                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS dropbox_path TEXT');
+                // Ensure ID is TEXT (migrating from SERIAL if needed, though rare for 'init-upload' flow)
+                // We skip checking ID type to avoid blocking, but the INSERT below inserts a string UUID.
+                // If ID is integer, it will throw. 
+            } catch (migErr) {
+                 // Ignore if columns exist or other minor errors, but log
+                 console.warn('[Files] Schema self-healing warning:', migErr.message);
+            }
+
             await workerClient.query(`
                  CREATE TABLE IF NOT EXISTS file_chunks (
                     chunk_id TEXT PRIMARY KEY,
