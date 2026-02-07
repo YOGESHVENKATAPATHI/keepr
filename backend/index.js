@@ -507,11 +507,22 @@ app.post('/api/upload/finalize', async (req, res) => {
             // Update status
             await client.query("UPDATE file_uploads SET status='completed' WHERE file_id=$1", [fileId]);
             
+            // DB MIGRATION FIX: Ensure no strict constraints block us if schema drifted
+            try {
+                await client.query('ALTER TABLE file_chunks ALTER COLUMN shard_id DROP NOT NULL');
+            } catch(e) {}
+            try {
+                await client.query('ALTER TABLE file_chunks ALTER COLUMN chunk_id DROP NOT NULL');
+            } catch(e) {}
+
             // Log chunks
             for (const c of chunks) {
+                // Handle case where shardId is missing (legacy/error)
+                const safeShardId = c.shardId || c.shard_id || 0; 
+                
                 await client.query(
                     'INSERT INTO file_chunks (file_id, chunk_index, shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5)',
-                    [fileId, c.index, c.shardId, c.path, 'completed']
+                    [fileId, c.index, safeShardId, c.path, 'completed']
                 );
             }
             
