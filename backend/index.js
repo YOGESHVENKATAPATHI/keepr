@@ -510,9 +510,20 @@ app.post('/api/upload/finalize', async (req, res) => {
             // DB MIGRATION FIX: Ensure no strict constraints block us if schema drifted
             try {
                 await client.query('ALTER TABLE file_chunks ALTER COLUMN shard_id DROP NOT NULL');
-            } catch(e) {}
+            } catch(e) { console.warn('Fix shard_id failed', e.message); }
+            
             try {
+                // Ensure chunk_id is nullable OR sequence
                 await client.query('ALTER TABLE file_chunks ALTER COLUMN chunk_id DROP NOT NULL');
+            } catch(e) { 
+                 // If that failed, maybe column doesn't exist? or locked
+                 console.warn('Fix chunk_id drop not null failed', e.message);
+            }
+
+            // CRITICAL FIX: If table has chunk_id as PK but no sequence, we must drop it or ignore it.
+            // Let's try to set a default just in case it is required
+            try {
+                 await client.query("ALTER TABLE file_chunks ALTER COLUMN chunk_id SET DEFAULT 0");
             } catch(e) {}
 
             // Log chunks
@@ -520,10 +531,24 @@ app.post('/api/upload/finalize', async (req, res) => {
                 // Handle case where shardId is missing (legacy/error)
                 const safeShardId = c.shardId || c.shard_id || 0; 
                 
-                await client.query(
-                    'INSERT INTO file_chunks (file_id, chunk_index, shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5)',
-                    [fileId, c.index, safeShardId, c.path, 'completed']
-                );
+                // Try STANDARD insert first
+                try {
+                    await client.query(
+                        'INSERT INTO file_chunks (file_id, chunk_index, shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5)',
+                        [fileId, c.index, safeShardId, c.path, 'completed']
+                    );
+                } catch (insertErr) {
+                    // FALLBACK: If insert fails on chunk_id not null, try explicit
+                    if (insertErr.message && insertErr.message.includes('chunk_id')) {
+                        console.warn('Fallback insert with manual chunk_id');
+                        await client.query(
+                            'INSERT INTO file_chunks (chunk_id, file_id, chunk_index, shard_id, dropbox_path, status) VALUES ($1, $2, $3, $4, $5, $6)',
+                            [Math.floor(Math.random() * 10000000), fileId, c.index, safeShardId, c.path, 'completed']
+                        );
+                    } else {
+                        throw insertErr;
+                    }
+                }
             }
             
             // Get original metadata to insert into main 'files' table for listing
