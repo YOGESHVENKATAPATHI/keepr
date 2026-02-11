@@ -13,6 +13,8 @@ import '../theme/keepr_theme.dart';
 import 'file_viewer_screen.dart';
 import '../widgets/upload_dialog.dart';
 
+import 'package:flutter_svg/flutter_svg.dart';
+
 import 'package:url_launcher/url_launcher.dart';
 
 class FileManagerScreen extends StatefulWidget {
@@ -135,7 +137,71 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
 
     // Check for distributed file
     if (dropboxPath == 'distributed' && item['file_id_ref'] != null) {
-      // Show progress dialog
+      double sizeMb = double.tryParse(item['size_mb']?.toString() ?? '0') ?? 0;
+
+      if (!kIsWeb) {
+        // Desktop/Mobile: Stream to file to avoid memory issues
+        String? savePath = await FilePicker.platform.saveFile(
+          dialogTitle: 'Save $name',
+          fileName: name,
+        );
+
+        if (savePath == null) {
+          _showSnack('Save cancelled');
+          return;
+        }
+
+        // Show progress dialog
+        showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (ctx) {
+              return StatefulBuilder(builder: (context, setState) {
+                return StreamBuilder<double>(
+                    stream: _downloadProgressController?.stream ??
+                        Stream.value(0.0),
+                    initialData: 0.0,
+                    builder: (context, snapshot) {
+                      final p = snapshot.data ?? 0.0;
+                      return AlertDialog(
+                        backgroundColor: KeeprTheme.surface,
+                        title: Text("Downloading...",
+                            style: GoogleFonts.inter(color: Colors.white)),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            LinearProgressIndicator(
+                                value: p,
+                                backgroundColor: Colors.white10,
+                                color: KeeprTheme.primary),
+                            const SizedBox(height: 10),
+                            Text("${(p * 100).toStringAsFixed(1)}%",
+                                style: GoogleFonts.inter(color: Colors.white70))
+                          ],
+                        ),
+                      );
+                    });
+              });
+            });
+
+        try {
+          await widget.uploader.downloadDistributedFileToFile(
+              item['file_id_ref'], sizeMb, File(savePath), onProgress: (p) {
+            if (_downloadProgressController != null &&
+                !_downloadProgressController!.isClosed) {
+              _downloadProgressController!.add(p);
+            }
+          });
+          Navigator.pop(context); // Close dialog
+          _showSnack('Saved to $savePath');
+        } catch (e) {
+          Navigator.pop(context); // Close dialog on error
+          _showSnack('Download failed: $e', isError: true);
+        }
+        return;
+      }
+
+      // Web Logic (keep existing memory buffer)
       showDialog(
           context: context,
           barrierDismissible: false,
@@ -169,9 +235,6 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
           });
 
       try {
-        double sizeMb =
-            double.tryParse(item['size_mb']?.toString() ?? '0') ?? 0;
-
         final bytes = await widget.uploader.downloadDistributedFile(
             item['file_id_ref'], sizeMb, onProgress: (p) {
           if (_downloadProgressController != null &&
@@ -194,22 +257,9 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
             ..click();
           html.Url.revokeObjectUrl(url);
           _showSnack('Download started');
-        } else {
-          // Prompt save
-          String? savePath = await FilePicker.platform.saveFile(
-            dialogTitle: 'Save $name',
-            fileName: name,
-          );
-
-          if (savePath != null) {
-            final f = File(savePath);
-            await f.writeAsBytes(bytes);
-            _showSnack('Saved to $savePath');
-          } else {
-            _showSnack('Save cancelled');
-          }
         }
       } catch (e) {
+        Navigator.pop(context); // Close dialog
         _showSnack('Distributed download failed: $e', isError: true);
       }
       return;
@@ -327,6 +377,53 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     }
   }
 
+  Future<void> _createFile() async {
+    final TextEditingController nameController = TextEditingController();
+    final String? fileName = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: KeeprTheme.surface,
+        title: Text("New File", style: GoogleFonts.inter(color: Colors.white)),
+        content: TextField(
+          controller: nameController,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(
+            hintText: "example.txt",
+            hintStyle: TextStyle(color: Colors.white54),
+            enabledBorder: UnderlineInputBorder(
+                borderSide: BorderSide(color: Colors.white24)),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text("CANCEL", style: TextStyle(color: Colors.white54))),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, nameController.text.trim()),
+              child: Text("CREATE",
+                  style: TextStyle(
+                      color: KeeprTheme.primary, fontWeight: FontWeight.bold))),
+        ],
+      ),
+    );
+
+    if (fileName == null || fileName.isEmpty) return;
+
+    try {
+      _showSnack('Creating file...');
+      String fullPath =
+          currentPath == '/' ? '/$fileName' : '$currentPath/$fileName';
+
+      // Upload empty string
+      await widget.uploader.uploadStringContent("", widget.userId, fullPath);
+
+      _showSnack('File created successfully');
+      _refresh();
+    } catch (e) {
+      _showSnack('Failed to create file: $e', isError: true);
+    }
+  }
+
   void _openUploadDialog() {
     showDialog(
         context: context,
@@ -409,6 +506,13 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
       child: isDesktop
           ? Row(
               children: [
+                SvgPicture.asset(
+                  'assets/keeprlogo.svg',
+                  width: 32,
+                  height: 32,
+                  colorFilter: const ColorFilter.mode(Colors.white, BlendMode.srcIn)
+                ),
+                const SizedBox(width: 12),
                 Text(
                   'KEEPR',
                   style: GoogleFonts.zillaSlab(
@@ -421,6 +525,8 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                 _buildActionButton('UPLOAD', _openUploadDialog,
                     highlight: true),
                 const SizedBox(width: 15),
+                _buildActionButton('NEW FILE', _createFile),
+                const SizedBox(width: 15),
                 _buildActionButton('NEW FOLDER', _createFolder),
                 const SizedBox(width: 15),
                 _buildActionButton('REFRESH', _refresh),
@@ -432,13 +538,24 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      'KEEPR',
-                      style: GoogleFonts.zillaSlab(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                          letterSpacing: 1.5),
+                    Row(
+                      children: [
+                        SvgPicture.asset(
+                          'assets/keeprlogo.svg',
+                          width: 28,
+                          height: 28,
+                          colorFilter: const ColorFilter.mode(Colors.white, BlendMode.srcIn)
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'KEEPR',
+                          style: GoogleFonts.zillaSlab(
+                              fontSize: 28,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                              letterSpacing: 1.5),
+                        ),
+                      ],
                     ),
                     IconButton(
                       onPressed: _refresh,
@@ -453,7 +570,14 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                     Expanded(
                         child: _buildActionButton('UPLOAD', _openUploadDialog,
                             highlight: true)),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: 8),
+                    Expanded(
+                        child: _buildActionButton('NEW FILE', _createFile)),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
                     Expanded(
                         child: _buildActionButton('NEW FOLDER', _createFolder)),
                   ],
@@ -580,24 +704,78 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
               ),
 
               // Action
-              TextButton(
-                onPressed: () {
-                  if (isFolder)
-                    _downloadFolder(it['path']);
-                  else
-                    _downloadFile(it);
-                },
-                child: Text('DOWNLOAD',
-                    style: GoogleFonts.inter(
-                        fontSize: 11,
-                        color: Colors.white54,
-                        fontWeight: FontWeight.bold)),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextButton(
+                    onPressed: () {
+                      if (isFolder)
+                        _downloadFolder(it['path']);
+                      else
+                        _downloadFile(it);
+                    },
+                    child: Text('DOWNLOAD',
+                        style: GoogleFonts.inter(
+                            fontSize: 11,
+                            color: Colors.white54,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: () => _confirmDelete(it),
+                    child: Text('DELETE',
+                        style: GoogleFonts.inter(
+                            fontSize: 11,
+                            color: Colors.redAccent.withOpacity(0.8),
+                            fontWeight: FontWeight.bold)),
+                  ),
+                ],
               )
             ],
           ),
         ),
       ),
     );
+  }
+
+  Future<void> _confirmDelete(Map<String, dynamic> item) async {
+    final name = item['name'];
+    final bool isFolder = item['is_folder'] ?? false;
+    final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+              backgroundColor: KeeprTheme.surface,
+              title: Text("Delete $name?",
+                  style: GoogleFonts.inter(color: Colors.white)),
+              content: Text(
+                  isFolder
+                      ? "This will permanently delete the folder and ALL its contents recursively (including all distributed chunks). This cannot be undone."
+                      : "This will permanently delete the file and all its distributed chunks.",
+                  style: GoogleFonts.inter(color: Colors.white70)),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: Text("CANCEL",
+                        style: TextStyle(color: Colors.white54))),
+                TextButton(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    child: Text("DELETE",
+                        style: TextStyle(
+                            color: Colors.redAccent,
+                            fontWeight: FontWeight.bold))),
+              ],
+            ));
+
+    if (confirmed == true) {
+      try {
+        _showSnack('Deleting $name...');
+        await widget.api.deleteFile(widget.userId, item['path']);
+        _showSnack('Deleted $name');
+        _refresh();
+      } catch (e) {
+        _showSnack('Failed to delete: $e', isError: true);
+      }
+    }
   }
 
   @override

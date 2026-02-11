@@ -3,7 +3,8 @@ import 'package:glassmorphism/glassmorphism.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
+import 'package:flutter/foundation.dart'
+    show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import '../utils/storage_helper.dart';
 
 import '../theme/keepr_theme.dart';
@@ -17,7 +18,7 @@ const String kGoogleClientId = String.fromEnvironment('GOOGLE_CLIENT_ID',
     defaultValue:
         '75763106036-6d5kmkr59sn567mbe41okqikb458r6cm.apps.googleusercontent.com');
 const String kBackendBase = String.fromEnvironment('BACKEND_BASE',
-    defaultValue: 'https://keepr-gold.vercel.app');
+    defaultValue: 'http://localhost:3000');
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -447,53 +448,66 @@ class _LoginScreenState extends State<LoginScreen> {
                                     const SizedBox(height: 10),
 
 // Google Sign-In (only on platforms where supported)
-                                  if (kIsWeb || defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS) ...[
-                                    SizedBox(
-                                      width: double.infinity,
-                                      height: 48,
-                                      child: ElevatedButton.icon(
-                                        onPressed: _isGoogleLoading
-                                            ? null
-                                            : _handleGoogleSignIn,
-                                        icon: Icon(Icons.login,
-                                            size: 24, color: Colors.white),
-                                        label: _isGoogleLoading
-                                            ? const SizedBox(
-                                                width: 20,
-                                                height: 20,
-                                                child:
-                                                    CircularProgressIndicator(
-                                                        strokeWidth: 2,
-                                                        color: Colors.white))
-                                            : const Text('Sign in with Google'),
-                                        style: ElevatedButton.styleFrom(
-                                          backgroundColor: Colors.white
-                                              .withAlpha((0.08 * 255).round()),
-                                          foregroundColor: Colors.white,
-                                          elevation: 0,
-                                          shape: RoundedRectangleBorder(
-                                              borderRadius:
-                                                  BorderRadius.circular(10)),
+                                    if (kIsWeb ||
+                                        defaultTargetPlatform ==
+                                            TargetPlatform.android ||
+                                        defaultTargetPlatform ==
+                                            TargetPlatform.iOS) ...[
+                                      SizedBox(
+                                        width: double.infinity,
+                                        height: 48,
+                                        child: ElevatedButton.icon(
+                                          onPressed: _isGoogleLoading
+                                              ? null
+                                              : _handleGoogleSignIn,
+                                          icon: Icon(Icons.login,
+                                              size: 24, color: Colors.white),
+                                          label: _isGoogleLoading
+                                              ? const SizedBox(
+                                                  width: 20,
+                                                  height: 20,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                          strokeWidth: 2,
+                                                          color: Colors.white))
+                                              : const Text(
+                                                  'Sign in with Google'),
+                                          style: ElevatedButton.styleFrom(
+                                            backgroundColor: Colors.white
+                                                .withAlpha(
+                                                    (0.08 * 255).round()),
+                                            foregroundColor: Colors.white,
+                                            elevation: 0,
+                                            shape: RoundedRectangleBorder(
+                                                borderRadius:
+                                                    BorderRadius.circular(10)),
+                                          ),
                                         ),
                                       ),
-                                    ),
-                                  ],
-                                  // On unsupported platforms, optionally show nothing or a disabled hint
-                                  if (!(kIsWeb || defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS)) ...[
-                                    const SizedBox(height: 10),
-                                    SizedBox(
-                                      width: double.infinity,
-                                      height: 48,
-                                      child: OutlinedButton(
-                                        onPressed: null,
-                                        style: OutlinedButton.styleFrom(
-                                          foregroundColor: Colors.white54,
-                                          backgroundColor: Colors.white.withAlpha((0.03 * 255).round()),
+                                    ],
+                                    // On unsupported platforms, optionally show nothing or a disabled hint
+                                    if (!(kIsWeb ||
+                                        defaultTargetPlatform ==
+                                            TargetPlatform.android ||
+                                        defaultTargetPlatform ==
+                                            TargetPlatform.iOS)) ...[
+                                      const SizedBox(height: 10),
+                                      SizedBox(
+                                        width: double.infinity,
+                                        height: 48,
+                                        child: OutlinedButton(
+                                          onPressed: null,
+                                          style: OutlinedButton.styleFrom(
+                                            foregroundColor: Colors.white54,
+                                            backgroundColor: Colors.white
+                                                .withAlpha(
+                                                    (0.03 * 255).round()),
+                                          ),
+                                          child: const Text(
+                                              'Sign in with Google (not available on desktop)'),
                                         ),
-                                        child: const Text('Sign in with Google (not available on desktop)'),
                                       ),
-                                    ),
-                                  ],
+                                    ],
 
                                     const SizedBox(height: 10),
 
@@ -501,51 +515,59 @@ class _LoginScreenState extends State<LoginScreen> {
                                     SizedBox(
                                       width: double.infinity,
                                       child: TextButton(
-                                        onPressed: (_lastIdToken == null &&
-                                                    _lastAccessToken == null) ||
-                                                _isGoogleLoading
-                                            ? null
-                                            : () async {
-                                                showDialog(
-                                                  context: context,
-                                                  barrierDismissible: false,
-                                                  builder: (ctx) => const Center(
-                                                      child:
-                                                          CircularProgressIndicator()),
-                                                );
-                                                try {
-                                                  final payload = await _api
-                                                      .debugGoogleToken(
-                                                          idToken: _lastIdToken,
-                                                          accessToken:
-                                                              _lastAccessToken);
-                                                  if (mounted) Navigator.of(context).pop();
-                                                  if (mounted) await showDialog(
+                                        onPressed:
+                                            (_lastIdToken == null &&
+                                                        _lastAccessToken ==
+                                                            null) ||
+                                                    _isGoogleLoading
+                                                ? null
+                                                : () async {
+                                                    showDialog(
                                                       context: context,
-                                                      builder:
-                                                          (ctx) => AlertDialog(
-                                                                title: const Text(
-                                                                    'Debug token payload'),
-                                                                content: SingleChildScrollView(
-                                                                    child: Text(
-                                                                        payload
-                                                                            .toString())),
-                                                                actions: [
-                                                                  TextButton(
-                                                                      onPressed: () =>
-                                                                          Navigator.of(ctx)
-                                                                              .pop(),
-                                                                      child: const Text(
-                                                                          'Close'))
-                                                                ],
-                                                              ));
-                                                } catch (e) {
-                                                  if (mounted) Navigator.of(context).pop();
-                                                  if (mounted) _showSnack(
-                                                      'Debug request failed: ${e.toString()}',
-                                                      error: true);
-                                                }
-                                              },
+                                                      barrierDismissible: false,
+                                                      builder: (ctx) =>
+                                                          const Center(
+                                                              child:
+                                                                  CircularProgressIndicator()),
+                                                    );
+                                                    try {
+                                                      final payload = await _api
+                                                          .debugGoogleToken(
+                                                              idToken:
+                                                                  _lastIdToken,
+                                                              accessToken:
+                                                                  _lastAccessToken);
+                                                      if (mounted)
+                                                        Navigator.of(context)
+                                                            .pop();
+                                                      if (mounted)
+                                                        await showDialog(
+                                                            context: context,
+                                                            builder:
+                                                                (ctx) =>
+                                                                    AlertDialog(
+                                                                      title: const Text(
+                                                                          'Debug token payload'),
+                                                                      content: SingleChildScrollView(
+                                                                          child:
+                                                                              Text(payload.toString())),
+                                                                      actions: [
+                                                                        TextButton(
+                                                                            onPressed: () =>
+                                                                                Navigator.of(ctx).pop(),
+                                                                            child: const Text('Close'))
+                                                                      ],
+                                                                    ));
+                                                    } catch (e) {
+                                                      if (mounted)
+                                                        Navigator.of(context)
+                                                            .pop();
+                                                      if (mounted)
+                                                        _showSnack(
+                                                            'Debug request failed: ${e.toString()}',
+                                                            error: true);
+                                                    }
+                                                  },
                                         child: const Text(''),
                                       ),
                                     ),

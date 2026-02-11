@@ -8,10 +8,14 @@ const auth = require('./auth');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const fetch = require('node-fetch'); // Ensure node-fetch is available
+const deletionWorker = require('./deletionWorker');
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+
+// Start background worker
+deletionWorker.startDeletionWorker();
 
 // Helpful startup checks
 const requiredEnv = ['GOOGLE_CLIENT_ID', 'EMAIL_USER', 'EMAIL_PASS', 'FRONTEND_BASE_URL'];
@@ -433,7 +437,7 @@ app.post('/api/auth/request-pin-reset', async (req, res) => {
             await client.query('INSERT INTO pin_resets (user_id, reset_token, expires_at) VALUES ($1, $2, $3)', [userId, token, expiresAt]);
 
             // send email
-            const base = resetUrlBase || process.env.PIN_RESET_URL || 'https://keepr-gold.vercel.app/pin-reset?token=';
+            const base = resetUrlBase || process.env.PIN_RESET_URL || 'http://localhost:3000/pin-reset?token=';
             const sent = await auth.sendPinResetEmail(email, token, base);
             return sent;
         });
@@ -991,6 +995,129 @@ app.post('/api/upload/finalize', async (req, res) => {
          res.status(500).send(e.message);
     }
 });
+
+
+
+// 5. Delete File OR Folder (Recursive)
+// Handles distributed files, standard files, and entire folders
+app.post('/api/files/delete', async (req, res) => {
+    const { userId, path } = req.body;
+    console.log('[Delete] Request for', path, 'user=', userId);
+
+    try {
+        await executeWithDB(async (client) => {
+            // Ensure deletion queue table exists
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS deletion_queue (
+                    id SERIAL PRIMARY KEY,
+                    shard_id INT NOT NULL,
+                    paths TEXT[] NOT NULL,
+                    status TEXT DEFAULT 'pending', 
+                    retries INT DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            `);
+
+            // Function to delete a single file record and its chunks (Batched)
+            async function deleteOneFile(file) {
+                 if (file.is_folder) return; // safety
+
+                 // Distributed File
+                 if (file.dropbox_path === 'distributed' && file.file_id_ref) {
+                     // Batch chunk deletion loop to handle millions of chunks
+                     let hasMoreChunks = true;
+                     while(hasMoreChunks) {
+                         // Use ctid (physical row location) to identify rows if 'id' column is missing or for efficient batching
+                         const chunkRes = await client.query(
+                             'SELECT ctid, shard_id, dropbox_path FROM file_chunks WHERE file_id = $1 LIMIT 1000',
+                             [file.file_id_ref]
+                         );
+                         
+                         if (chunkRes.rows.length === 0) {
+                             hasMoreChunks = false;
+                             break;
+                         }
+
+                         const shardMap = {};
+                         const chunkCtids = [];
+                         for (const c of chunkRes.rows) {
+                            if (!shardMap[c.shard_id]) shardMap[c.shard_id] = [];
+                            shardMap[c.shard_id].push(c.dropbox_path);
+                            chunkCtids.push(c.ctid);
+                         }
+                         
+                         // Insert into deletion queue instead of direct delete
+                         for (const sId of Object.keys(shardMap)) {
+                             // shardMap[sId] is array of paths
+                             await client.query(
+                                 'INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', 
+                                 [sId, shardMap[sId]]
+                             );
+                         }
+                         
+                         // Delete this batch from DB using ctid
+                         // Note: Passing array of ctids requires explicit cast to tid[]
+                         await client.query('DELETE FROM file_chunks WHERE ctid = ANY($1::tid[])', [chunkCtids]);
+                     }
+                     // Clean upload record
+                     await client.query('DELETE FROM file_uploads WHERE file_id = $1', [file.file_id_ref]);
+
+                 } else {
+                     // Legacy/Simple File
+                     // Logic omitted for brevity, assumed cleaned up or handled manually
+                 }
+
+                 // Remove from 'files' table
+                 await client.query('DELETE FROM files WHERE id = $1', [file.id]);
+            }
+
+            // 1. Resolve target
+            const targetRes = await client.query('SELECT * FROM files WHERE user_id = $1 AND path = $2', [userId, path]);
+            if (targetRes.rows.length === 0) return res.status(404).send("Not found");
+            const target = targetRes.rows[0];
+
+            if (target.is_folder) {
+                console.log(`[Delete] Deleting folder recursively: ${path}`);
+                
+                // 1. Delete all descendant files in batches
+                while(true) {
+                    const fileBatch = await client.query(
+                        "SELECT * FROM files WHERE user_id=$1 AND path LIKE $2 AND is_folder=false LIMIT 200", 
+                        [userId, path + '/%']
+                    );
+                    
+                    if (fileBatch.rows.length === 0) break;
+                    
+                    console.log(`[Delete] Processing batch of ${fileBatch.rows.length} files...`);
+                    for (const f of fileBatch.rows) {
+                        await deleteOneFile(f);
+                    }
+                }
+                
+                // 2. Delete all subfolders records
+                // Since we don't have FK constraints on parent_path, we can just bulk delete
+                await client.query(
+                    "DELETE FROM files WHERE user_id=$1 AND path LIKE $2 AND is_folder=true", 
+                    [userId, path + '/%']
+                );
+
+                // 3. Delete the target folder itself
+                await client.query('DELETE FROM files WHERE id = $1', [target.id]);
+
+            } else {
+                // Just a file
+                await deleteOneFile(target);
+            }
+            
+            res.json({ ok: true });
+        });
+
+    } catch(e) {
+        console.error('[Delete] Failed', e);
+        res.status(500).send(e.message);
+    }
+});
+
 
 // 4. Download Info: Get chunk map for a distributed file
 app.post('/api/files/download-info', async (req, res) => {

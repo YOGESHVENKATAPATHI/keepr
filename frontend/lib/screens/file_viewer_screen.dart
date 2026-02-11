@@ -40,6 +40,7 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
   bool _loading = true;
   String? _downloadUrl;
   List<int>? _fileBytes;
+  String? _localFilePath;
   String? _textContent;
   bool _saving = false;
   late TextEditingController _codeController;
@@ -60,18 +61,44 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
   Future<void> _init() async {
     try {
       if (widget.dropboxPath == 'distributed' && widget.fileIdRef != null) {
-        // Distributed: Download bytes directly
-        final bytes = await widget.uploader
-            .downloadDistributedFile(widget.fileIdRef!, widget.sizeMb);
-        setState(() {
-          _fileBytes = bytes;
-        });
-        debugPrint(
-            '[FileViewer] downloaded bytes length=${bytes.length} (expected ${(widget.sizeMb * 1024 * 1024).round()})');
+        if (!kIsWeb) {
+          // Native: Stream to temp file
+          final tempDir = await getTemporaryDirectory();
+          final filePath = '${tempDir.path}/${widget.fileName}';
+          final f = File(filePath);
+          await widget.uploader.downloadDistributedFileToFile(
+              widget.fileIdRef!, widget.sizeMb, f);
 
-        if (_isCodeFile) {
-          _textContent = utf8.decode(bytes);
-          _codeController.text = _textContent!;
+          String? txt;
+          if (_isCodeFile) {
+            try {
+              txt = await f.readAsString();
+            } catch (e) {
+              txt = "Binary content";
+            }
+          }
+
+          if (mounted) {
+            setState(() {
+              _localFilePath = filePath;
+              if (txt != null) {
+                _textContent = txt;
+                _codeController.text = txt;
+              }
+            });
+          }
+          debugPrint('[FileViewer] downloaded to $filePath');
+        } else {
+          // Web: RAM
+          final bytes = await widget.uploader
+              .downloadDistributedFile(widget.fileIdRef!, widget.sizeMb);
+          setState(() {
+            _fileBytes = bytes;
+          });
+          if (_isCodeFile) {
+            _textContent = utf8.decode(bytes);
+            _codeController.text = _textContent!;
+          }
         }
       } else {
         // Standard / Legacy
@@ -192,7 +219,7 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
   }
 
   Widget _buildContent() {
-    if (_downloadUrl == null && _fileBytes == null) {
+    if (_downloadUrl == null && _fileBytes == null && _localFilePath == null) {
       return Center(
           child: Text("Could not load file.",
               style: GoogleFonts.inter(color: Colors.white54)));
@@ -201,48 +228,61 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
     if (_isImage) {
       return Center(
         child: InteractiveViewer(
-          child: _fileBytes != null
-              ? Image.memory(
-                  Uint8List.fromList(_fileBytes!),
+          child: _localFilePath != null
+              ? Image.file(File(_localFilePath!),
                   errorBuilder: (ctx, err, stack) =>
-                      Icon(Icons.broken_image, size: 64, color: Colors.white24),
-                )
-              : Image.network(
-                  _downloadUrl!,
-                  loadingBuilder: (ctx, child, chunk) {
-                    if (chunk == null) return child;
-                    return Center(
-                        child: CircularProgressIndicator(
-                            value: chunk.expectedTotalBytes != null
-                                ? chunk.cumulativeBytesLoaded /
-                                    chunk.expectedTotalBytes!
-                                : null));
-                  },
-                  errorBuilder: (ctx, err, stack) =>
-                      Icon(Icons.broken_image, size: 64, color: Colors.white24),
-                ),
+                      Icon(Icons.broken_image, size: 64, color: Colors.white24))
+              : (_fileBytes != null
+                  ? Image.memory(
+                      Uint8List.fromList(_fileBytes!),
+                      errorBuilder: (ctx, err, stack) => Icon(
+                          Icons.broken_image,
+                          size: 64,
+                          color: Colors.white24),
+                    )
+                  : Image.network(
+                      _downloadUrl!,
+                      loadingBuilder: (ctx, child, chunk) {
+                        if (chunk == null) return child;
+                        return Center(
+                            child: CircularProgressIndicator(
+                                value: chunk.expectedTotalBytes != null
+                                    ? chunk.cumulativeBytesLoaded /
+                                        chunk.expectedTotalBytes!
+                                    : null));
+                      },
+                      errorBuilder: (ctx, err, stack) => Icon(
+                          Icons.broken_image,
+                          size: 64,
+                          color: Colors.white24),
+                    )),
         ),
       );
     }
 
+    // Code file uses _textContent which is already set
     if (_isCodeFile) {
       return Container(
-        color: Colors.black.withAlpha((0.3 * 255).round()), // Darker editor bg
+        color: Colors.black.withAlpha((0.3 * 255).round()),
         padding: const EdgeInsets.all(16),
         child: TextField(
           controller: _codeController,
           maxLines: null,
           expands: true,
           style: GoogleFonts.firaCode(
-              color: const Color(0xFFa9b7c6), // Classic dark theme code color
-              fontSize: 14,
-              height: 1.5),
+              color: const Color(0xFFa9b7c6), fontSize: 14, height: 1.5),
           decoration: InputDecoration(border: InputBorder.none),
         ),
       );
     }
 
     if (_isPdf) {
+      if (_localFilePath != null) {
+        return SfPdfViewer.file(File(_localFilePath!),
+            onDocumentLoadFailed: (details) => ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(
+                    content: Text("Failed to load PDF: ${details.error}"))));
+      }
       return _fileBytes != null
           ? SfPdfViewer.memory(
               Uint8List.fromList(_fileBytes!),
@@ -281,6 +321,13 @@ class _FileViewerScreenState extends State<FileViewerScreen> {
             onPressed: () async {
               if (_downloadUrl != null) {
                 await launchUrl(Uri.parse(_downloadUrl!));
+              } else if (_localFilePath != null && !kIsWeb) {
+                final uri = Uri.file(_localFilePath!);
+                if (!await launchUrl(uri)) {
+                  if (context.mounted)
+                    ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text("Could not open file.")));
+                }
               } else if (_fileBytes != null) {
                 if (kIsWeb) {
                   final blob = html.Blob([_fileBytes!]);

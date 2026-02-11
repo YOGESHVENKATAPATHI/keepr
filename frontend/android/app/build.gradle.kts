@@ -8,7 +8,8 @@ plugins {
 android {
     namespace = "com.example.keepr"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    // Pin NDK to installed version to avoid auto-download failures. Update if you reinstall a different NDK version.
+    ndkVersion = "27.0.12077973"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'package:dio/dio.dart';
@@ -70,8 +71,10 @@ class FolderUploadService {
 
         if (initResp.statusCode == 200) break;
 
-        print('[Upload][WARN] init attempt $initAttempt failed: ${initResp.statusCode} ${initResp.body}');
-        if (initAttempt >= maxInitAttempts) throw Exception("Init upload failed: ${initResp.body}");
+        print(
+            '[Upload][WARN] init attempt $initAttempt failed: ${initResp.statusCode} ${initResp.body}');
+        if (initAttempt >= maxInitAttempts)
+          throw Exception("Init upload failed: ${initResp.body}");
       } catch (e) {
         print('[Upload][ERROR] init attempt $initAttempt error: $e');
         if (initAttempt >= maxInitAttempts) rethrow;
@@ -80,7 +83,8 @@ class FolderUploadService {
     }
 
     final fileId = jsonDecode(initResp.body)['fileId'];
-    print("Initialized upload for $fileName (ID: $fileId) with $totalChunks chunks");
+    print(
+        "Initialized upload for $fileName (ID: $fileId) with $totalChunks chunks");
 
     // 2. Prepare chunks
     List<Future> uploadTasks = [];
@@ -228,14 +232,19 @@ class FolderUploadService {
         final allocResp = await http.post(
             Uri.parse('$backendUrl/api/upload/allocate-chunk'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode(
-                {'fileId': fileId, 'chunkIndex': chunkIndex, 'sizeMb': sizeMb}));
+            body: jsonEncode({
+              'fileId': fileId,
+              'chunkIndex': chunkIndex,
+              'sizeMb': sizeMb
+            }));
         if (allocResp.statusCode == 200) {
           alloc = jsonDecode(allocResp.body);
           break;
         }
-        print('[Upload][WARN] alloc attempt $allocAttempts failed: ${allocResp.statusCode} ${allocResp.body}');
-        if (allocAttempts >= maxAllocAttempts) throw Exception('Alloc chunk failed: ${allocResp.body}');
+        print(
+            '[Upload][WARN] alloc attempt $allocAttempts failed: ${allocResp.statusCode} ${allocResp.body}');
+        if (allocAttempts >= maxAllocAttempts)
+          throw Exception('Alloc chunk failed: ${allocResp.body}');
       } catch (e) {
         print('[Upload][ERROR] alloc attempt $allocAttempts error: $e');
         if (allocAttempts >= maxAllocAttempts) rethrow;
@@ -244,17 +253,24 @@ class FolderUploadService {
     }
 
     // Normalize token keys and validate presence
-    String? allocToken = alloc['accessToken'] ?? alloc['access_token'] ?? alloc['token'] ?? alloc['accessTokenString'];
+    String? allocToken = alloc['accessToken'] ??
+        alloc['access_token'] ??
+        alloc['token'] ??
+        alloc['accessTokenString'];
     if (allocToken == null || allocToken.isEmpty) {
-      print('[Upload][ERROR] allocate-chunk response missing access token: $alloc');
+      print(
+          '[Upload][ERROR] allocate-chunk response missing access token: $alloc');
       throw Exception('Allocate response missing access token');
     }
 
     // Also normalize shard id and uploadPath for defensive use
-    final shardId = alloc['shardId'] ?? alloc['shard_id'] ?? alloc['shard'] ?? 0;
-    final uploadPath = alloc['uploadPath'] ?? alloc['upload_path'] ?? alloc['path'];
+    final shardId =
+        alloc['shardId'] ?? alloc['shard_id'] ?? alloc['shard'] ?? 0;
+    final uploadPath =
+        alloc['uploadPath'] ?? alloc['upload_path'] ?? alloc['path'];
     if (uploadPath == null) {
-      print('[Upload][ERROR] allocate-chunk response missing uploadPath: $alloc');
+      print(
+          '[Upload][ERROR] allocate-chunk response missing uploadPath: $alloc');
       throw Exception('Allocate response missing uploadPath');
     }
 
@@ -265,10 +281,13 @@ class FolderUploadService {
       uploadAttempts++;
       try {
         if (kIsWeb) {
-          // Browser fetch path (use http package which uses browser fetch)
-          final url = Uri.parse('https://content.dropboxapi.com/2/files/upload');
-          final resp = await http.post(url,
-              headers: {
+          // Browser fetch path using Dio for progress events (XHR)
+          final dio = Dio();
+          dio.options.sendTimeout = const Duration(minutes: 5);
+          
+          await dio.post('https://content.dropboxapi.com/2/files/upload',
+              data: chunkData, // Direct bytes for Web
+              options: Options(headers: {
                 'Authorization': 'Bearer $allocToken',
                 'Dropbox-API-Arg': jsonEncode({
                   "path": uploadPath,
@@ -277,15 +296,12 @@ class FolderUploadService {
                   "mute": true
                 }),
                 'Content-Type': 'application/octet-stream'
-              },
-              body: chunkData);
-
-          if (resp.statusCode != 200) {
-            print('[Upload][ERROR] Web upload response: ${resp.statusCode} ${resp.body}');
-            throw Exception('Upload failed: ${resp.statusCode} ${resp.body}');
-          }
-          // For browsers we don't get per-byte progress here; report chunk complete
-          if (onChunkProgress != null) onChunkProgress(chunkData.length, chunkData.length);
+              }),
+              onSendProgress: (sent, total) {
+                if (onChunkProgress != null) {
+                  onChunkProgress(sent, total <= 0 ? chunkData.length : total);
+                }
+              });
           break;
         } else {
           final dio = Dio();
@@ -293,8 +309,10 @@ class FolderUploadService {
           dio.options.sendTimeout = const Duration(minutes: 5);
           dio.options.receiveTimeout = const Duration(minutes: 5);
 
+          // Using Stream.fromIterable([chunkData]) makes Dio emit only one progress event (0 -> 100%)
+          // Passing List<int> directly prompts Dio to handle it as a buffer and emit granular writes.
           await dio.post('https://content.dropboxapi.com/2/files/upload',
-              data: Stream.fromIterable([chunkData]),
+              data: chunkData, 
               options: Options(headers: {
                 'Authorization': 'Bearer $allocToken',
                 'Dropbox-API-Arg': jsonEncode({
@@ -318,8 +336,11 @@ class FolderUploadService {
         print('[Upload] upload attempt $uploadAttempts error: $e');
         // Friendly wrap for TLS handshake errors
         final errMsg = e?.toString() ?? '';
-        if ((e is HandshakeException) || errMsg.contains('HandshakeException') || errMsg.contains('Connection terminated during handshake')) {
-          throw Exception('HandshakeException: Connection terminated during TLS handshake when uploading chunk $chunkIndex to ${alloc['uploadPath']}. Check your network, proxy, or storage TLS configuration. Original: $e');
+        if ((e is HandshakeException) ||
+            errMsg.contains('HandshakeException') ||
+            errMsg.contains('Connection terminated during handshake')) {
+          throw Exception(
+              'HandshakeException: Connection terminated during TLS handshake when uploading chunk $chunkIndex to ${alloc['uploadPath']}. Check your network, proxy, or storage TLS configuration. Original: $e');
         }
         if (uploadAttempts >= maxUploadAttempts) rethrow;
         await Future.delayed(Duration(milliseconds: 500 * uploadAttempts));
@@ -328,7 +349,8 @@ class FolderUploadService {
     }
 
     // C. Report Success
-    final chunkId = '${fileId}_${chunkIndex}_${DateTime.now().millisecondsSinceEpoch}';
+    final chunkId =
+        '${fileId}_${chunkIndex}_${DateTime.now().millisecondsSinceEpoch}';
     onChunkComplete({
       'index': chunkIndex,
       'chunkId': chunkId,
@@ -392,8 +414,8 @@ class FolderUploadService {
     }
 
     // 2. Download Chunks (Parallel)
-    // Create unique empty lists per slot to avoid accidental shared references
-    final List<List<int>> parts = List.generate(maxIndex + 1, (_) => <int>[]);
+    // We retain parts as Uint8List to minimize conversion overhead
+    final List<Uint8List?> parts = List.generate(maxIndex + 1, (_) => null);
     final client = http.Client();
     int totalBytesReceived = 0;
 
@@ -465,30 +487,35 @@ class FolderUploadService {
           final request = http.Request('POST', Uri.parse(url));
           request.headers.addAll(headers);
 
-          final streamedResponse = await client.send(request).timeout(Duration(seconds: 60));
+          final streamedResponse =
+              await client.send(request).timeout(Duration(seconds: 60));
           if (streamedResponse.statusCode != 200) {
             final body = await streamedResponse.stream.bytesToString();
-            throw Exception("Chunk download failed: ${streamedResponse.statusCode} ${streamedResponse.reasonPhrase} body=$body");
+            throw Exception(
+                "Chunk download failed: ${streamedResponse.statusCode} ${streamedResponse.reasonPhrase} body=$body");
           }
 
-          final List<int> chunkBytes = [];
+          // Optimized: Collect into a BytesBuilder for efficient growth
+          final builder = BytesBuilder(copy: false);
           await streamedResponse.stream.listen((data) {
-            chunkBytes.addAll(data);
+            builder.add(data);
             totalBytesReceived += data.length;
-            print(
-                '[Download] chunk $index received ${data.length} bytes (running total: $totalBytesReceived)');
             // Emit progress in a throttled manner
             emitDownloadProgressIfNeeded();
           }).asFuture();
 
-          parts[index] = chunkBytes;
-          print('[Download] chunk $index complete size=${chunkBytes.length}');
+          // Store as Uint8List
+          parts[index] = builder.takeBytes();
+          print('[Download] chunk $index complete size=${parts[index]!.length}');
           break;
         } catch (e) {
           print('[Download] chunk $index attempt $attempts error: $e');
           final errMsg = e?.toString() ?? '';
-          if ((e is HandshakeException) || errMsg.contains('HandshakeException') || errMsg.contains('Connection terminated during handshake')) {
-            throw Exception('HandshakeException: Connection terminated during TLS handshake when downloading chunk $index from path $path. Check your network, proxy, or storage TLS configuration. Original: $e');
+          if ((e is HandshakeException) ||
+              errMsg.contains('HandshakeException') ||
+              errMsg.contains('Connection terminated during handshake')) {
+            throw Exception(
+                'HandshakeException: Connection terminated during TLS handshake when downloading chunk $index from path $path. Check your network, proxy, or storage TLS configuration. Original: $e');
           }
           if (attempts >= maxAttempts) rethrow;
           await Future.delayed(Duration(milliseconds: 400 * attempts));
@@ -496,6 +523,7 @@ class FolderUploadService {
         }
       }
     }
+
 
     int i = 0;
     while (i < sortedUnique.length) {
@@ -517,20 +545,31 @@ class FolderUploadService {
     client.close();
 
     // 3. Merge
-    // Inspect parts before merge for diagnostics
-    int sumParts = 0;
+    // Optimized merge: Determine total size and allocate single buffer
+    int totalLen = 0;
     final missingIndices = <int>[];
     for (int idx = 0; idx < parts.length; idx++) {
-      final psize = parts[idx].length;
-      print('[Download] part $idx size=$psize');
-      if (psize == 0) missingIndices.add(idx);
-      sumParts += psize;
+      if (parts[idx] == null) {
+        missingIndices.add(idx);
+      } else {
+        totalLen += parts[idx]!.length;
+      }
     }
 
-    final assembled =
-        parts.where((p) => p.isNotEmpty).expand((x) => x).toList();
+    // Allocate final buffer of exact size
+    final assembled = Uint8List(totalLen);
+    int offset = 0;
+    for (int idx = 0; idx < parts.length; idx++) {
+      if (parts[idx] != null) {
+        assembled.setRange(offset, offset + parts[idx]!.length, parts[idx]!);
+        offset += parts[idx]!.length;
+        // Free memory for this part immediately
+        parts[idx] = null;
+      }
+    }
+    
     print(
-        '[Download] assembled byte length=${assembled.length} expected=$expectedBytes totalReceived=$totalBytesReceived sumParts=$sumParts missingChunks=${missingIndices.length}');
+        '[Download] assembled byte length=${assembled.length} expected=$expectedBytes totalReceived=$totalBytesReceived missingChunks=${missingIndices.length}');
 
     if (expectedBytes > 0 && assembled.length != expectedBytes) {
       print(
@@ -910,5 +949,135 @@ class FolderUploadService {
 
     await raf.close();
     print("Large file uploaded: $path");
+  }
+
+  // --- Streaming Logic for Large Files ---
+  Future<void> downloadDistributedFileToFile(
+      String fileIdRef, double totalSizeMb, File targetFile,
+      {Function(double)? onProgress}) async {
+    
+    // 1. Info
+    final infoResp = await http.post(
+        Uri.parse('$backendUrl/api/files/download-info'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'fileIdRef': fileIdRef}));
+        
+    if (infoResp.statusCode != 200) throw Exception("Failed info");
+    
+    final data = jsonDecode(infoResp.body);
+    final chunks = (data['chunks'] as List).cast<Map<String, dynamic>>();
+
+    // Deduplicate
+    final uniqueChunks = <int, Map<String, dynamic>>{};
+    for (var c in chunks) uniqueChunks[c['index']] = c;
+    final sortedUnique = uniqueChunks.values.toList()
+      ..sort((a, b) => (a['index'] as int).compareTo(b['index'] as int));
+
+    // Stats
+    int expectedBytes = (totalSizeMb * 1024 * 1024).round(); 
+    // (Simpler calculation for now, progress is approximate)
+
+    // Prepare
+    if (await targetFile.exists()) await targetFile.delete();
+    // Create parent if not exists
+    if (!await targetFile.parent.exists()) await targetFile.parent.create(recursive: true);
+    
+    final raf = await targetFile.open(mode: FileMode.write);
+    
+    // Temp Dir
+    final tempDir = Directory(p.join(targetFile.parent.path, ".${p.basename(targetFile.path)}_parts"));
+    if (!await tempDir.exists()) await tempDir.create();
+
+    // State
+    int nextWriteIndex = 0;
+    final Map<int, File> completedParts = {};
+    int totalBytesReceived = 0;
+    
+    // Helper to merge
+    Future<void> _tryMerge() async {
+      while (completedParts.containsKey(nextWriteIndex)) {
+        final partFile = completedParts[nextWriteIndex]!;
+        // Write block by block
+        final reader = await partFile.open(mode: FileMode.read);
+        final len = await reader.length();
+        int off = 0;
+        final bufSize = 1024 * 1024;
+        while (off < len) {
+          int count = (len - off < bufSize) ? (len - off) : bufSize;
+          final bytes = await reader.read(count);
+          await raf.writeFrom(bytes);
+          off += bytes.length;
+        }
+        await reader.close();
+        await partFile.delete();
+        completedParts.remove(nextWriteIndex);
+        nextWriteIndex++;
+      }
+    }
+
+    final client = http.Client();
+
+    try {
+      Future<void> fetchAndStore(int index, String path, String token) async {
+         final url = 'https://content.dropboxapi.com/2/files/download';
+         final headers = {
+          'Authorization': 'Bearer $token',
+          'Dropbox-API-Arg': jsonEncode({"path": path}),
+         };
+         
+         final partPath = p.join(tempDir.path, "$index.part");
+         final partFile = File(partPath);
+         
+         // Retry loop
+         int attempts = 0;
+         while(true) {
+           attempts++;
+           try {
+             final req = http.Request('POST', Uri.parse(url));
+             req.headers.addAll(headers);
+             final resp = await client.send(req);
+             if (resp.statusCode != 200) throw Exception("Status: ${resp.statusCode}");
+             
+             final sink = partFile.openWrite();
+             await resp.stream.listen((chunk) {
+               sink.add(chunk);
+               totalBytesReceived += chunk.length;
+               if (onProgress != null && expectedBytes > 0) {
+                 double p = totalBytesReceived / expectedBytes;
+                 if (p > 1.0) p = 1.0;
+                 onProgress(p);
+               }
+             }).asFuture();
+             await sink.close();
+             
+             completedParts[index] = partFile;
+             await _tryMerge();
+             break;
+           } catch(e) {
+             if (attempts >= 3) rethrow;
+             await Future.delayed(Duration(seconds: attempts));
+           }
+         }
+      }
+
+      // Execution Loop (Batch of 3)
+      int i = 0;
+      while (i < sortedUnique.length) {
+        final batch = <Future>[];
+        for (int k = 0; k < 3 && i < sortedUnique.length; k++) {
+           final c = sortedUnique[i];
+           batch.add(fetchAndStore(c['index'], c['path'], c['token']));
+           i++;
+        }
+        await Future.wait(batch);
+      }
+
+    } finally {
+      client.close();
+      await raf.close();
+      if (await tempDir.exists()) {
+        try { await tempDir.delete(recursive: true); } catch(e){}
+      }
+    }
   }
 }

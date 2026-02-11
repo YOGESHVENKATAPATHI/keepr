@@ -139,6 +139,87 @@ async function startUploadSession(dbx, fileSize) {
 
 
 
+
+async function deletePathsFromShard(shardId, chunkPaths) {
+    if (!chunkPaths || chunkPaths.length === 0) return;
+    
+    // get token
+    const token = await getAccessTokenForShard(shardId);
+    
+    // API limitation: 1000 items per batch
+    const CHUNK_SIZE = 1000;
+    for (let i = 0; i < chunkPaths.length; i += CHUNK_SIZE) {
+        // Prepare entries: { "path": "/..." }
+        const entries = chunkPaths.slice(i, i + CHUNK_SIZE).map(p => ({ "path": p }));
+        
+        try {
+            console.log(`[Storage] Shard ${shardId} deleting batch of ${entries.length} items...`);
+            const response = await fetch('https://api.dropboxapi.com/2/files/delete_batch', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ entries })
+            });
+
+            if (!response.ok) {
+                 const txt = await response.text();
+                 console.error(`[Storage] Shard ${shardId} delete_batch failed:`, txt);
+            } else {
+                 const d = await response.json();
+                 
+                 if (d['.tag'] === 'async_job_id') {
+                      const jobId = d.async_job_id;
+                      console.log(`[Storage] Shard ${shardId} deletion queued (Job: ${jobId}). Waiting for completion...`);
+                      await waitForDeleteJob(token, jobId, shardId);
+                 } else if (d['.tag'] === 'complete') {
+                      console.log(`[Storage] Shard ${shardId} deletion completed immediately.`);
+                 } else {
+                      console.log(`[Storage] Shard ${shardId} unknown response tag: ${d['.tag']}`);
+                 }
+            }
+        } catch(e) {
+            console.error(`[Storage] Shard ${shardId} delete exception`, e);
+        }
+    }
+}
+
+async function waitForDeleteJob(token, jobId, shardId) {
+    let attempts = 0;
+    while(attempts < 60) { // Timeout after 60s approx
+        attempts++;
+        await new Promise(r => setTimeout(r, 1000));
+        
+        try {
+            const res = await fetch('https://api.dropboxapi.com/2/files/delete_batch/check', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ async_job_id: jobId })
+            });
+            
+            if (!res.ok) {
+                 console.warn(`[Storage] Shard ${shardId} check-job failed:`, await res.text());
+                 return; 
+            }
+            
+            const status = await res.json();
+            if (status['.tag'] === 'complete') {
+                console.log(`[Storage] Shard ${shardId} Job ${jobId} finished successfully.`);
+                return;
+            } else if (status['.tag'] === 'failed') {
+                console.error(`[Storage] Shard ${shardId} Job ${jobId} reported FAILURE.`, status);
+                return;
+            }
+            // else 'in_progress' -> loop continue
+        } catch(e) {
+            console.error(`[Storage] Shard ${shardId} check-job exception`, e);
+            // don't break immediately on network blip
+        }
+    }
+    console.warn(`[Storage] Shard ${shardId} Job ${jobId} timed out or stuck.`);
+}
+
 async function getAccessTokenForShard(shardId) {
     let masterClient = null;
     try {
@@ -155,5 +236,6 @@ async function getAccessTokenForShard(shardId) {
 
 module.exports = {
     getFittestStorageAccount,
-    getAccessTokenForShard
+    getAccessTokenForShard,
+    deletePathsFromShard
 };
