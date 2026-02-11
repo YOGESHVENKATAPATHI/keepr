@@ -437,7 +437,7 @@ app.post('/api/auth/request-pin-reset', async (req, res) => {
             await client.query('INSERT INTO pin_resets (user_id, reset_token, expires_at) VALUES ($1, $2, $3)', [userId, token, expiresAt]);
 
             // send email
-            const base = resetUrlBase || process.env.PIN_RESET_URL || 'http://localhost:3000/pin-reset?token=';
+            const base = resetUrlBase || process.env.PIN_RESET_URL || 'https://keepr-gold.vercel.app/pin-reset?token=';
             const sent = await auth.sendPinResetEmail(email, token, base);
             return sent;
         });
@@ -865,6 +865,17 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
         // Return instructions
         // We will store this chunk at /keepr_chunks/<fileId>/<index> on the chosen shard
         const remotePath = `/keepr_chunks/${fileId}/${chunkIndex}.bin`;
+
+        // Reserve space in DB (Pending Allocation)
+        await executeWithDB(async (client) => {
+             // Ensure table exists just in case (though init should have done it)
+             // We rely on 'init' having run.
+             await client.query(
+                 `INSERT INTO file_chunks (file_id, chunk_index, shard_id, size_mb, status, dropbox_path) 
+                  VALUES ($1, $2, $3, $4, 'pending', $5)`,
+                 [fileId, chunkIndex, account.shard_id, sizeMb, remotePath]
+             );
+        });
         
         res.json({
             shardId: account.shard_id,
@@ -908,14 +919,21 @@ app.post('/api/upload/finalize', async (req, res) => {
                 const sizeBytes = c.size || c.size_bytes || 0;
                 const sizeMb = sizeBytes ? (sizeBytes / (1024 * 1024)) : null;
 
-                // CHECK: Avoid duplicate entries for same file_id + chunk_index
+                // CHECK: Handle existing (pending) entries or duplicates
                 const existing = await client.query(
                     'SELECT 1 FROM file_chunks WHERE file_id=$1 AND chunk_index=$2',
                     [fileId, c.index]
                 );
 
                 if (existing.rowCount > 0) {
-                    console.log(`Skipping duplicate chunk for file=${fileId} index=${c.index}`);
+                    // Update the pending chunk to completed
+                    await client.query(
+                        `UPDATE file_chunks 
+                         SET status='completed', shard_id=$3, dropbox_path=$4, size_mb=$5 
+                         WHERE file_id=$1 AND chunk_index=$2`,
+                         [fileId, c.index, safeShardId, c.path, sizeMb]
+                    );
+                    // console.log(`Updated pending chunk for file=${fileId} index=${c.index}`);
                     continue;
                 }
 

@@ -18,7 +18,7 @@ const String kGoogleClientId = String.fromEnvironment('GOOGLE_CLIENT_ID',
     defaultValue:
         '75763106036-6d5kmkr59sn567mbe41okqikb458r6cm.apps.googleusercontent.com');
 const String kBackendBase = String.fromEnvironment('BACKEND_BASE',
-    defaultValue: 'http://localhost:3000');
+    defaultValue: 'https://keepr-gold.vercel.app');
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});

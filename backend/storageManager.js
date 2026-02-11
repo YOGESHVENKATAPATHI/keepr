@@ -43,6 +43,22 @@ async function getFittestStorageAccount(requiredSizeMb = 0) {
 
         console.log(`[Storage] Found ${res.rows.length} active shards. Starting live checks...`);
         
+        // 0. Calculate Reserved Space (Pending Chunks) to avoid over-allocation
+        let pendingMap = {};
+        try {
+            const pendingRes = await masterClient.query(`
+                SELECT shard_id, SUM(size_mb) as pending_mb 
+                FROM file_chunks 
+                WHERE status = 'pending' 
+                GROUP BY shard_id
+            `);
+            pendingRes.rows.forEach(r => pendingMap[r.shard_id] = parseFloat(r.pending_mb));
+            console.log('[Storage] Pending allocations map:', pendingMap);
+        } catch (e) {
+            // Table might not exist yet if no uploads started
+            console.warn('[Storage] Skipping pending check (table missing?):', e.message);
+        }
+
         let bestCandidate = null;
 
         // Live Validation Loop
@@ -55,11 +71,15 @@ async function getFittestStorageAccount(requiredSizeMb = 0) {
                 const usageData = await getLiveSpaceUsage(accessToken);
                 const usedMb = usageData.used / (1024 * 1024);
                 const allocatedMb = usageData.allocated / (1024 * 1024);
-                const freeMb = allocatedMb - usedMb;
+                
+                // Apply pending reservation
+                const pendingMb = pendingMap[account.id] || 0;
+                const effectiveUsedMb = usedMb + pendingMb;
+                const freeMb = allocatedMb - effectiveUsedMb;
 
-                console.log(`[Storage] Live Check Shard ${account.id}: Free=${freeMb.toFixed(2)}MB, Used=${usedMb.toFixed(2)}MB (Allocated: ${allocatedMb.toFixed(0)}MB)`);
+                console.log(`[Storage] Live Check Shard ${account.id}: Free=${freeMb.toFixed(2)}MB (Live Used: ${usedMb.toFixed(2)} + Pending: ${pendingMb.toFixed(2)} / Alloc: ${allocatedMb.toFixed(0)})`);
 
-                // 3. Update DB with REAL usage
+                // 3. Update DB with REAL usage (keep DB consistent with Dropbox)
                 await masterClient.query(
                     'UPDATE storage_shards SET current_usage_mb = $1 WHERE id = $2',
                     [usedMb, account.id]

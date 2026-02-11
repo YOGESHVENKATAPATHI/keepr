@@ -506,12 +506,11 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
       child: isDesktop
           ? Row(
               children: [
-                SvgPicture.asset(
-                  'assets/keeprlogo.svg',
-                  width: 32,
-                  height: 32,
-                  colorFilter: const ColorFilter.mode(Colors.white, BlendMode.srcIn)
-                ),
+                SvgPicture.asset('assets/keeprlogo.svg',
+                    width: 32,
+                    height: 32,
+                    colorFilter:
+                        const ColorFilter.mode(Colors.white, BlendMode.srcIn)),
                 const SizedBox(width: 12),
                 Text(
                   'KEEPR',
@@ -540,12 +539,11 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                   children: [
                     Row(
                       children: [
-                        SvgPicture.asset(
-                          'assets/keeprlogo.svg',
-                          width: 28,
-                          height: 28,
-                          colorFilter: const ColorFilter.mode(Colors.white, BlendMode.srcIn)
-                        ),
+                        SvgPicture.asset('assets/keeprlogo.svg',
+                            width: 28,
+                            height: 28,
+                            colorFilter: const ColorFilter.mode(
+                                Colors.white, BlendMode.srcIn)),
                         const SizedBox(width: 8),
                         Text(
                           'KEEPR',
