@@ -854,28 +854,66 @@ app.post('/api/upload/init', async (req, res) => {
 // 2. Allocate Chunk: Decide where to put a specific chunk
 app.post('/api/upload/allocate-chunk', async (req, res) => {
     const { fileId, chunkIndex, sizeMb } = req.body;
-    // console.log(`[Upload] allocating chunk ${chunkIndex} for ${fileId} (${sizeMb}MB)`);
     
     try {
-        // Round-robin or Load Balancer Logic
-        // For now, simpler: Pick fittest account for this chunk Size
-        // Ideally we iterate available shards or cache them. 
+        // 1. Check if already allocated (Idempotency)
+        let existing = null;
+        await executeWithDB(async (client) => {
+            const res = await client.query(
+                'SELECT shard_id, dropbox_path FROM file_chunks WHERE file_id=$1 AND chunk_index=$2', 
+                [fileId, chunkIndex]
+            );
+            if (res.rows.length > 0) existing = res.rows[0];
+        });
+
+        if (existing) {
+             console.log(`[Upload] Chunk ${chunkIndex} already allocated on shard ${existing.shard_id}`);
+             const token = await storageManager.getAccessTokenForShard(existing.shard_id);
+             return res.json({
+                 shardId: existing.shard_id,
+                 accessToken: token,
+                 uploadPath: existing.dropbox_path
+             });
+        }
+
+        // 2. Not found, allocate new
         const account = await storageManager.getFittestStorageAccount(sizeMb);
-        
-        // Return instructions
-        // We will store this chunk at /keepr_chunks/<fileId>/<index> on the chosen shard
         const remotePath = `/keepr_chunks/${fileId}/${chunkIndex}.bin`;
 
-        // Reserve space in DB (Pending Allocation)
-        await executeWithDB(async (client) => {
-             // Ensure table exists just in case (though init should have done it)
-             // We rely on 'init' having run.
-             await client.query(
-                 `INSERT INTO file_chunks (file_id, chunk_index, shard_id, size_mb, status, dropbox_path) 
-                  VALUES ($1, $2, $3, $4, 'pending', $5)`,
-                 [fileId, chunkIndex, account.shard_id, sizeMb, remotePath]
-             );
-        });
+        // 3. Reserve space in DB (Handle race condition)
+        try {
+            await executeWithDB(async (client) => {
+                 await client.query(
+                     `INSERT INTO file_chunks (file_id, chunk_index, shard_id, size_mb, status, dropbox_path) 
+                      VALUES ($1, $2, $3, $4, 'pending', $5)`,
+                     [fileId, chunkIndex, account.shard_id, sizeMb, remotePath]
+                 );
+            });
+        } catch (dbErr) {
+            // Race condition: Someone else inserted while we were calculating
+            if (dbErr.message && (dbErr.message.includes('unique') || dbErr.message.includes('duplicate') || dbErr.code === '23505')) {
+                 console.warn(`[Upload] Chunk ${chunkIndex} allocation race detected. Using existing.`);
+                 
+                 let raceExisting = null;
+                 await executeWithDB(async (client) => {
+                    const res = await client.query(
+                        'SELECT shard_id, dropbox_path FROM file_chunks WHERE file_id=$1 AND chunk_index=$2', 
+                        [fileId, chunkIndex]
+                    );
+                    if (res.rows.length > 0) raceExisting = res.rows[0];
+                 });
+                 
+                 if (raceExisting) {
+                    const token = await storageManager.getAccessTokenForShard(raceExisting.shard_id);
+                    return res.json({
+                        shardId: raceExisting.shard_id,
+                        accessToken: token,
+                        uploadPath: raceExisting.dropbox_path
+                    });
+                 }
+            }
+            throw dbErr;
+        }
         
         res.json({
             shardId: account.shard_id,
