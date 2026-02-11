@@ -437,7 +437,7 @@ app.post('/api/auth/request-pin-reset', async (req, res) => {
             await client.query('INSERT INTO pin_resets (user_id, reset_token, expires_at) VALUES ($1, $2, $3)', [userId, token, expiresAt]);
 
             // send email
-            const base = resetUrlBase || process.env.PIN_RESET_URL || 'https://keepr-gold.vercel.app/pin-reset?token=';
+            const base = resetUrlBase || process.env.PIN_RESET_URL || 'http://localhost:3000/pin-reset?token=';
             const sent = await auth.sendPinResetEmail(email, token, base);
             return sent;
         });
@@ -880,46 +880,65 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
         const account = await storageManager.getFittestStorageAccount(sizeMb);
         const remotePath = `/keepr_chunks/${fileId}/${chunkIndex}.bin`;
 
-        // 3. Reserve space in DB (Handle race condition)
-        try {
-            await executeWithDB(async (client) => {
-                 await client.query(
-                     `INSERT INTO file_chunks (file_id, chunk_index, shard_id, size_mb, status, dropbox_path) 
-                      VALUES ($1, $2, $3, $4, 'pending', $5)`,
-                     [fileId, chunkIndex, account.shard_id, sizeMb, remotePath]
-                 );
-            });
-        } catch (dbErr) {
-            // Race condition: Someone else inserted while we were calculating
-            if (dbErr.message && (dbErr.message.includes('unique') || dbErr.message.includes('duplicate') || dbErr.code === '23505')) {
-                 console.warn(`[Upload] Chunk ${chunkIndex} allocation race detected. Using existing.`);
-                 
-                 let raceExisting = null;
-                 await executeWithDB(async (client) => {
-                    const res = await client.query(
-                        'SELECT shard_id, dropbox_path FROM file_chunks WHERE file_id=$1 AND chunk_index=$2', 
-                        [fileId, chunkIndex]
-                    );
-                    if (res.rows.length > 0) raceExisting = res.rows[0];
-                 });
-                 
-                 if (raceExisting) {
-                    const token = await storageManager.getAccessTokenForShard(raceExisting.shard_id);
-                    return res.json({
-                        shardId: raceExisting.shard_id,
-                        accessToken: token,
-                        uploadPath: raceExisting.dropbox_path
-                    });
-                 }
+        // 3. Reserve space in DB (Handle race condition & PK overlaps)
+        let allocated = null;
+        let attempts = 0;
+        
+        while (!allocated && attempts < 3) {
+            attempts++;
+            try {
+                // Generate a unique ID for this chunk (Fix for duplicate key error on default '0')
+                const newChunkId = generateUUID(); // Use helper or uuidv4
+
+                await executeWithDB(async (client) => {
+                     await client.query(
+                         `INSERT INTO file_chunks (chunk_id, file_id, chunk_index, shard_id, size_mb, status, dropbox_path) 
+                          VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
+                         [newChunkId, fileId, chunkIndex, account.shard_id, sizeMb, remotePath]
+                     );
+                });
+                allocated = { shardId: account.shard_id, uploadPath: remotePath };
+            } catch (dbErr) {
+                // Check if it's a constraint violation
+                if (dbErr.message && (dbErr.message.includes('unique') || dbErr.message.includes('duplicate') || dbErr.code === '23505')) {
+                     
+                     // A. Check if it's a LOGICAL collision (file_id + chunk_index already exists)
+                     let raceExisting = null;
+                     await executeWithDB(async (client) => {
+                        const res = await client.query(
+                            'SELECT shard_id, dropbox_path FROM file_chunks WHERE file_id=$1 AND chunk_index=$2', 
+                            [fileId, chunkIndex]
+                        );
+                        if (res.rows.length > 0) raceExisting = res.rows[0];
+                     });
+                     
+                     if (raceExisting) {
+                        console.log(`[Upload] Chunk ${chunkIndex} allocation found existing (race/retry).`);
+                        const token = await storageManager.getAccessTokenForShard(raceExisting.shard_id);
+                        return res.json({
+                            shardId: raceExisting.shard_id,
+                            accessToken: token,
+                            uploadPath: raceExisting.dropbox_path
+                        });
+                     }
+
+                     // B. If logical record NOT found, it was a random PK collision (unlikely with UUID) or '0' default collision
+                     console.warn(`[Upload] Chunk ${chunkIndex} allocation PK collision (attempt ${attempts}). Retrying...`);
+                     continue; // Retry insert loop with new UUID
+                }
+                throw dbErr; // valid DB error
             }
-            throw dbErr;
         }
         
-        res.json({
-            shardId: account.shard_id,
-            accessToken: account.access_token,
-            uploadPath: remotePath
-        });
+        if (allocated) {
+            return res.json({
+                shardId: allocated.shardId,
+                accessToken: account.access_token,
+                uploadPath: allocated.uploadPath
+            });
+        }
+        
+        throw new Error("Unable to allocate chunk after multiple retries.");
     } catch(e) {
         console.error('Allocate Chunk Failed', e);
         res.status(500).send(e.message);
@@ -977,32 +996,34 @@ app.post('/api/upload/finalize', async (req, res) => {
 
                 // DATA INTEGRITY: Insert into shard columns and persist size_mb when available
                 try {
+                    const newChunkId = generateUUID();
                     const insertQuery = `INSERT INTO file_chunks 
-                      (file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, size_mb, status) 
-                     VALUES ($1, $2, $3, $3, $4, $5, 'completed')`;
-                    await client.query(insertQuery, [fileId, c.index, safeShardId, c.path, sizeMb]);
+                      (chunk_id, file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, size_mb, status) 
+                     VALUES ($6, $1, $2, $3, $3, $4, $5, 'completed')`;
+                    await client.query(insertQuery, [fileId, c.index, safeShardId, c.path, sizeMb, newChunkId]);
                 } catch (insertErr) {
                     // FALLBACK 1: Maybe 'shard_id' column doesn't exist? Try only storage_shard_id
                     if (insertErr.message && insertErr.message.includes('shard_id')) {
                          try {
+                            const newChunkId = generateUUID();
                             await client.query(
                                 `INSERT INTO file_chunks 
-                                  (file_id, chunk_index, storage_shard_id, dropbox_path, size_mb, status) 
-                                 VALUES ($1, $2, $3, $4, $5, 'completed')`,
-                                [fileId, c.index, safeShardId, c.path, sizeMb]
+                                  (chunk_id, file_id, chunk_index, storage_shard_id, dropbox_path, size_mb, status) 
+                                 VALUES ($6, $1, $2, $3, $4, $5, 'completed')`,
+                                [fileId, c.index, safeShardId, c.path, sizeMb, newChunkId]
                             );
                             continue; // Success
                          } catch (e2) { /* ignore, try next fallback */ }
                     }
 
-                    // FALLBACK 2: Explicit chunk_id needed?
+                    // FALLBACK 2: Explicit chunk_id needed? (Redundant if we already add it, but keep for safety)
                     if (insertErr.message && (insertErr.message.includes('chunk_id') || insertErr.message.includes('violate'))) {
-                        console.warn('Fallback insert with manual chunk_id');
+                        console.warn('Fallback insert with generated chunk_id');
                         await client.query(
                             `INSERT INTO file_chunks 
                               (chunk_id, file_id, chunk_index, shard_id, storage_shard_id, dropbox_path, size_mb, status) 
                              VALUES ($1, $2, $3, $4, $4, $5, $6, 'completed')`,
-                            [Math.floor(Math.random() * 10000000), fileId, c.index, safeShardId, c.path, sizeMb] // $1..$6
+                            [generateUUID(), fileId, c.index, safeShardId, c.path, sizeMb] // $1..$6
                         );
                     } else {
                         console.error("Unknown Insert Error detail:", insertErr);

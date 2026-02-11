@@ -7,10 +7,10 @@ class ApiService {
   ApiService({required this.backendBase});
 
   /// Convenience factory that reads backend base from compile-time define when
-  /// running locally: `--dart-define=BACKEND_BASE=https://keepr-gold.vercel.app`.
+  /// running locally: `--dart-define=BACKEND_BASE=http://localhost:3000`.
   factory ApiService.forEnv() => ApiService(
       backendBase: const String.fromEnvironment('BACKEND_BASE',
-          defaultValue: 'https://keepr-gold.vercel.app'));
+          defaultValue: 'http://localhost:3000'));
 
   Future<bool> sendOtp(String email) async {
     final url = Uri.parse('$backendBase/api/auth/send-otp');
