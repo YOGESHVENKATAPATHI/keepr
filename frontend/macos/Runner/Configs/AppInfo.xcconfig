@@ -8,7 +8,7 @@
 PRODUCT_NAME = keepr
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = com.example.keepr
+PRODUCT_BUNDLE_IDENTIFIER = com.keepr.yogesh
 
 // The copyright displayed in application information
 PRODUCT_COPYRIGHT = Copyright © 2026 com.example. All rights reserved.

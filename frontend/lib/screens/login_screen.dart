@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:glassmorphism/glassmorphism.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter/foundation.dart'
     show kIsWeb, defaultTargetPlatform, TargetPlatform;
@@ -75,6 +76,29 @@ class _LoginScreenState extends State<LoginScreen> {
     ));
   }
 
+  // Prompt mobile user to choose a download directory (only once) and persist it.
+  // Stored under key 'download_path' using FlutterSecureStorage.
+  Future<void> _ensureDownloadPathSet() async {
+    // Only prompt on mobile platforms (Android/iOS)
+    if (kIsWeb) return;
+    if (!(defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS)) return;
+
+    final existing = await _secureStorage.read(key: 'download_path');
+    if (existing != null && existing.isNotEmpty) return;
+
+    try {
+      final dir = await FilePicker.platform.getDirectoryPath();
+      if (dir != null && dir.isNotEmpty) {
+        await _secureStorage.write(key: 'download_path', value: dir);
+        _showSnack('Download path saved');
+      }
+    } catch (e) {
+      // non-fatal — just skip if platform does not support directory picker
+      print('[Login] download path prompt failed: $e');
+    }
+  }
+
   Future<void> _handleSubmit() async {
     if (_isOtpSent) {
       await _verifyOtp();
@@ -120,14 +144,33 @@ class _LoginScreenState extends State<LoginScreen> {
         await _secureStorage.write(key: 'user_email', value: email);
 
         _showSnack('Login successful!');
+
+        // Fetch profile to determine whether a PIN is already set
+        final profileResp = await _api.getProfile(token);
+        final hasPin = profileResp != null &&
+            profileResp['profile'] != null &&
+            profileResp['profile']['has_pin'] == true;
+
+        // On mobile, prompt user to pick and save a download directory (only once)
+        await _ensureDownloadPathSet();
+
         if (!mounted) return;
 
-        Navigator.of(context).pushReplacement(MaterialPageRoute(
-            builder: (ctx) => FileManagerScreen(
-                  userId: email,
+        if (!hasPin) {
+          Navigator.of(context).pushReplacement(MaterialPageRoute(
+              builder: (_) => SetPinScreen(
                   api: _api,
-                  uploader: _uploadService,
-                )));
+                  token: token,
+                  userEmail: email,
+                  uploader: _uploadService)));
+        } else {
+          Navigator.of(context).pushReplacement(MaterialPageRoute(
+              builder: (ctx) => FileManagerScreen(
+                    userId: email,
+                    api: _api,
+                    uploader: _uploadService,
+                  )));
+        }
       } else {
         _showSnack('Invalid OTP', error: true);
       }
@@ -193,6 +236,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
       if (!hasPin) {
         // ask user to set a PIN
+        await _ensureDownloadPathSet();
         Navigator.of(context).pushReplacement(MaterialPageRoute(
             builder: (_) => SetPinScreen(
                 api: _api,
@@ -200,6 +244,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 userEmail: account.email,
                 uploader: _uploadService)));
       } else {
+        await _ensureDownloadPathSet();
         Navigator.of(context).pushReplacement(MaterialPageRoute(
             builder: (ctx) => FileManagerScreen(
                   userId: account.email,

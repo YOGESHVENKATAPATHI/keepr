@@ -162,34 +162,23 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         console.log(`[Auth] OTP verified for ${email}`);
         
         try {
-            // Persist user in the worker DB
-            await executeWithDB(async (workerClient) => {
+            // Issue an onboarding (pre-user) token but DO NOT create a users row yet.
+            // The client will complete account creation when the PIN is set.
+            const tokenValue = await executeWithDB(async (workerClient) => {
+                // Ensure pre_users table exists
                 await workerClient.query(`
-                    CREATE TABLE IF NOT EXISTS users (
-                        id SERIAL PRIMARY KEY,
-                        email TEXT UNIQUE NOT NULL,
-                        email_verified BOOLEAN DEFAULT FALSE,
-                        pin_hash TEXT,
-                        last_failed_pin_attempts INT DEFAULT 0,
-                        pin_locked_until TIMESTAMP NULL,
+                    CREATE TABLE IF NOT EXISTS pre_users (
+                        token TEXT PRIMARY KEY,
+                        email TEXT NOT NULL,
                         created_at TIMESTAMP DEFAULT NOW()
                     );
                 `);
-                // Ensure existing worker schema has all required columns
-                await ensureUsersSchema(workerClient);
-                
-                // key-value style check or just insert-on-conflict
-                const check = await workerClient.query('SELECT id FROM users WHERE email = $1', [email]);
-                if (check.rows.length === 0) {
-                    await workerClient.query('INSERT INTO users (email, email_verified) VALUES ($1, true)', [email]);
-                    console.log(`[Auth] New user created: ${email}`);
-                } else {
-                    // ensure email_verified true
-                    await workerClient.query('UPDATE users SET email_verified = TRUE WHERE email = $1', [email]);
-                    console.log(`[Auth] User exists: ${email}`);
-                }
+                // Index to speed up TTL cleanup and lookups by creation time
+                await workerClient.query(`
+                    CREATE INDEX IF NOT EXISTS pre_users_created_idx ON pre_users (created_at);
+                `);
 
-                // Ensure auth tables exist
+                // Ensure auth_tokens exists for future (fully-provisioned) users
                 await workerClient.query(`
                     CREATE TABLE IF NOT EXISTS auth_tokens (
                         id SERIAL PRIMARY KEY,
@@ -201,21 +190,13 @@ app.post('/api/auth/verify-otp', async (req, res) => {
                     );
                 `);
 
-                await workerClient.query(`
-                    CREATE TABLE IF NOT EXISTS pin_resets (
-                        id SERIAL PRIMARY KEY,
-                        user_id INT NOT NULL,
-                        reset_token TEXT UNIQUE NOT NULL,
-                        expires_at TIMESTAMP NOT NULL,
-                        used BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP DEFAULT NOW()
-                    );
-                `);
+                const newToken = uuidv4();
+                await workerClient.query('INSERT INTO pre_users (token, email) VALUES ($1, $2)', [newToken, email]);
+                return newToken;
             });
 
-            console.log(`[Auth] login success for ${email}`);
-            // For backwards compatibility we still return a mock token here; clients should transition to real tokens via Google Sign-In or PIN flows.
-            res.status(200).send({ message: 'Login successful', token: 'mock-jwt-token' });
+            console.log(`[Auth] onboarding token issued for ${email}`);
+            res.status(200).send({ message: 'Login successful', token: tokenValue });
         } catch (e) {
             console.error(e);
             res.status(500).send({ message: 'Database error during login', error: e.message });
@@ -237,13 +218,41 @@ async function verifyAuthToken(req, res, next) {
     const token = parts[1];
 
     try {
+        // 1) Check for fully-provisioned token in auth_tokens
         const row = await executeWithDB(async (client) => {
             const r = await client.query('SELECT user_id, revoked FROM auth_tokens WHERE token = $1', [token]);
             return r.rows[0];
         });
-        if (!row || row.revoked) return res.status(401).send({ message: 'Invalid or revoked token' });
-        req.user = { id: row.user_id, token };
-        next();
+        if (row && !row.revoked) {
+            req.user = { id: row.user_id, token };
+            return next();
+        }
+
+        // 2) If not found, allow pre-provisioned onboarding tokens (pre_users)
+        const pre = await executeWithDB(async (client) => {
+            // ensure pre_users table exists for safety
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS pre_users (
+                    token TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            `);
+            // index to accelerate TTL cleanup and lookups
+            await client.query(`
+                CREATE INDEX IF NOT EXISTS pre_users_created_idx ON pre_users (created_at);
+            `);
+            const r = await client.query('SELECT email FROM pre_users WHERE token = $1', [token]);
+            return r.rows[0];
+        });
+
+        if (pre && pre.email) {
+            // Allow access but mark as onboarding/pre-user (limited privileges expected by handlers)
+            req.user = { id: null, email: pre.email, token, preUser: true };
+            return next();
+        }
+
+        return res.status(401).send({ message: 'Invalid or revoked token' });
     } catch (e) {
         console.error('Token verification error', e);
         res.status(500).send({ message: 'Token verification failed' });
@@ -299,32 +308,45 @@ app.post('/api/auth/google-signin', async (req, res) => {
 
             // insert or update user (we identify users by email only)
             const q = await client.query('SELECT id FROM users WHERE email = $1', [email]);
-            let userId;
-            if (q.rows.length === 0) {
-                const ins = await client.query('INSERT INTO users (email, email_verified) VALUES ($1, TRUE) RETURNING id', [email]);
-                userId = ins.rows[0].id;
-                console.log('[Auth] created user via Google:', email);
-            } else {
-                userId = q.rows[0].id;
+            if (q.rows.length > 0) {
+                // existing fully-provisioned user -> issue auth token as before
+                const userId = q.rows[0].id;
                 await client.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [userId]);
                 console.log('[Auth] updated user via Google:', email);
+
+                // ensure auth_tokens table
+                await client.query(`
+                    CREATE TABLE IF NOT EXISTS auth_tokens (
+                        id SERIAL PRIMARY KEY,
+                        user_id INT NOT NULL,
+                        token TEXT UNIQUE NOT NULL,
+                        device_info TEXT,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        revoked BOOLEAN DEFAULT FALSE
+                    );
+                `);
+
+                const tokenValue = uuidv4();
+                await client.query('INSERT INTO auth_tokens (user_id, token, device_info) VALUES ($1, $2, $3)', [userId, tokenValue, deviceInfo || null]);
+                return tokenValue;
             }
 
-            // ensure auth_tokens table
+            // New user -> create onboarding (pre_user) token instead of creating a users row.
             await client.query(`
-                CREATE TABLE IF NOT EXISTS auth_tokens (
-                    id SERIAL PRIMARY KEY,
-                    user_id INT NOT NULL,
-                    token TEXT UNIQUE NOT NULL,
-                    device_info TEXT,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    revoked BOOLEAN DEFAULT FALSE
+                CREATE TABLE IF NOT EXISTS pre_users (
+                    token TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
                 );
             `);
-
-            const tokenValue = uuidv4();
-            await client.query('INSERT INTO auth_tokens (user_id, token, device_info) VALUES ($1, $2, $3)', [userId, tokenValue, deviceInfo || null]);
-            return tokenValue;
+            // Ensure index exists for efficient expiry/deletes
+            await client.query(`
+                CREATE INDEX IF NOT EXISTS pre_users_created_idx ON pre_users (created_at);
+            `);
+            const onboardingToken = uuidv4();
+            await client.query('INSERT INTO pre_users (token, email) VALUES ($1, $2)', [onboardingToken, email]);
+            console.log('[Auth] onboarding token issued for new Google user:', email);
+            return onboardingToken;
         });
 
         res.json({ token });
@@ -337,16 +359,76 @@ app.post('/api/auth/google-signin', async (req, res) => {
 // POST /api/auth/set-pin (authenticated)
 app.post('/api/auth/set-pin', verifyAuthToken, async (req, res) => {
     const { pin } = req.body;
-    if (!pin || !/^\d{6}$/.test(pin)) return res.status(400).send({ message: 'Pin must be 6 digits' });
+    console.log(`[Auth] set-pin requested for user/email=${req.user?.id ?? req.user?.email} pinLength=${pin ? pin.length : 0}`);
+
+    if (!pin || !/^\d{6}$/.test(pin)) {
+        console.warn(`[Auth] Invalid PIN format for user/email=${req.user?.id ?? req.user?.email}`);
+        return res.status(400).send({ message: 'Pin must be 6 digits' });
+    }
+
     const hash = await bcrypt.hash(pin, 10);
 
     try {
+        if (req.user?.preUser) {
+            // Complete onboarding: create users row, attach the existing onboarding token
+            const created = await executeWithDB(async (client) => {
+                await client.query(`
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        email TEXT UNIQUE NOT NULL,
+                        email_verified BOOLEAN DEFAULT FALSE,
+                        pin_hash TEXT,
+                        last_failed_pin_attempts INT DEFAULT 0,
+                        pin_locked_until TIMESTAMP NULL,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                `);
+                await ensureUsersSchema(client);
+
+                // Insert new user (or return existing id if race)
+                let userId = null;
+                const q = await client.query('SELECT id FROM users WHERE email = $1', [req.user.email]);
+                if (q.rows.length === 0) {
+                    const ins = await client.query('INSERT INTO users (email, email_verified, pin_hash) VALUES ($1, TRUE, $2) RETURNING id', [req.user.email, hash]);
+                    userId = ins.rows[0].id;
+                } else {
+                    userId = q.rows[0].id;
+                    await client.query('UPDATE users SET pin_hash=$1, email_verified = TRUE WHERE id=$2', [hash, userId]);
+                }
+
+                // Ensure auth_tokens table and attach onboarding token for continued auth
+                await client.query(`
+                    CREATE TABLE IF NOT EXISTS auth_tokens (
+                        id SERIAL PRIMARY KEY,
+                        user_id INT NOT NULL,
+                        token TEXT UNIQUE NOT NULL,
+                        device_info TEXT,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        revoked BOOLEAN DEFAULT FALSE
+                    );
+                `);
+
+                // Move token from pre_users into auth_tokens for this user
+                await client.query('INSERT INTO auth_tokens (user_id, token, device_info) VALUES ($1, $2, $3)', [userId, req.user.token, null]);
+
+                // Remove pre_users onboarding record
+                await client.query('DELETE FROM pre_users WHERE token = $1', [req.user.token]);
+
+                return userId;
+            });
+
+            console.log(`[Auth] Completed onboarding and set PIN for userId=${created}`);
+            return res.json({ ok: true });
+        }
+
+        // Normal path for already-provisioned users
         await executeWithDB(async (client) => {
             await client.query('UPDATE users SET pin_hash=$1 WHERE id=$2', [hash, req.user.id]);
         });
+        console.log(`[Auth] PIN set successfully for userId=${req.user.id}`);
         res.json({ ok: true });
     } catch (e) {
-        console.error('Set pin failed', e);
+        console.error(`Set pin failed for user/email=${req.user?.id ?? req.user?.email}`, e);
         res.status(500).send({ message: 'Failed to set pin' });
     }
 });
@@ -354,6 +436,11 @@ app.post('/api/auth/set-pin', verifyAuthToken, async (req, res) => {
 // GET /api/auth/profile - returns basic profile if token is valid
 app.get('/api/auth/profile', verifyAuthToken, async (req, res) => {
     try {
+        // If token corresponds to onboarding (pre-user), return email + has_pin=false
+        if (req.user?.preUser) {
+            return res.json({ profile: { email: req.user.email, has_pin: false } });
+        }
+
         const profile = await executeWithDB(async (client) => {
             const u = await client.query('SELECT email, (pin_hash IS NOT NULL) AS has_pin FROM users WHERE id=$1', [req.user.id]);
             if (u.rows.length === 0) throw new Error('User not found');

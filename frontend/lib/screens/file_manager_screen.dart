@@ -6,6 +6,7 @@ import 'package:universal_html/html.dart' as html;
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:glassmorphism/glassmorphism.dart';
 import '../services/api_service.dart';
 import '../services/folder_upload_service.dart';
@@ -140,11 +141,29 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
       double sizeMb = double.tryParse(item['size_mb']?.toString() ?? '0') ?? 0;
 
       if (!kIsWeb) {
-        // Desktop/Mobile: Stream to file to avoid memory issues
-        String? savePath = await FilePicker.platform.saveFile(
-          dialogTitle: 'Save $name',
-          fileName: name,
-        );
+        // Desktop/Mobile: on mobile use saved download path (if set) so user
+        // doesn't need to pick a location every time. Otherwise fall back to
+        // the save dialog (desktop or if path missing).
+        final secureStorage = const FlutterSecureStorage();
+        String? savePath;
+        final isMobile = defaultTargetPlatform == TargetPlatform.android ||
+            defaultTargetPlatform == TargetPlatform.iOS;
+
+        if (isMobile) {
+          final stored = await secureStorage.read(key: 'download_path');
+          if (stored != null && stored.isNotEmpty) {
+            final sep = Platform.pathSeparator;
+            savePath = stored.endsWith(sep) ? '$stored$name' : '$stored${sep}$name';
+          }
+        }
+
+        // If we didn't obtain a saved path, ask the user (desktop or mobile fallback)
+        if (savePath == null) {
+          savePath = await FilePicker.platform.saveFile(
+            dialogTitle: 'Save $name',
+            fileName: name,
+          );
+        }
 
         if (savePath == null) {
           _showSnack('Save cancelled');
