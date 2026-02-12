@@ -524,7 +524,7 @@ app.post('/api/auth/request-pin-reset', async (req, res) => {
             await client.query('INSERT INTO pin_resets (user_id, reset_token, expires_at) VALUES ($1, $2, $3)', [userId, token, expiresAt]);
 
             // send email
-            const base = resetUrlBase || process.env.PIN_RESET_URL || 'http://localhost:3000/pin-reset?token=';
+            const base = resetUrlBase || process.env.PIN_RESET_URL || 'https://keepr-gold.vercel.app/pin-reset?token=';
             const sent = await auth.sendPinResetEmail(email, token, base);
             return sent;
         });

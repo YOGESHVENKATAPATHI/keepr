@@ -4,7 +4,9 @@
   "description": "Vercel Serverless Backend for Keepr",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "full-clean-dry": "node scripts/full_clean.js",
+    "full-clean": "node scripts/full_clean.js --yes"
   },
   "dependencies": {
     "pg": "^8.11.3",
@@ -17,6 +19,7 @@
     "google-auth-library": "^8.9.0",
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.0",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "minimist": "^1.2.8"
   }
 }

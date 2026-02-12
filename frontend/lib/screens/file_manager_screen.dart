@@ -17,6 +17,7 @@ import '../widgets/upload_dialog.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 
 import 'package:url_launcher/url_launcher.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 class FileManagerScreen extends StatefulWidget {
   final String userId;
@@ -108,7 +109,10 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     if (dirPath == null) {
       final result = await FilePicker.platform.pickFiles(
           allowMultiple: true,
-          withData: true); // Force load into memory for chunking logic
+          withData:
+              false, // Important: Never load full file into memory to avoid crashes
+          withReadStream: true // Use stream for Web/Large files
+          );
       if (result == null) return;
 
       try {
@@ -144,6 +148,17 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
         // Desktop/Mobile: on mobile use saved download path (if set) so user
         // doesn't need to pick a location every time. Otherwise fall back to
         // the save dialog (desktop or if path missing).
+
+        if (Platform.isAndroid) {
+          var status = await Permission.manageExternalStorage.status;
+          if (!status.isGranted) {
+            await Permission.manageExternalStorage.request();
+          }
+          if (await Permission.storage.isDenied) {
+            await Permission.storage.request();
+          }
+        }
+
         final secureStorage = const FlutterSecureStorage();
         String? savePath;
         final isMobile = defaultTargetPlatform == TargetPlatform.android ||
@@ -153,7 +168,8 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
           final stored = await secureStorage.read(key: 'download_path');
           if (stored != null && stored.isNotEmpty) {
             final sep = Platform.pathSeparator;
-            savePath = stored.endsWith(sep) ? '$stored$name' : '$stored${sep}$name';
+            savePath =
+                stored.endsWith(sep) ? '$stored$name' : '$stored${sep}$name';
           }
         }
 

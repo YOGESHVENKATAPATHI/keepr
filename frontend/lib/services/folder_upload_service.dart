@@ -87,110 +87,137 @@ class FolderUploadService {
         "Initialized upload for $fileName (ID: $fileId) with $totalChunks chunks");
 
     // 2. Prepare chunks
-    List<Future> uploadTasks = [];
     List<Map<String, dynamic>> completedChunks = [];
     int bytesUploaded = 0;
 
-    // We need the file bytes. On web, file.bytes is usually populated.
-    // If not (large file on desktop), we might have issues with random access if using stream.
-    // Assuming bytes available for now (Web context).
+    // Handle both Web (bytes/stream) and Mobile/Desktop (path)
     final bytes = file.bytes;
-    if (bytes == null)
-      throw Exception(
-          "File bytes not available for chunking. Ensure file is loaded in memory.");
+    final stream = file.readStream; // Available if withReadStream: true
+    // RandomAccessFile? raf; // Removed to avoid shared pointer concurrency issues
 
-    // Semaphore for concurrency (limit 4 parallel uploads)
-    // Simple implementation: Custom batch runner or just careful loop
-    final int concurrency = 4;
-
-    for (int i = 0; i < totalChunks; i++) {
-      final start = i * chunkSize;
-      final end =
-          (start + chunkSize < totalSize) ? start + chunkSize : totalSize;
-      final chunkData = bytes.sublist(start, end);
-
-      // We'll queue this work
-      // To strictly limit concurrency, we can use a Queue or pool.
-      // For simplicity in this prompt, let's use a batching approach.
-    }
-
-    // Processing using a pool with per-chunk progress reporting
-    int activeUploads = 0;
-    int chunkIndex = 0;
-    Completer<void> doneCompleter = Completer<void>();
-    List<dynamic> fatalErrors = [];
-
-    // Throttling helpers: emit at most once per second or when at least 1KB progress made
-    int lastEmitMs = DateTime.now().millisecondsSinceEpoch;
-    int lastEmittedBytes = 0;
-    void emitProgressIfNeeded() {
-      if (onProgress == null) return;
-      final now = DateTime.now().millisecondsSinceEpoch;
-      if (bytesUploaded - lastEmittedBytes >= 1024 ||
-          now - lastEmitMs >= 1000 ||
-          bytesUploaded >= totalSize) {
-        lastEmitMs = now;
-        lastEmittedBytes = bytesUploaded;
-        onProgress(bytesUploaded / totalSize);
+    if (bytes == null && stream == null) {
+      if (file.path == null) {
+        throw Exception("File data not available (no bytes, path, or stream).");
       }
     }
 
-    void startNext() async {
-      if (fatalErrors.isNotEmpty) return;
-      if (chunkIndex >= totalChunks) {
-        if (activeUploads == 0 && !doneCompleter.isCompleted)
-          doneCompleter.complete();
-        return;
+    try {
+      // Semaphore for concurrency (limit 4 parallel uploads)
+      final int concurrency = 4;
+
+      // Processing using a pool with per-chunk progress reporting
+      int activeUploads = 0;
+      int chunkIndex = 0;
+      Completer<void> doneCompleter = Completer<void>();
+      List<dynamic> fatalErrors = [];
+
+      // Throttling helpers
+      int lastEmitMs = DateTime.now().millisecondsSinceEpoch;
+      int lastEmittedBytes = 0;
+      void emitProgressIfNeeded() {
+        if (onProgress == null) return;
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (bytesUploaded - lastEmittedBytes >= 1024 * 64 || // 64KB
+            now - lastEmitMs >= 500 ||
+            bytesUploaded >= totalSize) {
+          lastEmitMs = now;
+          lastEmittedBytes = bytesUploaded;
+          onProgress(bytesUploaded / totalSize);
+        }
       }
 
-      final i = chunkIndex++;
-      activeUploads++;
+      // STREAM MODE (Sequential Read, Parallel Upload)
+      if (stream != null && bytes == null) {
+        await _uploadStreamByChunksCorrect(
+            stream, chunkSize, totalChunks, fileId, concurrency,
+            // Progress
+            (uploaded) {
+          bytesUploaded = uploaded;
+          emitProgressIfNeeded();
+        },
+            // Chunk Completion
+            (result) => completedChunks.add(result));
 
-      try {
-        // Keep track of the last sent bytes for this chunk to compute deltas
-        int prevSentForChunk = 0;
+        // Final progress
+        if (onProgress != null) onProgress(1.0);
+      } else {
+        // RANDOM ACCESS MODE (Bytes or RAF)
 
-        await _processChunk(
-            fileId: fileId,
-            chunkIndex: i,
-            chunkData: bytes.sublist(
-                i * chunkSize,
-                (i * chunkSize + chunkSize < totalSize
-                    ? i * chunkSize + chunkSize
-                    : totalSize)),
-            onChunkProgress: (sent, total) {
-              // sent is bytes sent for this chunk
-              final int delta = sent - prevSentForChunk;
-              if (delta > 0) {
-                prevSentForChunk = sent;
-                bytesUploaded += delta;
-                emitProgressIfNeeded();
+        void startNext() async {
+          if (fatalErrors.isNotEmpty) return;
+          if (chunkIndex >= totalChunks) {
+            if (activeUploads == 0 && !doneCompleter.isCompleted)
+              doneCompleter.complete();
+            return;
+          }
+
+          final i = chunkIndex++;
+          activeUploads++;
+
+          try {
+            // Prepare chunk data
+            final start = i * chunkSize;
+            final end =
+                (start + chunkSize < totalSize) ? start + chunkSize : totalSize;
+            List<int> chunkData;
+
+            if (bytes != null) {
+              chunkData = bytes.sublist(start, end);
+            } else {
+              // Read from file safely (new handle per chunk to allow concurrency)
+              final localRaf = await File(file.path!).open(mode: FileMode.read);
+              try {
+                await localRaf.setPosition(start);
+                chunkData = await localRaf.read(end - start);
+              } finally {
+                await localRaf.close();
               }
-            },
-            onChunkComplete: (result) {
-              completedChunks.add(result);
-              // If some bytes weren't accounted for via progress callbacks (edge cases), add remainder
-              final int chunkSizeBytes = result['size'] as int;
-              final int remainder = chunkSizeBytes - prevSentForChunk;
-              if (remainder > 0) {
-                bytesUploaded += remainder;
-              }
-              emitProgressIfNeeded();
-            });
-      } catch (e) {
-        print("Chunk $i failed: $e");
-        fatalErrors.add(e);
-        if (!doneCompleter.isCompleted) doneCompleter.completeError(e);
-      } finally {
-        activeUploads--;
-        startNext();
+            }
+
+            // Keep track of the last sent bytes for this chunk to compute deltas
+            int prevSentForChunk = 0;
+
+            await _processChunk(
+                fileId: fileId,
+                chunkIndex: i,
+                chunkData: chunkData,
+                onChunkProgress: (sent, total) {
+                  // sent is bytes sent for this chunk
+                  final int delta = sent - prevSentForChunk;
+                  if (delta > 0) {
+                    prevSentForChunk = sent;
+                    bytesUploaded += delta;
+                    emitProgressIfNeeded();
+                  }
+                },
+                onChunkComplete: (result) {
+                  completedChunks.add(result);
+                  // If some bytes weren't accounted for via progress callbacks (edge cases), add remainder
+                  final int chunkSizeBytes = result['size'] as int;
+                  final int remainder = chunkSizeBytes - prevSentForChunk;
+                  if (remainder > 0) {
+                    bytesUploaded += remainder;
+                  }
+                  emitProgressIfNeeded();
+                });
+          } catch (e) {
+            print("Chunk $i failed: $e");
+            fatalErrors.add(e);
+            if (!doneCompleter.isCompleted) doneCompleter.completeError(e);
+          } finally {
+            activeUploads--;
+            startNext();
+          }
+        }
+
+        // Start initial batch
+        for (int k = 0; k < concurrency; k++) startNext();
+
+        await doneCompleter.future;
       }
+    } finally {
+      // raf closed automatically if used locally
     }
-
-    // Start initial batch
-    for (int k = 0; k < concurrency; k++) startNext();
-
-    await doneCompleter.future;
 
     // 3. Finalize
     print(
@@ -211,6 +238,168 @@ class FolderUploadService {
 
     // Ensure we emit a final 100% progress update
     if (onProgress != null) onProgress(1.0);
+  }
+
+  Future<void> _uploadStreamByChunks(
+      Stream<List<int>> stream,
+      int chunkSize,
+      int totalChunksEstimate,
+      String fileId,
+      int concurrency,
+      Function(int) onBytesUploaded,
+      Function(Map<String, dynamic>) onChunkCompleted) async {
+    int currentChunkIndex = 0;
+    int currentBufferLen = 0;
+    List<int> buffer = [];
+
+    // Active uploads
+    List<Future> active = [];
+
+    await for (final packet in stream) {
+      buffer.addAll(packet);
+      currentBufferLen += packet.length;
+
+      // While we have enough to fill a chunk (or more)
+      while (currentBufferLen >= chunkSize) {
+        // Slice
+        final chunkData = buffer.sublist(0, chunkSize);
+        buffer = buffer.sublist(chunkSize);
+        currentBufferLen -= chunkSize;
+
+        final idx = currentChunkIndex++;
+
+        // Wait if concurrency limit reached
+        while (active.length >= concurrency) {
+          await Future.any(active);
+          active.removeWhere((f) => f.asStream().isBroadcast
+              ? false
+              : true); // Simple cleanup is hard, simpler:
+          // Actually Future.any returns the completed one. But finding WHICH one is hard.
+          // Easier: just await the first one if using a Queue, but we want any.
+          // Correct approach: Maintain list, when full, await specific or race.
+          // Simpler: Just await all if full? No, inhibits throughput.
+          // We'll use a simple clean-up loop.
+          await Future.delayed(Duration(milliseconds: 50));
+          active.removeWhere(
+              (f) => f.toString().contains("Completed") /* Hacky */);
+          // Better: wrap future to self-remove
+        }
+
+        // Start upload
+        final future =
+            _processChunkWithRetry(fileId, idx, chunkData, onChunkCompleted);
+        active.add(future);
+
+        // Clean up finished
+        active.removeWhere((f) => f
+            .toString()
+            .contains("Frequency") /* dummy */); // Need proper future tracking
+        // Let's implement proper tracking below.
+      }
+    }
+
+    // Leftover
+    if (currentBufferLen > 0) {
+      final idx = currentChunkIndex++;
+      final chunkData = buffer;
+      active.add(
+          _processChunkWithRetry(fileId, idx, chunkData, onChunkCompleted));
+    }
+
+    await Future.wait(active);
+  }
+
+  // Wrapper simply to return Future that completes so we can track it
+  Future<void> _processChunkWithRetry(String fileId, int index, List<int> data,
+      Function(Map<String, dynamic>) onComplete) async {
+    await _processChunk(
+        fileId: fileId,
+        chunkIndex: index,
+        chunkData: data,
+        onChunkComplete: onComplete,
+        onChunkProgress:
+            null // Stream mode complicates global progress if parallel. We update global bytes linearly.
+        );
+  }
+
+  // Rewrite _uploadStreamByChunks with better concurrency control
+  Future<void> _uploadStreamByChunksCorrect(
+      Stream<List<int>> stream,
+      int chunkSize,
+      int totalChunksEstimate,
+      String fileId,
+      int concurrency,
+      Function(int) onBytesUploaded,
+      Function(Map<String, dynamic>) onChunkCompleted) async {
+    int currentChunkIndex = 0;
+    List<int> buffer = [];
+
+    // Correct Progress Tracking:
+    // Tracks bytes from fully completed chunks
+    int totalBytesFromCompletedChunks = 0;
+    // Tracks current progress of active chunks (ChunkIndex -> BytesSent)
+    final Map<int, int> activeChunkProgress = {};
+
+    void updateProgress() {
+      int activeTotal = 0;
+      for (var val in activeChunkProgress.values) {
+        activeTotal += val;
+      }
+      onBytesUploaded(totalBytesFromCompletedChunks + activeTotal);
+    }
+
+    final active = <Future>[];
+
+    // Helper to wait for slot
+    Future<void> waitForSlot() async {
+      if (active.length < concurrency) return;
+      await Future.any(active);
+    }
+
+    // Helper to start a chunk upload
+    void startChunk(int idx, List<int> data) {
+      activeChunkProgress[idx] = 0; // Initialize
+
+      final f = _processChunk(
+        fileId: fileId,
+        chunkIndex: idx,
+        chunkData: data,
+        onChunkComplete: onChunkCompleted,
+        onChunkProgress: (sent, total) {
+           activeChunkProgress[idx] = sent;
+           updateProgress();
+        }
+      ).then((_) {
+        // Completion
+        activeChunkProgress.remove(idx);
+        totalBytesFromCompletedChunks += data.length;
+        updateProgress();
+      });
+
+      active.add(f);
+      f.whenComplete(() => active.remove(f));
+    }
+
+    await for (final packet in stream) {
+      buffer.addAll(packet);
+
+      while (buffer.length >= chunkSize) {
+        await waitForSlot();
+
+        final chunkData = buffer.sublist(0, chunkSize);
+        buffer.removeRange(0, chunkSize);
+
+        startChunk(currentChunkIndex++, chunkData);
+      }
+    }
+
+    if (buffer.isNotEmpty) {
+      await waitForSlot();
+      final chunkData = buffer;
+      startChunk(currentChunkIndex++, chunkData);
+    }
+
+    await Future.wait(active);
   }
 
   Future<void> _processChunk(
@@ -284,7 +473,7 @@ class FolderUploadService {
           // Browser fetch path using Dio for progress events (XHR)
           final dio = Dio();
           dio.options.sendTimeout = const Duration(minutes: 5);
-          
+
           await dio.post('https://content.dropboxapi.com/2/files/upload',
               data: chunkData, // Direct bytes for Web
               options: Options(headers: {
@@ -296,12 +485,11 @@ class FolderUploadService {
                   "mute": true
                 }),
                 'Content-Type': 'application/octet-stream'
-              }),
-              onSendProgress: (sent, total) {
-                if (onChunkProgress != null) {
-                  onChunkProgress(sent, total <= 0 ? chunkData.length : total);
-                }
-              });
+              }), onSendProgress: (sent, total) {
+            if (onChunkProgress != null) {
+              onChunkProgress(sent, total <= 0 ? chunkData.length : total);
+            }
+          });
           break;
         } else {
           final dio = Dio();
@@ -312,7 +500,7 @@ class FolderUploadService {
           // Using Stream.fromIterable([chunkData]) makes Dio emit only one progress event (0 -> 100%)
           // Passing List<int> directly prompts Dio to handle it as a buffer and emit granular writes.
           await dio.post('https://content.dropboxapi.com/2/files/upload',
-              data: chunkData, 
+              data: chunkData,
               options: Options(headers: {
                 'Authorization': 'Bearer $allocToken',
                 'Dropbox-API-Arg': jsonEncode({
@@ -506,7 +694,8 @@ class FolderUploadService {
 
           // Store as Uint8List
           parts[index] = builder.takeBytes();
-          print('[Download] chunk $index complete size=${parts[index]!.length}');
+          print(
+              '[Download] chunk $index complete size=${parts[index]!.length}');
           break;
         } catch (e) {
           print('[Download] chunk $index attempt $attempts error: $e');
@@ -523,7 +712,6 @@ class FolderUploadService {
         }
       }
     }
-
 
     int i = 0;
     while (i < sortedUnique.length) {
@@ -567,7 +755,7 @@ class FolderUploadService {
         parts[idx] = null;
       }
     }
-    
+
     print(
         '[Download] assembled byte length=${assembled.length} expected=$expectedBytes totalReceived=$totalBytesReceived missingChunks=${missingIndices.length}');
 
@@ -955,15 +1143,14 @@ class FolderUploadService {
   Future<void> downloadDistributedFileToFile(
       String fileIdRef, double totalSizeMb, File targetFile,
       {Function(double)? onProgress}) async {
-    
     // 1. Info
     final infoResp = await http.post(
         Uri.parse('$backendUrl/api/files/download-info'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({'fileIdRef': fileIdRef}));
-        
+
     if (infoResp.statusCode != 200) throw Exception("Failed info");
-    
+
     final data = jsonDecode(infoResp.body);
     final chunks = (data['chunks'] as List).cast<Map<String, dynamic>>();
 
@@ -974,25 +1161,27 @@ class FolderUploadService {
       ..sort((a, b) => (a['index'] as int).compareTo(b['index'] as int));
 
     // Stats
-    int expectedBytes = (totalSizeMb * 1024 * 1024).round(); 
+    int expectedBytes = (totalSizeMb * 1024 * 1024).round();
     // (Simpler calculation for now, progress is approximate)
 
     // Prepare
     if (await targetFile.exists()) await targetFile.delete();
     // Create parent if not exists
-    if (!await targetFile.parent.exists()) await targetFile.parent.create(recursive: true);
-    
+    if (!await targetFile.parent.exists())
+      await targetFile.parent.create(recursive: true);
+
     final raf = await targetFile.open(mode: FileMode.write);
-    
+
     // Temp Dir
-    final tempDir = Directory(p.join(targetFile.parent.path, ".${p.basename(targetFile.path)}_parts"));
+    final tempDir = Directory(p.join(
+        targetFile.parent.path, ".${p.basename(targetFile.path)}_parts"));
     if (!await tempDir.exists()) await tempDir.create();
 
     // State
     int nextWriteIndex = 0;
     final Map<int, File> completedParts = {};
     int totalBytesReceived = 0;
-    
+
     // Helper to merge
     Future<void> _tryMerge() async {
       while (completedParts.containsKey(nextWriteIndex)) {
@@ -1019,45 +1208,46 @@ class FolderUploadService {
 
     try {
       Future<void> fetchAndStore(int index, String path, String token) async {
-         final url = 'https://content.dropboxapi.com/2/files/download';
-         final headers = {
+        final url = 'https://content.dropboxapi.com/2/files/download';
+        final headers = {
           'Authorization': 'Bearer $token',
           'Dropbox-API-Arg': jsonEncode({"path": path}),
-         };
-         
-         final partPath = p.join(tempDir.path, "$index.part");
-         final partFile = File(partPath);
-         
-         // Retry loop
-         int attempts = 0;
-         while(true) {
-           attempts++;
-           try {
-             final req = http.Request('POST', Uri.parse(url));
-             req.headers.addAll(headers);
-             final resp = await client.send(req);
-             if (resp.statusCode != 200) throw Exception("Status: ${resp.statusCode}");
-             
-             final sink = partFile.openWrite();
-             await resp.stream.listen((chunk) {
-               sink.add(chunk);
-               totalBytesReceived += chunk.length;
-               if (onProgress != null && expectedBytes > 0) {
-                 double p = totalBytesReceived / expectedBytes;
-                 if (p > 1.0) p = 1.0;
-                 onProgress(p);
-               }
-             }).asFuture();
-             await sink.close();
-             
-             completedParts[index] = partFile;
-             await _tryMerge();
-             break;
-           } catch(e) {
-             if (attempts >= 3) rethrow;
-             await Future.delayed(Duration(seconds: attempts));
-           }
-         }
+        };
+
+        final partPath = p.join(tempDir.path, "$index.part");
+        final partFile = File(partPath);
+
+        // Retry loop
+        int attempts = 0;
+        while (true) {
+          attempts++;
+          try {
+            final req = http.Request('POST', Uri.parse(url));
+            req.headers.addAll(headers);
+            final resp = await client.send(req);
+            if (resp.statusCode != 200)
+              throw Exception("Status: ${resp.statusCode}");
+
+            final sink = partFile.openWrite();
+            await resp.stream.listen((chunk) {
+              sink.add(chunk);
+              totalBytesReceived += chunk.length;
+              if (onProgress != null && expectedBytes > 0) {
+                double p = totalBytesReceived / expectedBytes;
+                if (p > 1.0) p = 1.0;
+                onProgress(p);
+              }
+            }).asFuture();
+            await sink.close();
+
+            completedParts[index] = partFile;
+            await _tryMerge();
+            break;
+          } catch (e) {
+            if (attempts >= 3) rethrow;
+            await Future.delayed(Duration(seconds: attempts));
+          }
+        }
       }
 
       // Execution Loop (Batch of 3)
@@ -1065,18 +1255,19 @@ class FolderUploadService {
       while (i < sortedUnique.length) {
         final batch = <Future>[];
         for (int k = 0; k < 3 && i < sortedUnique.length; k++) {
-           final c = sortedUnique[i];
-           batch.add(fetchAndStore(c['index'], c['path'], c['token']));
-           i++;
+          final c = sortedUnique[i];
+          batch.add(fetchAndStore(c['index'], c['path'], c['token']));
+          i++;
         }
         await Future.wait(batch);
       }
-
     } finally {
       client.close();
       await raf.close();
       if (await tempDir.exists()) {
-        try { await tempDir.delete(recursive: true); } catch(e){}
+        try {
+          await tempDir.delete(recursive: true);
+        } catch (e) {}
       }
     }
   }
