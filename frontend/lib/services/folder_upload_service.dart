@@ -13,6 +13,27 @@ class FolderUploadService {
 
   FolderUploadService({required this.backendUrl});
 
+  // Helper for background service or path-based uploads
+  Future<void> uploadFileFromPath({
+    required String path,
+    required String name,
+    required int size,
+    required String userId,
+    required String logicalPath,
+    Function(double)? onProgress,
+    bool Function()? isCancelled,
+    Function(String)? onFileIdCreated,
+  }) async {
+    final file = PlatformFile(
+      name: name,
+      size: size,
+      path: path,
+      bytes: null,
+      readStream: null,
+    );
+    await _uploadFileDistributed(file, userId, logicalPath, onProgress: onProgress, isCancelled: isCancelled, onFileIdCreated: onFileIdCreated);
+  }
+  
   // Web-compatible upload for PlatformFiles (from file_picker)
   Future<void> uploadWebFiles(
       List<PlatformFile> files, String userId, String parentPath,
@@ -40,12 +61,12 @@ class FolderUploadService {
       rethrow;
     }
   }
-
+  
   // --- Distributed Upload Logic ---
-
+  
   Future<void> _uploadFileDistributed(
       PlatformFile file, String userId, String logicalPath,
-      {Function(double)? onProgress}) async {
+      {Function(double)? onProgress, bool Function()? isCancelled, Function(String)? onFileIdCreated}) async {
     final int chunkSize = 4 * 1024 * 1024; // 4MB
     final int totalSize = file.size;
     final int totalChunks = (totalSize / chunkSize).ceil();
@@ -83,6 +104,7 @@ class FolderUploadService {
     }
 
     final fileId = jsonDecode(initResp.body)['fileId'];
+    onFileIdCreated?.call(fileId);
     print(
         "Initialized upload for $fileName (ID: $fileId) with $totalChunks chunks");
 
@@ -117,6 +139,10 @@ class FolderUploadService {
       void emitProgressIfNeeded() {
         if (onProgress == null) return;
         final now = DateTime.now().millisecondsSinceEpoch;
+
+        // Clamp bytesUploaded to totalSize to prevent > 100% UI
+        if (bytesUploaded > totalSize) bytesUploaded = totalSize;
+
         if (bytesUploaded - lastEmittedBytes >= 1024 * 64 || // 64KB
             now - lastEmitMs >= 500 ||
             bytesUploaded >= totalSize) {
@@ -145,6 +171,13 @@ class FolderUploadService {
 
         void startNext() async {
           if (fatalErrors.isNotEmpty) return;
+          if (isCancelled?.call() ?? false) {
+            if (!doneCompleter.isCompleted) {
+                 fatalErrors.add(Exception("Cancelled"));
+                 doneCompleter.completeError(Exception("Cancelled"));
+            }
+            return;
+          }
           if (chunkIndex >= totalChunks) {
             if (activeUploads == 0 && !doneCompleter.isCompleted)
               doneCompleter.complete();
@@ -182,6 +215,38 @@ class FolderUploadService {
                 chunkIndex: i,
                 chunkData: chunkData,
                 onChunkProgress: (sent, total) {
+                  // RESET LOGIC: If sent < prevSentForChunk, it implies a retry/restart
+                  // within _processChunk, so we must reset our tracker.
+                  // CRITICAL: We also need to handle the case where 'sent' jumps ahead but we *know* it's a retry
+                  // because _processChunk manages its own retries invisibly to us.
+                  // However, we can't easily detect a retry if the first progress event is > prevSentForChunk.
+                  // For example, if prev was 50, and retry jumps to 70 immediately.
+                  // In that case, we would add (70-50)=20. The total adds up to 70.
+                  // This is functionally correct for the progress bar (it just doesn't dip back to 0).
+                  // So the only danger is if we DON'T detect a lower value, but we somehow double count.
+                  // If we don't detect a lower value, we simply add the delta.
+                  // Since the retry starts sending from byte 0, the 'sent' value mirrors ONLY the current attempt.
+                  // So if attempt 1 sent 50 bytes (sent=50), and attempt 2 sends 70 bytes (sent=70),
+                  // if we treat it as a continuation, we add (70-50)=20 to the global sum.
+                  // Total added to global sum = 50 + 20 = 70.
+                  // This is CORRECT. The user sees progress go 50% -> 70% (skipping the dip to 0).
+                  // This is actually better UX than dipping to 0.
+                  // But wait, what if attempt 2 fails at 70?
+                  // Then we have 70 added.
+                  // Attempt 3 starts at 0.
+                  // 0 < 70 -> We subtract 70 and reset to 0.
+                  // Global sum reverts correctly.
+
+                  // So the logic holds:
+                  // 1. If sent < prev, we MUST reset because we are seeing "earlier" bytes again.
+                  // 2. If sent >= prev, we assume progress continues (even if it's a new attempt that just caught up).
+
+                  if (sent < prevSentForChunk) {
+                    // Start of a retry: we revert the global bytesUploaded by the amount previously contributed by this chunk
+                    bytesUploaded -= prevSentForChunk;
+                    prevSentForChunk = 0;
+                  }
+
                   // sent is bytes sent for this chunk
                   final int delta = sent - prevSentForChunk;
                   if (delta > 0) {
@@ -361,15 +426,14 @@ class FolderUploadService {
       activeChunkProgress[idx] = 0; // Initialize
 
       final f = _processChunk(
-        fileId: fileId,
-        chunkIndex: idx,
-        chunkData: data,
-        onChunkComplete: onChunkCompleted,
-        onChunkProgress: (sent, total) {
-           activeChunkProgress[idx] = sent;
-           updateProgress();
-        }
-      ).then((_) {
+          fileId: fileId,
+          chunkIndex: idx,
+          chunkData: data,
+          onChunkComplete: onChunkCompleted,
+          onChunkProgress: (sent, total) {
+            activeChunkProgress[idx] = sent;
+            updateProgress();
+          }).then((_) {
         // Completion
         activeChunkProgress.remove(idx);
         totalBytesFromCompletedChunks += data.length;
@@ -828,6 +892,32 @@ class FolderUploadService {
     } catch (e) {
       rethrow;
     }
+  }
+
+  Future<void> downloadFileToPath(String dropboxPath, File targetFile,
+      {Function(double)? onProgress}) async {
+    final token = await _getBestStorageToken();
+    final dio = Dio();
+
+    // We can use the /download endpoint directly
+    final url = 'https://content.dropboxapi.com/2/files/download';
+
+    await dio.download(
+      url,
+      targetFile.path,
+      options: Options(
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Dropbox-API-Arg': jsonEncode({"path": dropboxPath}),
+        },
+        responseType: ResponseType.bytes,
+      ),
+      onReceiveProgress: (received, total) {
+        if (total != -1 && onProgress != null) {
+          onProgress(received / total);
+        }
+      },
+    );
   }
 
   Future<String> getTemporaryLink(String dropboxPath) async {

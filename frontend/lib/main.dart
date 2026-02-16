@@ -1,8 +1,11 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:glassmorphism/glassmorphism.dart';
 import 'theme/keepr_theme.dart';
 import 'services/folder_upload_service.dart';
 import 'services/api_service.dart';
+import 'services/notification_service.dart';
+import 'services/background_upload_service.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'screens/file_manager_screen.dart';
 import 'screens/login_screen.dart';
@@ -10,7 +13,18 @@ import 'screens/pin_entry_screen.dart';
 import 'utils/storage_helper.dart';
 
 // Entry Point
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  if (!kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.windows)) {
+    try {
+      await NotificationService().init();
+      await BackgroundUploadService.initialize();
+    } catch (e) {
+      print("Error initializing background services: $e");
+    }
+  }
+
   runApp(const KeeprApp());
 }
 

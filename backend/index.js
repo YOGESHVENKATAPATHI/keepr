@@ -1032,6 +1032,27 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
     }
 });
 
+// 2.5 Cancel Upload: Cleanup partial data
+app.post('/api/upload/cancel', async (req, res) => {
+    const { fileId } = req.body;
+    if (!fileId) return res.status(400).send('fileId required');
+    
+    console.log(`[Upload] Cancelling upload for fileId=${fileId}`);
+    try {
+        await executeWithDB(async (client) => {
+             // 1. Delete chunks (Metadata)
+             await client.query('DELETE FROM file_chunks WHERE file_id=$1', [fileId]);
+             // 2. Delete file record (Metadata)
+             await client.query('DELETE FROM file_uploads WHERE file_id=$1', [fileId]);
+             // 3. Ideally cleanup actual files from storage if possible (deferred)
+        });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Cancel Upload Failed', e);
+        res.status(500).send(e.message);
+    }
+});
+
 // 3. Finalize Upload: Mark done & Create Searchable File Record
 app.post('/api/upload/finalize', async (req, res) => {
     const { fileId, chunks } = req.body; // chunks is array of { index, shardId, path, success }

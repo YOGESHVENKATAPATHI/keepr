@@ -1,10 +1,14 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:percent_indicator/percent_indicator.dart';
+import 'package:uuid/uuid.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 
 import '../services/folder_upload_service.dart';
+import '../services/background_upload_service.dart';
 
 class UploadDialog extends StatefulWidget {
   final FolderUploadService uploader;
@@ -25,18 +29,65 @@ class UploadDialog extends StatefulWidget {
 }
 
 class _UploadTask {
+  final String id;
   final PlatformFile file;
   double progress = 0.0;
   bool isCompleted = false;
   bool isFailed = false;
   String? errorMessage;
 
-  _UploadTask(this.file);
+  _UploadTask(this.file) : id = const Uuid().v4();
 }
 
 class _UploadDialogState extends State<UploadDialog> {
   final List<_UploadTask> _tasks = [];
   bool _isPicking = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (!kIsWeb) {
+      _initBackgroundListener();
+    }
+  }
+
+  void _initBackgroundListener() async {
+    final service = FlutterBackgroundService();
+    if (await service.isRunning()) {
+      service.on('progress').listen((event) {
+        if (event == null || !mounted) return;
+        final taskId = event['taskId'];
+        if (taskId == null) return;
+
+        bool taskFound = false;
+        setState(() {
+          try {
+            final task = _tasks.firstWhere((t) => t.id == taskId);
+            taskFound = true;
+            final status = event['status'];
+
+            if (status == 'running') {
+              task.progress = (event['progress'] as num).toDouble();
+            } else if (status == 'completed') {
+              task.progress = 1.0;
+              task.isCompleted = true;
+            } else if (status == 'failed') {
+               task.isFailed = true;
+               task.errorMessage = event['error'];
+            }
+          } catch (e) {
+            // Task not found
+          }
+        });
+        
+        if (taskFound && _tasks.isNotEmpty && _tasks.every((t) => t.isCompleted || t.isFailed)) {
+           // All visible tasks done
+           widget.onUploadComplete();
+        }
+      });
+    }
+  }
+
 
   Future<void> _pickFiles() async {
     if (_isPicking) return;
@@ -54,7 +105,22 @@ class _UploadDialogState extends State<UploadDialog> {
           _tasks.addAll(newTasks);
         });
 
-        _startUploads(newTasks);
+        if (kIsWeb) {
+          _startUploads(newTasks);
+        } else {
+          final paths = newTasks.map((t) => t.file.path!).toList();
+          final names = newTasks.map((t) => t.file.name).toList();
+          final ids = newTasks.map((t) => t.id).toList();
+
+          await BackgroundUploadService.startUploads(
+            backendUrl: widget.uploader.backendUrl,
+            userId: widget.userId,
+            parentPath: widget.currentPath,
+            filePaths: paths,
+            fileNames: names,
+            taskIds: ids,
+          );
+        }
       }
     } finally {
       if (mounted) setState(() => _isPicking = false);

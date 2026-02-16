@@ -141,85 +141,87 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     final name = item['name'];
 
     // Check for distributed file
-    if (dropboxPath == 'distributed' && item['file_id_ref'] != null) {
-      double sizeMb = double.tryParse(item['size_mb']?.toString() ?? '0') ?? 0;
+    final isDistributed =
+        (dropboxPath == 'distributed' && item['file_id_ref'] != null);
+    double sizeMb = double.tryParse(item['size_mb']?.toString() ?? '0') ?? 0;
 
-      if (!kIsWeb) {
-        // Desktop/Mobile: on mobile use saved download path (if set) so user
-        // doesn't need to pick a location every time. Otherwise fall back to
-        // the save dialog (desktop or if path missing).
+    if (!kIsWeb) {
+      // Desktop/Mobile: on mobile use saved download path (if set) so user
+      // doesn't need to pick a location every time. Otherwise fall back to
+      // the save dialog (desktop or if path missing).
 
-        if (Platform.isAndroid) {
-          var status = await Permission.manageExternalStorage.status;
-          if (!status.isGranted) {
-            await Permission.manageExternalStorage.request();
-          }
-          if (await Permission.storage.isDenied) {
-            await Permission.storage.request();
-          }
+      if (Platform.isAndroid) {
+        var status = await Permission.manageExternalStorage.status;
+        if (!status.isGranted) {
+          await Permission.manageExternalStorage.request();
         }
-
-        final secureStorage = const FlutterSecureStorage();
-        String? savePath;
-        final isMobile = defaultTargetPlatform == TargetPlatform.android ||
-            defaultTargetPlatform == TargetPlatform.iOS;
-
-        if (isMobile) {
-          final stored = await secureStorage.read(key: 'download_path');
-          if (stored != null && stored.isNotEmpty) {
-            final sep = Platform.pathSeparator;
-            savePath =
-                stored.endsWith(sep) ? '$stored$name' : '$stored${sep}$name';
-          }
+        if (await Permission.storage.isDenied) {
+          await Permission.storage.request();
         }
+      }
 
-        // If we didn't obtain a saved path, ask the user (desktop or mobile fallback)
-        if (savePath == null) {
-          savePath = await FilePicker.platform.saveFile(
-            dialogTitle: 'Save $name',
-            fileName: name,
-          );
+      final secureStorage = const FlutterSecureStorage();
+      String? savePath;
+      final isMobile = defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS;
+
+      if (isMobile) {
+        final stored = await secureStorage.read(key: 'download_path');
+        if (stored != null && stored.isNotEmpty) {
+          final sep = Platform.pathSeparator;
+          savePath =
+              stored.endsWith(sep) ? '$stored$name' : '$stored${sep}$name';
         }
+      }
 
-        if (savePath == null) {
-          _showSnack('Save cancelled');
-          return;
-        }
+      // If we didn't obtain a saved path, ask the user (desktop or mobile fallback)
+      if (savePath == null) {
+        savePath = await FilePicker.platform.saveFile(
+          dialogTitle: 'Save $name',
+          fileName: name,
+        );
+      }
 
-        // Show progress dialog
-        showDialog(
-            context: context,
-            barrierDismissible: false,
-            builder: (ctx) {
-              return StatefulBuilder(builder: (context, setState) {
-                return StreamBuilder<double>(
-                    stream: _downloadProgressController?.stream ??
-                        Stream.value(0.0),
-                    initialData: 0.0,
-                    builder: (context, snapshot) {
-                      final p = snapshot.data ?? 0.0;
-                      return AlertDialog(
-                        backgroundColor: KeeprTheme.surface,
-                        title: Text("Downloading...",
-                            style: GoogleFonts.inter(color: Colors.white)),
-                        content: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            LinearProgressIndicator(
-                                value: p,
-                                backgroundColor: Colors.white10,
-                                color: KeeprTheme.primary),
-                            const SizedBox(height: 10),
-                            Text("${(p * 100).toStringAsFixed(1)}%",
-                                style: GoogleFonts.inter(color: Colors.white70))
-                          ],
-                        ),
-                      );
-                    });
-              });
+      if (savePath == null) {
+        _showSnack('Save cancelled');
+        return;
+      }
+
+      // Show progress dialog
+      showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) {
+            return StatefulBuilder(builder: (context, setState) {
+              return StreamBuilder<double>(
+                  stream:
+                      _downloadProgressController?.stream ?? Stream.value(0.0),
+                  initialData: 0.0,
+                  builder: (context, snapshot) {
+                    final p = snapshot.data ?? 0.0;
+                    return AlertDialog(
+                      backgroundColor: KeeprTheme.surface,
+                      title: Text("Downloading...",
+                          style: GoogleFonts.inter(color: Colors.white)),
+                      content: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          LinearProgressIndicator(
+                              value: p,
+                              backgroundColor: Colors.white10,
+                              color: KeeprTheme.primary),
+                          const SizedBox(height: 10),
+                          Text("${(p * 100).toStringAsFixed(1)}%",
+                              style: GoogleFonts.inter(color: Colors.white70))
+                        ],
+                      ),
+                    );
+                  });
             });
+          });
 
-        try {
+      try {
+        if (isDistributed) {
           await widget.uploader.downloadDistributedFileToFile(
               item['file_id_ref'], sizeMb, File(savePath), onProgress: (p) {
             if (_downloadProgressController != null &&
@@ -227,16 +229,27 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
               _downloadProgressController!.add(p);
             }
           });
-          Navigator.pop(context); // Close dialog
-          _showSnack('Saved to $savePath');
-        } catch (e) {
-          Navigator.pop(context); // Close dialog on error
-          _showSnack('Download failed: $e', isError: true);
+        } else {
+          // Regular / Legacy file download
+          await widget.uploader.downloadFileToPath(dropboxPath, File(savePath),
+              onProgress: (p) {
+            if (_downloadProgressController != null &&
+                !_downloadProgressController!.isClosed) {
+              _downloadProgressController!.add(p);
+            }
+          });
         }
-        return;
+        Navigator.pop(context); // Close dialog
+        _showSnack('Saved to $savePath');
+      } catch (e) {
+        Navigator.pop(context); // Close dialog on error
+        _showSnack('Download failed: $e', isError: true);
       }
+      return;
+    }
 
-      // Web Logic (keep existing memory buffer)
+    // Web Logic
+    if (isDistributed) {
       showDialog(
           context: context,
           barrierDismissible: false,
@@ -280,19 +293,17 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
 
         Navigator.pop(context); // Close dialog
 
-        if (kIsWeb) {
-          // Ensure we pass a typed buffer to the JS Blob constructor to avoid JS string coercion
-          final u8 = Uint8List.fromList(bytes);
-          print(
-              '[Download] final assembled bytes: ${u8.length} (expected ${(sizeMb * 1024 * 1024).round()})');
-          final blob = html.Blob([u8], 'application/octet-stream');
-          final url = html.Url.createObjectUrlFromBlob(blob);
-          final anchor = html.AnchorElement(href: url)
-            ..setAttribute("download", name)
-            ..click();
-          html.Url.revokeObjectUrl(url);
-          _showSnack('Download started');
-        }
+        // Ensure we pass a typed buffer to the JS Blob constructor to avoid JS string coercion
+        final u8 = Uint8List.fromList(bytes);
+        print(
+            '[Download] final assembled bytes: ${u8.length} (expected ${(sizeMb * 1024 * 1024).round()})');
+        final blob = html.Blob([u8], 'application/octet-stream');
+        final url = html.Url.createObjectUrlFromBlob(blob);
+        final anchor = html.AnchorElement(href: url)
+          ..setAttribute("download", name)
+          ..click();
+        html.Url.revokeObjectUrl(url);
+        _showSnack('Download started');
       } catch (e) {
         Navigator.pop(context); // Close dialog
         _showSnack('Distributed download failed: $e', isError: true);
@@ -300,15 +311,21 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
       return;
     }
 
-    // Legacy / Single file download
+    // Legacy / Single file download (WEB)
     try {
       _showSnack('Preparing download...');
       final link = await widget.uploader.getTemporaryLink(dropboxPath);
+      // Use anchor to force download if possible, otherwise launch
+      final anchor = html.AnchorElement(href: link)
+        ..setAttribute("download", name)
+        ..click();
+      /*
       if (await canLaunchUrl(Uri.parse(link))) {
         await launchUrl(Uri.parse(link));
       } else {
         throw Exception("Could not launch link");
       }
+      */
     } catch (e) {
       _showSnack('Download failed: $e', isError: true);
     }
@@ -782,8 +799,8 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                   style: GoogleFonts.inter(color: Colors.white)),
               content: Text(
                   isFolder
-                      ? "This will permanently delete the folder and ALL its contents recursively (including all distributed chunks). This cannot be undone."
-                      : "This will permanently delete the file and all its distributed chunks.",
+                      ? "This will permanently delete the folder and ALL its contents recursively.This cannot be undone."
+                      : "This will permanently delete the file",
                   style: GoogleFonts.inter(color: Colors.white70)),
               actions: [
                 TextButton(
