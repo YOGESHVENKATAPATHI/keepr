@@ -162,24 +162,13 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         console.log(`[Auth] OTP verified for ${email}`);
         
         try {
-            // Issue an onboarding (pre-user) token but DO NOT create a users row yet.
-            // The client will complete account creation when the PIN is set.
-            const tokenValue = await executeWithDB(async (workerClient) => {
-                // Ensure pre_users table exists
-                await workerClient.query(`
-                    CREATE TABLE IF NOT EXISTS pre_users (
-                        token TEXT PRIMARY KEY,
-                        email TEXT NOT NULL,
-                        created_at TIMESTAMP DEFAULT NOW()
-                    );
-                `);
-                // Index to speed up TTL cleanup and lookups by creation time
-                await workerClient.query(`
-                    CREATE INDEX IF NOT EXISTS pre_users_created_idx ON pre_users (created_at);
-                `);
-
-                // Ensure auth_tokens exists for future (fully-provisioned) users
-                await workerClient.query(`
+            const result = await executeWithDB(async (client) => {
+                // Check if user already exists
+                await ensureUsersSchema(client);
+                const q = await client.query('SELECT id, pin_hash FROM users WHERE email = $1', [email]);
+                
+                // Ensure auth_tokens exists
+                await client.query(`
                     CREATE TABLE IF NOT EXISTS auth_tokens (
                         id SERIAL PRIMARY KEY,
                         user_id INT NOT NULL,
@@ -190,13 +179,33 @@ app.post('/api/auth/verify-otp', async (req, res) => {
                     );
                 `);
 
-                const newToken = uuidv4();
-                await workerClient.query('INSERT INTO pre_users (token, email) VALUES ($1, $2)', [newToken, email]);
-                return newToken;
+                if (q.rows.length > 0) {
+                    // User exists - issue full token
+                    const userId = q.rows[0].id;
+                    const tokenValue = uuidv4();
+                    await client.query('INSERT INTO auth_tokens (user_id, token, device_info) VALUES ($1, $2, $3)', [userId, tokenValue, null]); // deviceInfo not passed in verify-otp currently
+                    return { token: tokenValue, isNew: false };
+                } else {
+                    // New user - issue onboarding token
+                    await client.query(`
+                        CREATE TABLE IF NOT EXISTS pre_users (
+                            token TEXT PRIMARY KEY,
+                            email TEXT NOT NULL,
+                            created_at TIMESTAMP DEFAULT NOW()
+                        );
+                    `);
+                    await client.query(`
+                       CREATE INDEX IF NOT EXISTS pre_users_created_idx ON pre_users (created_at);
+                    `);
+                    
+                    const newToken = uuidv4();
+                    await client.query('INSERT INTO pre_users (token, email) VALUES ($1, $2)', [newToken, email]);
+                    return { token: newToken, isNew: true };
+                }
             });
 
-            console.log(`[Auth] onboarding token issued for ${email}`);
-            res.status(200).send({ message: 'Login successful', token: tokenValue });
+            console.log(`[Auth] Login successful for ${email}. New user: ${result.isNew}`);
+            res.status(200).send({ message: 'Login successful', token: result.token });
         } catch (e) {
             console.error(e);
             res.status(500).send({ message: 'Database error during login', error: e.message });

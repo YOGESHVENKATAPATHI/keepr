@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
@@ -22,6 +23,7 @@ class FolderUploadService {
     required String logicalPath,
     Function(double)? onProgress,
     bool Function()? isCancelled,
+    bool Function()? isPaused,
     Function(String)? onFileIdCreated,
   }) async {
     final file = PlatformFile(
@@ -31,9 +33,13 @@ class FolderUploadService {
       bytes: null,
       readStream: null,
     );
-    await _uploadFileDistributed(file, userId, logicalPath, onProgress: onProgress, isCancelled: isCancelled, onFileIdCreated: onFileIdCreated);
+    await _uploadFileDistributed(file, userId, logicalPath,
+        onProgress: onProgress,
+        isCancelled: isCancelled,
+        isPaused: isPaused,
+        onFileIdCreated: onFileIdCreated);
   }
-  
+
   // Web-compatible upload for PlatformFiles (from file_picker)
   Future<void> uploadWebFiles(
       List<PlatformFile> files, String userId, String parentPath,
@@ -61,12 +67,15 @@ class FolderUploadService {
       rethrow;
     }
   }
-  
+
   // --- Distributed Upload Logic ---
-  
+
   Future<void> _uploadFileDistributed(
       PlatformFile file, String userId, String logicalPath,
-      {Function(double)? onProgress, bool Function()? isCancelled, Function(String)? onFileIdCreated}) async {
+      {Function(double)? onProgress,
+      bool Function()? isCancelled,
+      bool Function()? isPaused,
+      Function(String)? onFileIdCreated}) async {
     final int chunkSize = 4 * 1024 * 1024; // 4MB
     final int totalSize = file.size;
     final int totalChunks = (totalSize / chunkSize).ceil();
@@ -124,6 +133,15 @@ class FolderUploadService {
     }
 
     try {
+      Future<void> waitWhilePaused() async {
+        while (isPaused?.call() ?? false) {
+          if (isCancelled?.call() ?? false) {
+            throw Exception('Cancelled');
+          }
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+      }
+
       // Semaphore for concurrency (limit 4 parallel uploads)
       final int concurrency = 4;
 
@@ -162,7 +180,9 @@ class FolderUploadService {
           emitProgressIfNeeded();
         },
             // Chunk Completion
-            (result) => completedChunks.add(result));
+            (result) => completedChunks.add(result),
+            isCancelled: isCancelled,
+            isPaused: isPaused);
 
         // Final progress
         if (onProgress != null) onProgress(1.0);
@@ -173,10 +193,13 @@ class FolderUploadService {
           if (fatalErrors.isNotEmpty) return;
           if (isCancelled?.call() ?? false) {
             if (!doneCompleter.isCompleted) {
-                 fatalErrors.add(Exception("Cancelled"));
-                 doneCompleter.completeError(Exception("Cancelled"));
+              fatalErrors.add(Exception("Cancelled"));
+              doneCompleter.completeError(Exception("Cancelled"));
             }
             return;
+          }
+          if (isPaused?.call() ?? false) {
+            await waitWhilePaused();
           }
           if (chunkIndex >= totalChunks) {
             if (activeUploads == 0 && !doneCompleter.isCompleted)
@@ -214,6 +237,8 @@ class FolderUploadService {
                 fileId: fileId,
                 chunkIndex: i,
                 chunkData: chunkData,
+                isCancelled: isCancelled,
+                isPaused: isPaused,
                 onChunkProgress: (sent, total) {
                   // RESET LOGIC: If sent < prevSentForChunk, it implies a retry/restart
                   // within _processChunk, so we must reset our tracker.
@@ -285,6 +310,10 @@ class FolderUploadService {
     }
 
     // 3. Finalize
+    if (isCancelled?.call() ?? false) {
+      throw Exception('Cancelled');
+    }
+
     print(
         "Finalizing upload for $fileId... total chunks=${completedChunks.length}");
     print('[Upload][DEBUG] chunks metadata: ${completedChunks.map((c) => {
@@ -395,7 +424,9 @@ class FolderUploadService {
       String fileId,
       int concurrency,
       Function(int) onBytesUploaded,
-      Function(Map<String, dynamic>) onChunkCompleted) async {
+      Function(Map<String, dynamic>) onChunkCompleted,
+      {bool Function()? isCancelled,
+      bool Function()? isPaused}) async {
     int currentChunkIndex = 0;
     List<int> buffer = [];
 
@@ -417,8 +448,18 @@ class FolderUploadService {
 
     // Helper to wait for slot
     Future<void> waitForSlot() async {
-      if (active.length < concurrency) return;
-      await Future.any(active);
+      while (active.length >= concurrency) {
+        if (isCancelled?.call() ?? false) {
+          throw Exception('Cancelled');
+        }
+        while (isPaused?.call() ?? false) {
+          if (isCancelled?.call() ?? false) {
+            throw Exception('Cancelled');
+          }
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+        await Future.any(active);
+      }
     }
 
     // Helper to start a chunk upload
@@ -429,6 +470,8 @@ class FolderUploadService {
           fileId: fileId,
           chunkIndex: idx,
           chunkData: data,
+          isCancelled: isCancelled,
+          isPaused: isPaused,
           onChunkComplete: onChunkCompleted,
           onChunkProgress: (sent, total) {
             activeChunkProgress[idx] = sent;
@@ -448,6 +491,16 @@ class FolderUploadService {
       buffer.addAll(packet);
 
       while (buffer.length >= chunkSize) {
+        if (isCancelled?.call() ?? false) {
+          throw Exception('Cancelled');
+        }
+        while (isPaused?.call() ?? false) {
+          if (isCancelled?.call() ?? false) {
+            throw Exception('Cancelled');
+          }
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+
         await waitForSlot();
 
         final chunkData = buffer.sublist(0, chunkSize);
@@ -458,6 +511,16 @@ class FolderUploadService {
     }
 
     if (buffer.isNotEmpty) {
+      if (isCancelled?.call() ?? false) {
+        throw Exception('Cancelled');
+      }
+      while (isPaused?.call() ?? false) {
+        if (isCancelled?.call() ?? false) {
+          throw Exception('Cancelled');
+        }
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+
       await waitForSlot();
       final chunkData = buffer;
       startChunk(currentChunkIndex++, chunkData);
@@ -471,6 +534,8 @@ class FolderUploadService {
       required int chunkIndex,
       required List<int> chunkData,
       required Function(Map<String, dynamic>) onChunkComplete,
+      bool Function()? isCancelled,
+      bool Function()? isPaused,
       Function(int sent, int total)? onChunkProgress}) async {
     final sizeMb = chunkData.length / (1024 * 1024);
 
@@ -480,6 +545,16 @@ class FolderUploadService {
     int maxAllocAttempts = 3;
     Map<String, dynamic> alloc;
     while (true) {
+      if (isCancelled?.call() ?? false) {
+        throw Exception('Cancelled');
+      }
+      while (isPaused?.call() ?? false) {
+        if (isCancelled?.call() ?? false) {
+          throw Exception('Cancelled');
+        }
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+
       allocAttempts++;
       try {
         final allocResp = await http.post(
@@ -531,6 +606,16 @@ class FolderUploadService {
     int uploadAttempts = 0;
     int maxUploadAttempts = 3;
     while (true) {
+      if (isCancelled?.call() ?? false) {
+        throw Exception('Cancelled');
+      }
+      while (isPaused?.call() ?? false) {
+        if (isCancelled?.call() ?? false) {
+          throw Exception('Cancelled');
+        }
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+
       uploadAttempts++;
       try {
         if (kIsWeb) {
@@ -585,9 +670,12 @@ class FolderUploadService {
           break;
         }
       } catch (e) {
+        if (isCancelled?.call() ?? false) {
+          throw Exception('Cancelled');
+        }
         print('[Upload] upload attempt $uploadAttempts error: $e');
         // Friendly wrap for TLS handshake errors
-        final errMsg = e?.toString() ?? '';
+        final errMsg = e.toString();
         if ((e is HandshakeException) ||
             errMsg.contains('HandshakeException') ||
             errMsg.contains('Connection terminated during handshake')) {
@@ -1232,7 +1320,9 @@ class FolderUploadService {
   // --- Streaming Logic for Large Files ---
   Future<void> downloadDistributedFileToFile(
       String fileIdRef, double totalSizeMb, File targetFile,
-      {Function(double)? onProgress}) async {
+      {Function(double)? onProgress,
+      bool Function()? isCancelled,
+      bool Function()? isPaused}) async {
     // 1. Info
     final infoResp = await http.post(
         Uri.parse('$backendUrl/api/files/download-info'),
@@ -1250,13 +1340,89 @@ class FolderUploadService {
     final sortedUnique = uniqueChunks.values.toList()
       ..sort((a, b) => (a['index'] as int).compareTo(b['index'] as int));
 
+    if (sortedUnique.isEmpty) {
+      throw Exception('No chunks available for download');
+    }
+
+    // Isolate Communication Ports
+    final receivePort = ReceivePort(); // For progress & status
+    SendPort? isolateControlPort;
+    final completer = Completer<void>();
+    StreamSubscription? sub;
+
+    try {
+      // Spawn execution in background isolate
+      await Isolate.spawn(
+        _downloadWorker,
+        {
+          'sendPort': receivePort.sendPort,
+          'chunks': sortedUnique,
+          'targetPath': targetFile.path,
+          'totalSizeMb': totalSizeMb,
+        },
+      );
+
+      sub = receivePort.listen((message) {
+        if (message is SendPort) {
+          isolateControlPort = message;
+        } else if (message is Map) {
+          final type = message['type'];
+          if (type == 'progress') {
+            final double p = message['value'];
+            onProgress?.call(p);
+            
+            // Periodically check cancellation
+            if (isCancelled?.call() == true) {
+              isolateControlPort?.send('cancel');
+            }
+            if (isPaused?.call() == true) {
+              isolateControlPort?.send('pause');
+            } else {
+              isolateControlPort?.send('resume');
+            }
+          } else if (type == 'done') {
+            completer.complete();
+          } else if (type == 'error') {
+            completer.completeError(message['error']);
+          }
+        }
+      });
+
+      await completer.future;
+    } finally {
+      sub?.cancel();
+      receivePort.close();
+    }
+  }
+}
+
+Future<void> _downloadWorker(Map<String, dynamic> args) async {
+  final SendPort sendPort = args['sendPort'];
+  final List<Map<String, dynamic>> sortedUnique =
+      (args['chunks'] as List).cast<Map<String, dynamic>>();
+  final String targetPath = args['targetPath'];
+  final double totalSizeMb = args['totalSizeMb'];
+
+  final controlPort = ReceivePort();
+  sendPort.send(controlPort.sendPort);
+
+  // Control State
+  bool isCancelled = false;
+  bool isPaused = false;
+
+  controlPort.listen((msg) {
+    if (msg == 'cancel') isCancelled = true;
+    if (msg == 'pause') isPaused = true;
+    if (msg == 'resume') isPaused = false;
+  });
+
+  try {
     // Stats
     int expectedBytes = (totalSizeMb * 1024 * 1024).round();
-    // (Simpler calculation for now, progress is approximate)
 
     // Prepare
+    final targetFile = File(targetPath);
     if (await targetFile.exists()) await targetFile.delete();
-    // Create parent if not exists
     if (!await targetFile.parent.exists())
       await targetFile.parent.create(recursive: true);
 
@@ -1268,15 +1434,28 @@ class FolderUploadService {
     if (!await tempDir.exists()) await tempDir.create();
 
     // State
-    int nextWriteIndex = 0;
+    int nextWriteIndex = sortedUnique.first['index'] as int;
+    final int expectedChunkCount = sortedUnique.length;
     final Map<int, File> completedParts = {};
     int totalBytesReceived = 0;
+    int mergedChunkCount = 0;
+    int lastEmitTime = 0;
+
+    void emitProgress() {
+       final now = DateTime.now().millisecondsSinceEpoch;
+       if (now - lastEmitTime < 200) return; // Throttle
+       lastEmitTime = now;
+       
+       double p = 0;
+       if (expectedBytes > 0) p = totalBytesReceived / expectedBytes;
+       if (p > 1.0) p = 1.0;
+       sendPort.send({'type': 'progress', 'value': p});
+    }
 
     // Helper to merge
     Future<void> _tryMerge() async {
       while (completedParts.containsKey(nextWriteIndex)) {
         final partFile = completedParts[nextWriteIndex]!;
-        // Write block by block
         final reader = await partFile.open(mode: FileMode.read);
         final len = await reader.length();
         int off = 0;
@@ -1290,6 +1469,7 @@ class FolderUploadService {
         await reader.close();
         await partFile.delete();
         completedParts.remove(nextWriteIndex);
+        mergedChunkCount++;
         nextWriteIndex++;
       }
     }
@@ -1310,7 +1490,13 @@ class FolderUploadService {
         // Retry loop
         int attempts = 0;
         while (true) {
+          if (isCancelled) throw Exception("Cancelled");
+          while (isPaused) {
+            if (isCancelled) throw Exception("Cancelled");
+            await Future.delayed(Duration(milliseconds: 500));
+          }
           attempts++;
+          int bytesReceivedForThisPart = 0;
           try {
             final req = http.Request('POST', Uri.parse(url));
             req.headers.addAll(headers);
@@ -1319,21 +1505,31 @@ class FolderUploadService {
               throw Exception("Status: ${resp.statusCode}");
 
             final sink = partFile.openWrite();
-            await resp.stream.listen((chunk) {
-              sink.add(chunk);
-              totalBytesReceived += chunk.length;
-              if (onProgress != null && expectedBytes > 0) {
-                double p = totalBytesReceived / expectedBytes;
-                if (p > 1.0) p = 1.0;
-                onProgress(p);
+            await for (final chunk in resp.stream) {
+              if (isCancelled) {
+                await sink.close();
+                throw Exception("Cancelled");
               }
-            }).asFuture();
+              while (isPaused) {
+                 if (isCancelled) {
+                   await sink.close();
+                   throw Exception("Cancelled");
+                 }
+                 await Future.delayed(Duration(milliseconds: 500));
+              }
+              sink.add(chunk);
+              bytesReceivedForThisPart += chunk.length;
+              totalBytesReceived += chunk.length;
+              emitProgress();
+            }
             await sink.close();
 
             completedParts[index] = partFile;
-            await _tryMerge();
             break;
           } catch (e) {
+            totalBytesReceived -= bytesReceivedForThisPart;
+            emitProgress();
+            if (e.toString().contains("Cancelled")) rethrow;
             if (attempts >= 3) rethrow;
             await Future.delayed(Duration(seconds: attempts));
           }
@@ -1343,6 +1539,11 @@ class FolderUploadService {
       // Execution Loop (Batch of 3)
       int i = 0;
       while (i < sortedUnique.length) {
+        if (isCancelled) throw Exception("Cancelled");
+        while (isPaused) {
+          if (isCancelled) throw Exception("Cancelled");
+          await Future.delayed(Duration(milliseconds: 500));
+        }
         final batch = <Future>[];
         for (int k = 0; k < 3 && i < sortedUnique.length; k++) {
           final c = sortedUnique[i];
@@ -1350,15 +1551,33 @@ class FolderUploadService {
           i++;
         }
         await Future.wait(batch);
+        await _tryMerge();
       }
     } finally {
       client.close();
       await raf.close();
+      controlPort.close();
       if (await tempDir.exists()) {
         try {
           await tempDir.delete(recursive: true);
         } catch (e) {}
       }
+      if (isCancelled) {
+        if (await targetFile.exists()) {
+          await targetFile.delete();
+        }
+      } else if (mergedChunkCount != expectedChunkCount) {
+        if (await targetFile.exists()) {
+          await targetFile.delete();
+        }
+        throw Exception(
+            'Download incomplete: merged $mergedChunkCount/$expectedChunkCount chunks');
+      }
     }
+    
+    sendPort.send({'type': 'done'});
+  } catch (e) {
+    sendPort.send({'type': 'error', 'error': e.toString()});
   }
 }
+

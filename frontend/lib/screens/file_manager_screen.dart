@@ -13,11 +13,17 @@ import '../services/folder_upload_service.dart';
 import '../theme/keepr_theme.dart';
 import 'file_viewer_screen.dart';
 import '../widgets/upload_dialog.dart';
+import '../widgets/download_dialog.dart';
+import '../widgets/active_transfers_dialog.dart';
 
 import 'package:flutter_svg/flutter_svg.dart';
 
 import 'package:url_launcher/url_launcher.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:uuid/uuid.dart';
+
+import '../services/notification_service.dart';
+import '../services/background_upload_service.dart';
 
 class FileManagerScreen extends StatefulWidget {
   final String userId;
@@ -38,16 +44,100 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
   List<dynamic> items = [];
   bool loading = false;
   StreamController<double>? _downloadProgressController;
+  bool _isActiveTransfersDialogOpen = false;
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+  bool _isSearchExpanded = false;
+  final FocusNode _searchFocusNode = FocusNode();
+  Timer? _activeTaskPollTimer;
+  List<Map<String, dynamic>> _activeTasks = [];
+
+  StreamSubscription? _notificationSubscription;
 
   @override
   void initState() {
     super.initState();
     _downloadProgressController = StreamController<double>.broadcast();
     _refresh();
+    _startActiveTaskPolling();
+
+    _searchController.addListener(() {
+      if (!mounted) return;
+      setState(() {
+        _searchQuery = _searchController.text.trim();
+        _isSearchExpanded =
+            _searchFocusNode.hasFocus || _searchController.text.isNotEmpty;
+      });
+    });
+
+    _searchFocusNode.addListener(() {
+      if (!mounted) return;
+      setState(() {
+        _isSearchExpanded =
+            _searchFocusNode.hasFocus || _searchController.text.isNotEmpty;
+      });
+    });
+
+    _notificationSubscription =
+        NotificationService().actionStream.listen((action) {
+      if (action.actionId == 'open_app') {
+        _openActiveTransfersDialog();
+      }
+    });
+
+    final buffered = NotificationService().takeBufferedActions();
+    if (buffered.any((a) => a.actionId == 'open_app')) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _openActiveTransfersDialog();
+      });
+    }
+  }
+
+  void _startActiveTaskPolling() {
+    _pollActiveTasks();
+    _activeTaskPollTimer?.cancel();
+    _activeTaskPollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _pollActiveTasks();
+    });
+  }
+
+  Future<void> _pollActiveTasks() async {
+    final tasks = await BackgroundUploadService.getActiveTasks();
+    if (!mounted) return;
+    setState(() {
+      _activeTasks = tasks;
+    });
+  }
+
+  Future<void> _openActiveTransfersDialog({String? type}) async {
+    if (_isActiveTransfersDialogOpen || !mounted) return;
+
+    final tasks = _activeTasks.isEmpty
+        ? await BackgroundUploadService.getActiveTasks()
+        : _activeTasks;
+    final filtered = type == null
+        ? tasks
+        : tasks.where((task) => task['type']?.toString() == type).toList();
+
+    if (!mounted || filtered.isEmpty) {
+      _showSnack('No active background transfers');
+      return;
+    }
+
+    _isActiveTransfersDialogOpen = true;
+    await showDialog(
+      context: context,
+      builder: (_) => ActiveTransfersDialog(initialTasks: filtered),
+    );
+    _isActiveTransfersDialogOpen = false;
   }
 
   @override
   void dispose() {
+    _notificationSubscription?.cancel();
+    _activeTaskPollTimer?.cancel();
+    _searchController.dispose();
+    _searchFocusNode.dispose();
     if (_downloadProgressController != null &&
         !_downloadProgressController!.isClosed) {
       _downloadProgressController!.close();
@@ -99,6 +189,14 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
   }
 
   Future<void> _pickFolderAndUpload() async {
+    // Check for active background deletes
+    final tasks = await BackgroundUploadService.getActiveTasks();
+    if (tasks.any((t) => t['type'] == 'delete')) {
+      _showSnack('Please wait for deletions to complete before uploading.',
+          isError: true);
+      return;
+    }
+
     String? dirPath;
     try {
       dirPath = await FilePicker.platform.getDirectoryPath();
@@ -187,50 +285,62 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
         return;
       }
 
-      // Show progress dialog
-      showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (ctx) {
-            return StatefulBuilder(builder: (context, setState) {
-              return StreamBuilder<double>(
-                  stream:
-                      _downloadProgressController?.stream ?? Stream.value(0.0),
-                  initialData: 0.0,
-                  builder: (context, snapshot) {
-                    final p = snapshot.data ?? 0.0;
-                    return AlertDialog(
-                      backgroundColor: KeeprTheme.surface,
-                      title: Text("Downloading...",
-                          style: GoogleFonts.inter(color: Colors.white)),
-                      content: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          LinearProgressIndicator(
-                              value: p,
-                              backgroundColor: Colors.white10,
-                              color: KeeprTheme.primary),
-                          const SizedBox(height: 10),
-                          Text("${(p * 100).toStringAsFixed(1)}%",
-                              style: GoogleFonts.inter(color: Colors.white70))
-                        ],
-                      ),
-                    );
-                  });
+      if (isDistributed) {
+        showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (ctx) {
+              return DownloadDialog(
+                uploader: widget.uploader,
+                userId: widget.userId,
+                itemsToDownload: [
+                  {
+                    'name': name,
+                    'file_id_ref': item['file_id_ref'],
+                    'size_mb': sizeMb,
+                    'targetPath': savePath,
+                  }
+                ],
+                onDownloadComplete: () {
+                  _showSnack('Saved to $savePath');
+                  _refresh();
+                },
+              );
             });
-          });
+      } else {
+        showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (ctx) {
+              return StatefulBuilder(builder: (context, setState) {
+                return StreamBuilder<double>(
+                    stream: _downloadProgressController?.stream ??
+                        Stream.value(0.0),
+                    initialData: 0.0,
+                    builder: (context, snapshot) {
+                      final p = snapshot.data ?? 0.0;
+                      return AlertDialog(
+                        backgroundColor: KeeprTheme.surface,
+                        title: Text('Downloading...',
+                            style: GoogleFonts.inter(color: Colors.white)),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            LinearProgressIndicator(
+                                value: p,
+                                backgroundColor: Colors.white10,
+                                color: KeeprTheme.primary),
+                            const SizedBox(height: 10),
+                            Text('${(p * 100).toStringAsFixed(1)}%',
+                                style: GoogleFonts.inter(color: Colors.white70))
+                          ],
+                        ),
+                      );
+                    });
+              });
+            });
 
-      try {
-        if (isDistributed) {
-          await widget.uploader.downloadDistributedFileToFile(
-              item['file_id_ref'], sizeMb, File(savePath), onProgress: (p) {
-            if (_downloadProgressController != null &&
-                !_downloadProgressController!.isClosed) {
-              _downloadProgressController!.add(p);
-            }
-          });
-        } else {
-          // Regular / Legacy file download
+        try {
           await widget.uploader.downloadFileToPath(dropboxPath, File(savePath),
               onProgress: (p) {
             if (_downloadProgressController != null &&
@@ -238,12 +348,12 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
               _downloadProgressController!.add(p);
             }
           });
+          if (mounted) Navigator.pop(context);
+          _showSnack('Saved to $savePath');
+        } catch (e) {
+          if (mounted) Navigator.pop(context);
+          _showSnack('Download failed: $e', isError: true);
         }
-        Navigator.pop(context); // Close dialog
-        _showSnack('Saved to $savePath');
-      } catch (e) {
-        Navigator.pop(context); // Close dialog on error
-        _showSnack('Download failed: $e', isError: true);
       }
       return;
     }
@@ -476,7 +586,14 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     }
   }
 
-  void _openUploadDialog() {
+  Future<void> _openUploadDialog() async {
+    final tasks = await BackgroundUploadService.getActiveTasks();
+    if (tasks.any((t) => t['type'] == 'delete')) {
+      _showSnack('Please wait for deletions to complete.', isError: true);
+      return;
+    }
+
+    if (!mounted) return;
     showDialog(
         context: context,
         barrierDismissible: false,
@@ -551,89 +668,321 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
   }
 
   Widget _buildTopBar() {
-    final isDesktop = MediaQuery.of(context).size.width > 600;
+    // Determine screen width
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isMobile = screenWidth <= 600;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
-      child: isDesktop
-          ? Row(
+      child: Stack(
+        alignment: Alignment.centerRight,
+        children: [
+          // Logo (Left Aligned) - Becomes invisible when search overlaps on small screens
+          Align(
+            alignment: Alignment.centerLeft,
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 200),
+              opacity: (_isSearchExpanded && isMobile) ? 0.0 : 1.0,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SvgPicture.asset('assets/keeprlogo.svg',
+                      width: 28,
+                      height: 28,
+                      colorFilter: const ColorFilter.mode(
+                          Colors.white, BlendMode.srcIn)),
+                  const SizedBox(width: 8),
+                  Text(
+                    'KEEPR',
+                    style: GoogleFonts.zillaSlab(
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                        letterSpacing: 1.5),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Right Side Controls (Search + Menu)
+          Align(
+            alignment: Alignment.centerRight,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.end,
               children: [
-                SvgPicture.asset('assets/keeprlogo.svg',
-                    width: 32,
-                    height: 32,
-                    colorFilter:
-                        const ColorFilter.mode(Colors.white, BlendMode.srcIn)),
-                const SizedBox(width: 12),
-                Text(
-                  'KEEPR',
-                  style: GoogleFonts.zillaSlab(
-                      fontSize: 28,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                      letterSpacing: 1.5),
-                ),
-                const Spacer(),
-                _buildActionButton('UPLOAD', _openUploadDialog,
-                    highlight: true),
-                const SizedBox(width: 15),
-                _buildActionButton('NEW FILE', _createFile),
-                const SizedBox(width: 15),
-                _buildActionButton('NEW FOLDER', _createFolder),
-                const SizedBox(width: 15),
-                _buildActionButton('REFRESH', _refresh),
-              ],
-            )
-          : Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Row(
-                      children: [
-                        SvgPicture.asset('assets/keeprlogo.svg',
-                            width: 28,
-                            height: 28,
-                            colorFilter: const ColorFilter.mode(
-                                Colors.white, BlendMode.srcIn)),
-                        const SizedBox(width: 8),
-                        Text(
-                          'KEEPR',
-                          style: GoogleFonts.zillaSlab(
-                              fontSize: 28,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.white,
-                              letterSpacing: 1.5),
-                        ),
-                      ],
-                    ),
-                    IconButton(
-                      onPressed: _refresh,
-                      icon: const Icon(Icons.refresh, color: Colors.white70),
-                      tooltip: "Refresh",
-                    )
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    Expanded(
-                        child: _buildActionButton('UPLOAD', _openUploadDialog,
-                            highlight: true)),
-                    const SizedBox(width: 8),
-                    Expanded(
-                        child: _buildActionButton('NEW FILE', _createFile)),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                        child: _buildActionButton('NEW FOLDER', _createFolder)),
-                  ],
-                )
+                Flexible(child: _buildSearchBar()),
+                const SizedBox(width: 10),
+                _buildQuickActionsMenu(),
               ],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildQuickActionsMenu() {
+    final uploadCount = _activeTasks
+        .where((task) => task['type']?.toString() == 'upload')
+        .length;
+    final downloadCount = _activeTasks
+        .where((task) => task['type']?.toString() == 'download')
+        .length;
+
+    return PopupMenuButton<String>(
+      color: const Color(0xFF111827),
+      tooltip: 'Quick Actions',
+      onSelected: (value) {
+        if (value == 'refresh') {
+          _refresh();
+        } else if (value == 'upload') {
+          _openUploadDialog();
+        } else if (value == 'new_file') {
+          _createFile();
+        } else if (value == 'new_folder') {
+          _createFolder();
+        } else if (value == 'bg_uploads') {
+          _openActiveTransfersDialog(type: 'upload');
+        } else if (value == 'bg_downloads') {
+          _openActiveTransfersDialog(type: 'download');
+        }
+      },
+      itemBuilder: (context) => [
+        PopupMenuItem(
+          value: 'refresh',
+          child: Row(children: [
+            const Icon(Icons.refresh_rounded, color: Colors.white, size: 18),
+            const SizedBox(width: 10),
+            Text('Refresh', style: GoogleFonts.inter(color: Colors.white)),
+          ]),
+        ),
+        const PopupMenuDivider(height: 1),
+        PopupMenuItem(
+          value: 'upload',
+          child: Row(children: [
+            const Icon(Icons.upload_rounded,
+                color: Color(0xFF60A5FA), size: 18),
+            const SizedBox(width: 10),
+            Text('Upload', style: GoogleFonts.inter(color: Colors.white)),
+          ]),
+        ),
+        PopupMenuItem(
+          value: 'new_file',
+          child: Row(children: [
+            const Icon(Icons.note_add_rounded,
+                color: Color(0xFF34D399), size: 18),
+            const SizedBox(width: 10),
+            Text('Create File', style: GoogleFonts.inter(color: Colors.white)),
+          ]),
+        ),
+        PopupMenuItem(
+          value: 'new_folder',
+          child: Row(children: [
+            const Icon(Icons.create_new_folder_rounded,
+                color: Color(0xFFF59E0B), size: 18),
+            const SizedBox(width: 10),
+            Text('Create Folder',
+                style: GoogleFonts.inter(color: Colors.white)),
+          ]),
+        ),
+        if (!kIsWeb) ...[
+          const PopupMenuDivider(height: 1),
+          PopupMenuItem(
+            value: 'bg_uploads',
+            child: Row(children: [
+              const Icon(Icons.cloud_upload_outlined,
+                  color: Color(0xFF60A5FA), size: 18),
+              const SizedBox(width: 10),
+              Text('Currently Uploading ($uploadCount)',
+                  style: GoogleFonts.inter(color: Colors.white)),
+            ]),
+          ),
+          PopupMenuItem(
+            value: 'bg_downloads',
+            child: Row(children: [
+              const Icon(Icons.cloud_download_outlined,
+                  color: Color(0xFF34D399), size: 18),
+              const SizedBox(width: 10),
+              Text('Currently Downloading ($downloadCount)',
+                  style: GoogleFonts.inter(color: Colors.white)),
+            ]),
+          ),
+        ],
+      ],
+      child: Container(
+        width: 42,
+        height: 42,
+        decoration: BoxDecoration(
+          color: Colors.white.withAlpha((0.08 * 255).round()),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.white24),
+        ),
+        child: const Icon(Icons.more_vert_rounded, color: Colors.white),
+      ),
+    );
+  }
+
+  Widget _buildSearchBar() {
+    final isDesktop = MediaQuery.of(context).size.width > 600;
+    // On mobile, expanded width is limited to prevent overflow with logo and other elements
+    // The screen width minus (padding + logo + spacer + menu + initial search width buffer)
+    // 20 (left pad) + 20 (right pad) + 42 (menu button) + 10 (spacing) = 92
+    // We add a bit more buffer (e.g. 8) just in case = 100
+    final double screenWidth = MediaQuery.of(context).size.width;
+    final double maxMobileWidth = screenWidth - 100; // Use a safer margin
+    final double expandedWidth = isDesktop ? 300.0 : maxMobileWidth;
+    final double collapsedWidth = 42.0;
+
+    // When expanded on mobile, we might need to overlay or hide the logo,
+    // but for now let's just make sure it fits.
+    // If screen is very narrow, we might need to hide logo when expanded.
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOutCubic,
+      width: _isSearchExpanded ? expandedWidth : collapsedWidth,
+      height: 46,
+      decoration: BoxDecoration(
+        color: _isSearchExpanded
+            ? const Color(0xFF1F2937)
+            : const Color(0xFF4F29F0),
+        borderRadius: BorderRadius.circular(30),
+        boxShadow: [
+          if (!_isSearchExpanded)
+            BoxShadow(
+              color: const Color(0xFF4F29F0).withAlpha(80),
+              blurRadius: 10,
+              offset: const Offset(0, 4),
+            )
+        ],
+      ),
+      child: Stack(
+        children: [
+          // Search Input
+          Positioned.fill(
+            child: AnimatedOpacity(
+              duration: const Duration(milliseconds: 200),
+              opacity: _isSearchExpanded ? 1.0 : 0.0,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 48, right: 16),
+                child: Center(
+                  child: TextField(
+                    controller: _searchController,
+                    focusNode: _searchFocusNode,
+                    style: GoogleFonts.inter(color: Colors.white, fontSize: 15),
+                    cursorColor: const Color(0xFF4F29F0),
+                    decoration: InputDecoration(
+                      border: InputBorder.none,
+                      focusedBorder: InputBorder.none,
+                      enabledBorder: InputBorder.none,
+                      errorBorder: InputBorder.none,
+                      disabledBorder: InputBorder.none,
+                      filled: true,
+                      fillColor: Colors.transparent,
+                      hintText: 'Search files...',
+                      hintStyle: GoogleFonts.inter(
+                          color: Colors.white54, fontSize: 14),
+                      isDense: true,
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          // Search Icon
+          Positioned(
+            left: 11,
+            top: 11,
+            child: GestureDetector(
+              onTap: () {
+                if (!_isSearchExpanded) {
+                  _searchFocusNode.requestFocus();
+                }
+              },
+              child: Icon(
+                Icons.search_rounded,
+                color: Colors.white,
+                size: 22,
+              ),
+            ),
+          ),
+          // Close Icon
+          if (_isSearchExpanded && _searchQuery.isNotEmpty)
+            Positioned(
+              right: 8,
+              top: 0,
+              bottom: 0,
+              child: IconButton(
+                icon: const Icon(Icons.close_rounded,
+                    color: Colors.white70, size: 18),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                onPressed: () {
+                  _searchController.clear();
+                  _searchFocusNode.unfocus();
+                },
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  List<dynamic> get _filteredItems {
+    if (_searchQuery.isEmpty) return items;
+    final q = _searchQuery.toLowerCase();
+    return items.where((item) {
+      final name = (item['name'] ?? '').toString().toLowerCase();
+      final path = (item['path'] ?? '').toString().toLowerCase();
+      return name.contains(q) || path.contains(q);
+    }).toList(growable: false);
+  }
+
+  TextSpan _highlightedSpan(String text) {
+    final query = _searchQuery.trim();
+    if (query.isEmpty) {
+      return TextSpan(
+        text: text,
+        style: GoogleFonts.inter(
+            fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
+      );
+    }
+
+    final lowerText = text.toLowerCase();
+    final lowerQuery = query.toLowerCase();
+    final spans = <TextSpan>[];
+    int start = 0;
+
+    while (true) {
+      final index = lowerText.indexOf(lowerQuery, start);
+      if (index < 0) {
+        spans.add(TextSpan(text: text.substring(start)));
+        break;
+      }
+
+      if (index > start) {
+        spans.add(TextSpan(text: text.substring(start, index)));
+      }
+
+      spans.add(TextSpan(
+        text: text.substring(index, index + query.length),
+        style: const TextStyle(
+          color: Color(0xFF22D3EE),
+          fontWeight: FontWeight.w800,
+          backgroundColor: Color(0x3316465A),
+        ),
+      ));
+
+      start = index + query.length;
+    }
+
+    return TextSpan(
+      style: GoogleFonts.inter(
+          fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
+      children: spans,
     );
   }
 
@@ -717,14 +1066,10 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      name,
+                    RichText(
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: GoogleFonts.inter(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white),
+                      text: _highlightedSpan(name),
                     ),
                     const SizedBox(height: 4),
                     Row(
@@ -770,15 +1115,17 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                             color: Colors.white54,
                             fontWeight: FontWeight.bold)),
                   ),
-                  const SizedBox(width: 8),
-                  TextButton(
-                    onPressed: () => _confirmDelete(it),
-                    child: Text('DELETE',
-                        style: GoogleFonts.inter(
-                            fontSize: 11,
-                            color: Colors.redAccent.withOpacity(0.8),
-                            fontWeight: FontWeight.bold)),
-                  ),
+                  if (!kIsWeb) ...[
+                    const SizedBox(width: 8),
+                    TextButton(
+                      onPressed: () => _confirmDelete(it),
+                      child: Text('DELETE',
+                          style: GoogleFonts.inter(
+                              fontSize: 11,
+                              color: Colors.redAccent.withOpacity(0.8),
+                              fontWeight: FontWeight.bold)),
+                    ),
+                  ],
                 ],
               )
             ],
@@ -817,13 +1164,37 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
             ));
 
     if (confirmed == true) {
-      try {
-        _showSnack('Deleting $name...');
-        await widget.api.deleteFile(widget.userId, item['path']);
-        _showSnack('Deleted $name');
-        _refresh();
-      } catch (e) {
-        _showSnack('Failed to delete: $e', isError: true);
+      if (!kIsWeb &&
+          (Platform.isAndroid || Platform.isIOS || Platform.isWindows)) {
+        try {
+          final uuid = const Uuid().v4();
+          await BackgroundUploadService.startDeletes(
+            backendUrl: widget.api.backendBase,
+            userId: widget.userId,
+            filePaths: [item['path']],
+            fileNames: [name],
+            taskIds: [uuid],
+          );
+          _showSnack('deleting: $name');
+          setState(() {
+            // Optimistically remove from list? Or just let user refresh.
+            // _refresh();
+            // _refresh might fetch old state.
+          });
+          // Give it a second then refresh
+          Future.delayed(const Duration(seconds: 1), _refresh);
+        } catch (e) {
+          _showSnack('Failed to start delete: $e', isError: true);
+        }
+      } else {
+        try {
+          _showSnack('Deleting $name...');
+          await widget.api.deleteFile(widget.userId, item['path']);
+          _showSnack('Deleted $name');
+          _refresh();
+        } catch (e) {
+          _showSnack('Failed to delete: $e', isError: true);
+        }
       }
     }
   }
@@ -843,17 +1214,20 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                   backgroundColor: Colors.transparent,
                   minHeight: 2),
             Expanded(
-              child: items.isEmpty && !loading
+              child: _filteredItems.isEmpty && !loading
                   ? Center(
-                      child: Text("NO FILES FOUND",
+                      child: Text(
+                          _searchQuery.isEmpty
+                              ? 'NO FILES FOUND'
+                              : 'NO SEARCH RESULTS',
                           style: GoogleFonts.zillaSlab(
                               color: Colors.white24,
                               fontSize: 24,
                               fontWeight: FontWeight.bold)))
                   : ListView.builder(
-                      itemCount: items.length,
+                      itemCount: _filteredItems.length,
                       itemBuilder: (ctx, i) =>
-                          _buildItem(items[i] as Map<String, dynamic>),
+                          _buildItem(_filteredItems[i] as Map<String, dynamic>),
                     ),
             )
           ],

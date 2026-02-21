@@ -3,12 +3,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:percent_indicator/percent_indicator.dart';
 import 'package:uuid/uuid.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
+import 'dart:io' as io;
 
 import '../services/folder_upload_service.dart';
 import '../services/background_upload_service.dart';
+import '../services/notification_service.dart';
 
 class UploadDialog extends StatefulWidget {
   final FolderUploadService uploader;
@@ -34,6 +35,7 @@ class _UploadTask {
   double progress = 0.0;
   bool isCompleted = false;
   bool isFailed = false;
+  bool isPaused = false;
   String? errorMessage;
 
   _UploadTask(this.file) : id = const Uuid().v4();
@@ -68,26 +70,36 @@ class _UploadDialogState extends State<UploadDialog> {
 
             if (status == 'running') {
               task.progress = (event['progress'] as num).toDouble();
+              task.isPaused = false;
+            } else if (status == 'paused') {
+              task.isPaused = true;
             } else if (status == 'completed') {
               task.progress = 1.0;
               task.isCompleted = true;
+              task.isPaused = false;
             } else if (status == 'failed') {
-               task.isFailed = true;
-               task.errorMessage = event['error'];
+              task.isFailed = true;
+              task.errorMessage = event['error'];
+              task.isPaused = false;
+            } else if (status == 'cancelled') {
+              task.isFailed = true;
+              task.errorMessage = 'Cancelled';
+              task.isPaused = false;
             }
           } catch (e) {
             // Task not found
           }
         });
-        
-        if (taskFound && _tasks.isNotEmpty && _tasks.every((t) => t.isCompleted || t.isFailed)) {
-           // All visible tasks done
-           widget.onUploadComplete();
+
+        if (taskFound &&
+            _tasks.isNotEmpty &&
+            _tasks.every((t) => t.isCompleted || t.isFailed)) {
+          // All visible tasks done
+          widget.onUploadComplete();
         }
       });
     }
   }
-
 
   Future<void> _pickFiles() async {
     if (_isPicking) return;
@@ -105,21 +117,65 @@ class _UploadDialogState extends State<UploadDialog> {
           _tasks.addAll(newTasks);
         });
 
-        if (kIsWeb) {
-          _startUploads(newTasks);
-        } else {
-          final paths = newTasks.map((t) => t.file.path!).toList();
-          final names = newTasks.map((t) => t.file.name).toList();
-          final ids = newTasks.map((t) => t.id).toList();
+        if (!kIsWeb &&
+            (defaultTargetPlatform == TargetPlatform.android ||
+                defaultTargetPlatform == TargetPlatform.iOS)) {
+          final backgroundTasks = newTasks
+              .where((t) => (t.file.path?.isNotEmpty ?? false))
+              .toList();
+          final foregroundTasks = newTasks
+              .where((t) => !(t.file.path?.isNotEmpty ?? false))
+              .toList();
 
-          await BackgroundUploadService.startUploads(
-            backendUrl: widget.uploader.backendUrl,
-            userId: widget.userId,
-            parentPath: widget.currentPath,
-            filePaths: paths,
-            fileNames: names,
-            taskIds: ids,
-          );
+          if (backgroundTasks.isNotEmpty) {
+            final paths = backgroundTasks
+                .map((t) => t.file.path!)
+                .toList(growable: false);
+            final names =
+                backgroundTasks.map((t) => t.file.name).toList(growable: false);
+            final ids =
+                backgroundTasks.map((t) => t.id).toList(growable: false);
+
+            // Use try-catch for startUploads to prevent crashes if service fails
+            try {
+              await BackgroundUploadService.startUploads(
+                backendUrl: widget.uploader.backendUrl,
+                userId: widget.userId,
+                parentPath: widget.currentPath,
+                filePaths: paths,
+                fileNames: names,
+                taskIds: ids,
+              );
+            } catch (e) {
+              print("Background Upload Start Failed: $e");
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      'Background upload failed: $e. Retrying in foreground.',
+                    ),
+                  ),
+                );
+              }
+              // Fallback to foreground upload for files that have accessible paths.
+              await _startUploads(backgroundTasks, notifyWhenDone: false);
+            }
+          }
+
+          if (foregroundTasks.isNotEmpty) {
+            // Files from SAF/content providers may not expose a direct file path.
+            // Upload them in foreground using stream-based upload.
+            await _startUploads(foregroundTasks, notifyWhenDone: false);
+          }
+
+          if (newTasks.isNotEmpty &&
+              newTasks.every((t) => t.isCompleted || t.isFailed)) {
+            widget.onUploadComplete();
+          }
+        } else {
+          // Web and Desktop (Windows/Linux/MacOS) - Foreground Upload
+          // Desktop apps run continuously so simple async is fine
+          await _startUploads(newTasks);
         }
       }
     } finally {
@@ -127,31 +183,60 @@ class _UploadDialogState extends State<UploadDialog> {
     }
   }
 
-  Future<void> _startUploads(List<_UploadTask> newTasks) async {
+  Future<void> _startUploads(List<_UploadTask> newTasks,
+      {bool notifyWhenDone = true}) async {
     for (final task in newTasks) {
       await _processTask(task);
     }
-    widget.onUploadComplete();
+    if (notifyWhenDone) {
+      widget.onUploadComplete();
+    }
   }
 
   Future<void> _processTask(_UploadTask task) async {
     try {
-      await widget.uploader
-          .uploadWebFiles([task.file], widget.userId, widget.currentPath,
-              onFileProgress: (name, prog) {
-        if (mounted) {
-          setState(() {
-            task.progress = prog;
-          });
-        }
-      });
+      if (kIsWeb || task.file.path == null) {
+        await widget.uploader
+            .uploadWebFiles([task.file], widget.userId, widget.currentPath,
+                onFileProgress: (name, prog) {
+          if (mounted) {
+            setState(() {
+              task.progress = prog;
+            });
+          }
+        });
+      } else {
+        // Desktop (Windows/Linux/MacOS) - Use optimized chunked upload
+        final file = io.File(task.file.path!);
+        final size = await file.length();
+
+        await widget.uploader.uploadFileFromPath(
+          path: task.file.path!,
+          name: task.file.name,
+          size: size,
+          userId: widget.userId,
+          logicalPath: "${widget.currentPath}/${task.file.name}",
+          onProgress: (prog) {
+            if (mounted) {
+              setState(() {
+                task.progress = prog;
+              });
+            }
+          },
+          // Handle cancellation logic if needed
+          // isCancelled: () => false,
+        );
+      }
+
       if (mounted) {
         setState(() {
           task.progress = 1.0;
           task.isCompleted = true;
         });
       }
-    } catch (e) {
+    } catch (e, st) {
+      print('[UploadDialog] Upload task failed for ${task.file.name}: $e');
+      print('[UploadDialog] StackTrace: $st');
       if (mounted) {
         setState(() {
           task.isFailed = true;
@@ -365,14 +450,42 @@ class _UploadDialogState extends State<UploadDialog> {
               if (task.isCompleted)
                 const Icon(Icons.check, color: Color(0xFF10B981), size: 18)
               else if (task.isFailed)
-                Icon(Icons.refresh,
-                    color: Colors.white54, size: 18) // Retry placeholder
+                const Icon(Icons.error, color: Colors.redAccent, size: 18)
               else
-                Text("${(task.progress * 100).toStringAsFixed(0)}%",
-                    style: GoogleFonts.inter(
-                        color: Colors.white,
-                        fontSize: 12,
-                        fontWeight: FontWeight.bold))
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: Icon(task.isPaused ? Icons.play_arrow : Icons.pause,
+                          color: Colors.white70, size: 20),
+                      onPressed: () {
+                        final service = FlutterBackgroundService();
+                        service.invoke('notification_action', {
+                          'actionId':
+                              task.isPaused ? 'resume_action' : 'pause_action',
+                          'notificationId':
+                              NotificationService.notificationIdForTask(
+                                  task.id),
+                          'payload': 'upload_progress',
+                        });
+                      },
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close,
+                          color: Colors.white70, size: 20),
+                      onPressed: () {
+                        final service = FlutterBackgroundService();
+                        service.invoke('notification_action', {
+                          'actionId': 'cancel_action',
+                          'notificationId':
+                              NotificationService.notificationIdForTask(
+                                  task.id),
+                          'payload': 'upload_progress',
+                        });
+                      },
+                    ),
+                  ],
+                )
             ],
           ),
           const SizedBox(height: 8),
@@ -385,7 +498,9 @@ class _UploadDialogState extends State<UploadDialog> {
                       ? "Error: ${task.errorMessage ?? 'Unknown'}"
                       : (task.isCompleted
                           ? "Upload Successful!"
-                          : "${uploadedMb.toStringAsFixed(2)} MB / ${sizeMb.toStringAsFixed(2)} MB"),
+                          : (task.isPaused
+                              ? "Paused - ${uploadedMb.toStringAsFixed(2)} MB / ${sizeMb.toStringAsFixed(2)} MB"
+                              : "${uploadedMb.toStringAsFixed(2)} MB / ${sizeMb.toStringAsFixed(2)} MB")),
                   style: GoogleFonts.inter(
                       color: task.isFailed ? Colors.redAccent : Colors.white38,
                       fontSize: 10,

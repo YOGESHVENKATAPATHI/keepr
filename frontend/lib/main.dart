@@ -17,12 +17,11 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   if (!kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.windows)) {
-    try {
-      await NotificationService().init();
-      await BackgroundUploadService.initialize();
-    } catch (e) {
+    NotificationService().init().then((_) {
+      BackgroundUploadService.initialize();
+    }).catchError((e) {
       print("Error initializing background services: $e");
-    }
+    });
   }
 
   runApp(const KeeprApp());

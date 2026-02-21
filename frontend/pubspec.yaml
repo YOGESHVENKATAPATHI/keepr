@@ -29,8 +29,7 @@ dependencies:
   flutter_local_notifications: ^17.0.0
   flutter_background_service: ^5.1.0
   device_info_plus: ^12.3.0
-  uuid: ^4.5.2
-  local_notifier: ^0.1.6
+  uuid: ^4.5.3
 
 dev_dependencies:
   flutter_test:

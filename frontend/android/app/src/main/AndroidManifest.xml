@@ -19,6 +19,8 @@
         <service 
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:foregroundServiceType="dataSync"
+            android:enabled="true"
+            android:exported="true"
         />
         
         <activity
