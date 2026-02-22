@@ -255,6 +255,17 @@ async function verifyAuthToken(req, res, next) {
     try {
         // 1) Check for fully-provisioned token in auth_tokens
         const row = await executeWithDB(async (client) => {
+            // Ensure auth_tokens table exists
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS auth_tokens (
+                    id SERIAL PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    token TEXT UNIQUE NOT NULL,
+                    device_info TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    revoked BOOLEAN DEFAULT FALSE
+                );
+            `);
             const r = await client.query('SELECT user_id, revoked FROM auth_tokens WHERE token = $1', [token]);
             return r.rows[0];
         });
