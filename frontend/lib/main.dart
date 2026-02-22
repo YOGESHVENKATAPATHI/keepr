@@ -16,12 +16,15 @@ import 'utils/storage_helper.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  if (!kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.windows)) {
-    NotificationService().init().then((_) {
-      BackgroundUploadService.initialize();
-    }).catchError((e) {
+  if (!kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.windows)) {
+    try {
+      await NotificationService().init();
+      await BackgroundUploadService.initialize();
+    } catch (e) {
       print("Error initializing background services: $e");
-    });
+    }
   }
 
   runApp(const KeeprApp());

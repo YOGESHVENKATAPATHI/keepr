@@ -43,6 +43,11 @@ void onStart(ServiceInstance service) async {
     final Map<String, bool> taskCancelled = {};
     final Map<String, bool> taskPaused = {};
     final Map<String, int> taskProgress = {};
+    final Map<String, String> taskToSourcePath = {}; // New
+    final Map<String, String> taskToTargetPath = {}; // New
+    final Map<String, String> taskToUserId = {};
+    final Map<String, String> taskToLogicalPath = {}; 
+    final Map<String, double> taskToFileSize = {};
     final Set<String> cleanupTriggeredTasks = <String>{};
 
     Future<void> persistActiveTasks() async {
@@ -61,6 +66,11 @@ void onStart(ServiceInstance service) async {
           'progress': taskProgress[taskId] ?? 0,
           'paused': taskPaused[taskId] ?? false,
           'cancelled': taskCancelled[taskId] ?? false,
+          'sourcePath': taskToSourcePath[taskId],
+          'targetPath': taskToTargetPath[taskId],
+          'userId': taskToUserId[taskId],
+          'logicalPath': taskToLogicalPath[taskId],
+          'fileSize': taskToFileSize[taskId],
         });
       }
 
@@ -98,6 +108,12 @@ void onStart(ServiceInstance service) async {
           taskProgress[taskId] = (item['progress'] as num?)?.toInt() ?? 0;
           taskPaused[taskId] = item['paused'] == true;
           taskCancelled[taskId] = item['cancelled'] == true;
+          
+          if (item['sourcePath'] != null) taskToSourcePath[taskId] = item['sourcePath'];
+          if (item['targetPath'] != null) taskToTargetPath[taskId] = item['targetPath'];
+          if (item['userId'] != null) taskToUserId[taskId] = item['userId'];
+          if (item['logicalPath'] != null) taskToLogicalPath[taskId] = item['logicalPath'];
+          if (item['fileSize'] != null) taskToFileSize[taskId] = (item['fileSize'] as num).toDouble();
         }
       } catch (e) {
         print('[BackgroundService] Failed to restore active tasks: $e');
@@ -115,6 +131,11 @@ void onStart(ServiceInstance service) async {
       int? progress,
       bool? paused,
       bool? cancelled,
+      String? sourcePath,
+      String? targetPath,
+      String? userId,
+      String? logicalPath,
+      double? fileSize,
     }) async {
       notifToTask[notificationId] = taskId;
       taskToNotif[taskId] = notificationId;
@@ -126,6 +147,11 @@ void onStart(ServiceInstance service) async {
       if (progress != null) taskProgress[taskId] = progress;
       if (paused != null) taskPaused[taskId] = paused;
       if (cancelled != null) taskCancelled[taskId] = cancelled;
+      if (sourcePath != null) taskToSourcePath[taskId] = sourcePath;
+      if (targetPath != null) taskToTargetPath[taskId] = targetPath;
+      if (userId != null) taskToUserId[taskId] = userId;
+      if (logicalPath != null) taskToLogicalPath[taskId] = logicalPath;
+      if (fileSize != null) taskToFileSize[taskId] = fileSize;
       await persistActiveTasks();
     }
 
@@ -140,6 +166,11 @@ void onStart(ServiceInstance service) async {
       taskCancelled.remove(taskId);
       taskPaused.remove(taskId);
       taskProgress.remove(taskId);
+      taskToSourcePath.remove(taskId);
+      taskToTargetPath.remove(taskId);
+      taskToUserId.remove(taskId);
+      taskToLogicalPath.remove(taskId);
+      taskToFileSize.remove(taskId);
       cleanupTriggeredTasks.remove(taskId);
       await persistActiveTasks();
     }
@@ -190,7 +221,11 @@ void onStart(ServiceInstance service) async {
       if (action.actionId == 'pause_action') {
         taskPaused[taskId] = true;
         await persistActiveTasks();
-        service.invoke('progress', {'taskId': taskId, 'status': 'paused'});
+        service.invoke('progress', {
+          'taskId': taskId,
+          'status': 'paused',
+          'progress': (taskProgress[taskId] ?? 0) / 100.0
+        });
         await NotificationService().showProgressNotification(
           id: action.notificationId,
           title: '$titleBase Paused',
@@ -203,7 +238,11 @@ void onStart(ServiceInstance service) async {
       } else if (action.actionId == 'resume_action') {
         taskPaused[taskId] = false;
         await persistActiveTasks();
-        service.invoke('progress', {'taskId': taskId, 'status': 'running'});
+        service.invoke('progress', {
+          'taskId': taskId,
+          'status': 'running',
+          'progress': (taskProgress[taskId] ?? 0) / 100.0
+        });
         await NotificationService().showProgressNotification(
           id: action.notificationId,
           title: payload == 'download_progress' ? 'Downloading' : 'Uploading',
@@ -226,6 +265,172 @@ void onStart(ServiceInstance service) async {
     }
 
     await loadActiveTasks();
+
+    // AUTO-RESUME
+    for (final taskId in List<String>.from(taskToNotif.keys)) {
+       if (taskCancelled[taskId] == true) {
+          removeTask(taskId);
+          continue;
+       }
+       if (taskToBackendUrl[taskId] == null) {
+          removeTask(taskId);
+          continue; 
+       }
+
+       final type = taskToType[taskId];
+       final name = taskToName[taskId]!;
+       final notifId = taskToNotif[taskId]!;
+       final backendUrl = taskToBackendUrl[taskId]!;
+       final uploadService = FolderUploadService(backendUrl: backendUrl);
+
+       print('[Service] Resuming task $taskId ($type: $name)');
+       
+       // Fire and forget (don't await) so we process all tasks
+       Future(() async {
+          try {
+             if (type == 'upload') {
+                final sourcePath = taskToSourcePath[taskId];
+                final userId = taskToUserId[taskId];
+                final logicalPath = taskToLogicalPath[taskId];
+                
+                if (sourcePath == null || userId == null || logicalPath == null) {
+                   print('[Service] Cannot resume upload $taskId: missing metadata');
+                   await removeTask(taskId);
+                   return;
+                }
+                
+                final fileObj = File(sourcePath);
+                if (!await fileObj.exists()) {
+                   print('[Service] Cannot resume upload $taskId: file not found');
+                   await removeTask(taskId);
+                   return;
+                }
+                final size = await fileObj.length();
+                final existingFileId = taskToFileId[taskId];
+
+                await NotificationService().showProgressNotification(
+                    id: notifId,
+                    title: 'Resuming Upload: $name',
+                    body: 'Please wait...',
+                    progress: taskProgress[taskId] ?? 0,
+                    maxProgress: 100,
+                    isPaused: false,
+                    payload: 'upload_progress',
+                );
+
+                await uploadService.uploadFileFromPath(
+                    path: sourcePath,
+                    name: name,
+                    size: size,
+                    userId: userId,
+                    logicalPath: logicalPath,
+                    existingFileId: existingFileId,
+                    onProgress: (prog) {
+                      if (taskCancelled[taskId] == true) return;
+                      // if (taskPaused[taskId] == true) return; // Ignore pause if we removed buttons
+                      
+                      final progressValue = (prog * 100).toInt();
+                      taskProgress[taskId] = progressValue;
+                      // persistActiveTasks(); // Don't persist on every tick to avoid IO thrashing
+                      // Maybe throttle persistence? For now, skip persisting progress every tick.
+                      
+                      service.invoke('progress', {
+                        'taskId': taskId,
+                        'progress': prog,
+                        'status': 'running',
+                      });
+                      NotificationService().showProgressNotification(
+                        id: notifId,
+                        title: 'Uploading $name',
+                        body: '${(prog * 100).toStringAsFixed(1)}%',
+                        progress: progressValue,
+                        maxProgress: 100,
+                        isPaused: false,
+                        payload: 'upload_progress',
+                      );
+                    },
+                    isCancelled: () => taskCancelled[taskId] ?? false,
+                    isPaused: () => false, //taskPaused[taskId] ?? false,
+                    onFileIdCreated: (fid) {
+                        taskToFileId[taskId] = fid;
+                        persistActiveTasks();
+                    }
+                );
+                
+                await NotificationService().showCompletionNotification(
+                    id: notifId,
+                    title: 'Upload Complete',
+                    body: '$name uploaded successfully.',
+                );
+                await removeTask(taskId);
+
+             } else if (type == 'download') {
+                final targetPath = taskToTargetPath[taskId];
+                final fileId = taskToFileId[taskId];
+                final fileSize = taskToFileSize[taskId] ?? 0.0;
+                
+                if (targetPath == null || fileId == null) {
+                   await removeTask(taskId);
+                   return;
+                }
+
+                await NotificationService().showProgressNotification(
+                    id: notifId,
+                    title: 'Resuming Download: $name',
+                    body: 'Please wait...',
+                    progress: taskProgress[taskId] ?? 0,
+                    maxProgress: 100,
+                    isPaused: false,
+                    payload: 'download_progress',
+                );
+
+                await uploadService.downloadDistributedFileToFile(
+                    fileId, // fileIdRef
+                    fileSize / (1024 * 1024), // sizeMb
+                    File(targetPath),
+                    onProgress: (prog) {
+                      if (taskCancelled[taskId] == true) return;
+                      final progressValue = (prog * 100).toInt();
+                      taskProgress[taskId] = progressValue;
+                      
+                      service.invoke('progress', {
+                        'taskId': taskId,
+                        'progress': prog,
+                        'status': 'running',
+                      });
+                      NotificationService().showProgressNotification(
+                        id: notifId,
+                        title: 'Downloading $name',
+                        body: '${(prog * 100).toStringAsFixed(1)}%',
+                        progress: progressValue,
+                        maxProgress: 100,
+                        isPaused: false,
+                        payload: 'download_progress',
+                      );
+                    },
+                    isCancelled: () => taskCancelled[taskId] ?? false,
+                    isPaused: () => false 
+                );
+                
+                await NotificationService().showCompletionNotification(
+                    id: notifId,
+                    title: 'Download Complete',
+                    body: '$name downloaded successfully.',
+                );
+                await removeTask(taskId);
+             }
+          } catch (e) {
+             print('[Service] Resume failed for $taskId: $e');
+             await NotificationService().showCompletionNotification(
+                 id: notifId,
+                 title: 'Transfer Failed',
+                 body: 'Error resuming $name',
+                 isSuccess: false,
+             );
+             await removeTask(taskId);
+          }
+       });
+    }
 
     NotificationService().actionStream.listen((action) {
       handleNotificationAction(action);
@@ -279,6 +484,9 @@ void onStart(ServiceInstance service) async {
         final taskId = taskIds[i];
 
         final notifId = NotificationService.notificationIdForTask(taskId);
+        final fileObj = File(path);
+        final size = await fileObj.length();
+
         await registerOrUpdateTask(
           taskId: taskId,
           notificationId: notifId,
@@ -289,6 +497,10 @@ void onStart(ServiceInstance service) async {
           progress: 0,
           paused: false,
           cancelled: false,
+          sourcePath: path,
+          userId: userId,
+          logicalPath: '$parentPath/$name',
+          fileSize: size.toDouble(),
         );
 
         if (taskCancelled[taskId] == true) continue;
@@ -305,9 +517,6 @@ void onStart(ServiceInstance service) async {
             isPaused: false,
             payload: 'upload_progress',
           );
-
-          final fileObj = File(path);
-          final size = await fileObj.length();
 
           await uploadService.uploadFileFromPath(
             path: path,
@@ -408,9 +617,12 @@ void onStart(ServiceInstance service) async {
           name: name,
           payload: 'download_progress',
           backendUrl: backendUrl,
+          fileId: fileId,
           progress: 0,
           paused: false,
           cancelled: false,
+          targetPath: targetPath,
+          fileSize: sizeMb * 1024 * 1024,
         );
 
         if (taskCancelled[taskId] == true) continue;
@@ -574,15 +786,15 @@ class BackgroundUploadService {
     await service.configure(
       androidConfiguration: AndroidConfiguration(
         onStart: onStart,
-        autoStart: false,
+        autoStart: true, // AUTO-START
         isForegroundMode: true,
         notificationChannelId: 'upload_channel',
         initialNotificationTitle: 'Keepr Service',
-        initialNotificationContent: 'Ready for background tasks',
+        initialNotificationContent: 'Background transfers active',
         foregroundServiceNotificationId: 888,
       ),
       iosConfiguration: IosConfiguration(
-        autoStart: false,
+        autoStart: true,
         onForeground: onStart,
         onBackground: onIosBackground,
       ),

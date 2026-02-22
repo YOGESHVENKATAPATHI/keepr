@@ -120,7 +120,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
         : tasks.where((task) => task['type']?.toString() == type).toList();
 
     if (!mounted || filtered.isEmpty) {
-      _showSnack('No active background transfers');
+      _showSnack('No active transfers');
       return;
     }
 

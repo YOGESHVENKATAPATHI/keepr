@@ -364,14 +364,26 @@ class _DownloadDialogState extends State<DownloadDialog> {
                       ),
                       onPressed: () {
                         final service = FlutterBackgroundService();
+                        // Instead of sending notification_action, send explicit pause/resume command or invoke payload
+                        // But wait, the background service listens to 'notification_action'
+                        // Let's verify payload matches exactly what background service expects.
+
                         service.invoke('notification_action', {
                           'actionId':
                               task.isPaused ? 'resume_action' : 'pause_action',
                           'notificationId':
                               NotificationService.notificationIdForTask(
                                   task.id),
-                          'payload': 'download_progress',
+                          'payload':
+                              'download_progress', // Hardcoded here? Should match registration?
                         });
+
+                        // Optimistic update
+                        if (mounted) {
+                          setState(() {
+                            task.isPaused = !task.isPaused;
+                          });
+                        }
                       },
                     ),
                     IconButton(

@@ -947,6 +947,39 @@ app.post('/api/upload/init', async (req, res) => {
     }
 });
 
+app.post('/api/upload/status', async (req, res) => {
+    const { fileId } = req.body;
+    try {
+        const result = await executeWithDB(async (client) => {
+            const chunksRes = await client.query(
+                'SELECT chunk_index, size_mb, status FROM file_chunks WHERE file_id = $1 AND status = \'uploaded\'',
+                [fileId]
+            );
+            
+            const uploadRes = await client.query(
+                'SELECT total_chunks FROM file_uploads WHERE file_id = $1',
+                [fileId]
+            );
+
+            if (uploadRes.rows.length === 0) return null;
+
+            return {
+                totalChunks: uploadRes.rows[0].total_chunks,
+                completedChunks: chunksRes.rows.map(r => ({
+                    index: r.chunk_index,
+                    sizeMb: parseFloat(r.size_mb)
+                }))
+            };
+        });
+
+        if (!result) return res.status(404).send({ message: 'Upload not found' });
+        res.json(result);
+    } catch (e) {
+        console.error('Upload Status Error', e);
+        res.status(500).send({ message: e.message });
+    }
+});
+
 // 2. Allocate Chunk: Decide where to put a specific chunk
 app.post('/api/upload/allocate-chunk', async (req, res) => {
     const { fileId, chunkIndex, sizeMb } = req.body;

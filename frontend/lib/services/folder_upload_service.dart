@@ -21,6 +21,7 @@ class FolderUploadService {
     required int size,
     required String userId,
     required String logicalPath,
+    String? existingFileId,
     Function(double)? onProgress,
     bool Function()? isCancelled,
     bool Function()? isPaused,
@@ -34,6 +35,7 @@ class FolderUploadService {
       readStream: null,
     );
     await _uploadFileDistributed(file, userId, logicalPath,
+        existingFileId: existingFileId,
         onProgress: onProgress,
         isCancelled: isCancelled,
         isPaused: isPaused,
@@ -72,7 +74,8 @@ class FolderUploadService {
 
   Future<void> _uploadFileDistributed(
       PlatformFile file, String userId, String logicalPath,
-      {Function(double)? onProgress,
+      {String? existingFileId,
+      Function(double)? onProgress,
       bool Function()? isCancelled,
       bool Function()? isPaused,
       Function(String)? onFileIdCreated}) async {
@@ -82,44 +85,87 @@ class FolderUploadService {
     final String fileName = file.name;
     final double totalSizeMb = totalSize / (1024 * 1024);
 
-    // 1. Init Upload (with retries)
-    int maxInitAttempts = 3;
-    http.Response initResp;
-    int initAttempt = 0;
-    while (true) {
-      initAttempt++;
+    String fileId = existingFileId ?? '';
+    Set<int> completedIndices = {};
+
+    // 1. Init Upload (or Resume)
+    if (fileId.isNotEmpty) {
       try {
-        initResp = await http.post(Uri.parse('$backendUrl/api/upload/init'),
+        final statusResp = await http.post(
+            Uri.parse('$backendUrl/api/upload/status'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'user_id': userId,
-              'path': logicalPath,
-              'name': fileName,
-              'total_size_mb': totalSizeMb,
-              'total_chunks': totalChunks
-            }));
-
-        if (initResp.statusCode == 200) break;
-
-        print(
-            '[Upload][WARN] init attempt $initAttempt failed: ${initResp.statusCode} ${initResp.body}');
-        if (initAttempt >= maxInitAttempts)
-          throw Exception("Init upload failed: ${initResp.body}");
+            body: jsonEncode({'fileId': fileId}));
+        
+        if (statusResp.statusCode == 200) {
+          final data = jsonDecode(statusResp.body);
+          final chunks = (data['completedChunks'] as List).cast<Map<String, dynamic>>();
+          for (var c in chunks) {
+            completedIndices.add(c['index'] as int);
+          }
+           print('[Upload] Resuming upload for $fileId. Completed chunks: ${completedIndices.length}/$totalChunks');
+        } else {
+           print('[Upload] Failed to resume, starting fresh.');
+           fileId = '';
+        }
       } catch (e) {
-        print('[Upload][ERROR] init attempt $initAttempt error: $e');
-        if (initAttempt >= maxInitAttempts) rethrow;
-        await Future.delayed(Duration(milliseconds: 500 * initAttempt));
+         print('[Upload] Status check failed: $e, starting fresh.');
+         fileId = '';
       }
     }
 
-    final fileId = jsonDecode(initResp.body)['fileId'];
+    if (fileId.isEmpty) {
+      int maxInitAttempts = 3;
+      http.Response initResp;
+      int initAttempt = 0;
+      while (true) {
+        initAttempt++;
+        try {
+          initResp = await http.post(Uri.parse('$backendUrl/api/upload/init'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'user_id': userId,
+                'path': logicalPath,
+                'name': fileName,
+                'total_size_mb': totalSizeMb,
+                'total_chunks': totalChunks
+              }));
+
+          if (initResp.statusCode == 200) break;
+
+          print(
+              '[Upload][WARN] init attempt $initAttempt failed: ${initResp.statusCode} ${initResp.body}');
+          if (initAttempt >= maxInitAttempts)
+            throw Exception("Init upload failed: ${initResp.body}");
+        } catch (e) {
+          print('[Upload][ERROR] init attempt $initAttempt error: $e');
+          if (initAttempt >= maxInitAttempts) rethrow;
+          await Future.delayed(Duration(milliseconds: 500 * initAttempt));
+        }
+      }
+      fileId = jsonDecode(initResp.body)['fileId'];
+    }
+
     onFileIdCreated?.call(fileId);
     print(
         "Initialized upload for $fileName (ID: $fileId) with $totalChunks chunks");
 
     // 2. Prepare chunks
-    List<Map<String, dynamic>> completedChunks = [];
+    List<Map<String, dynamic>> completedChunks = []; // Fixed variable name
     int bytesUploaded = 0;
+    
+    // Calculate initial bytesUploaded based on completed chunks
+    if (completedIndices.isNotEmpty) {
+       bytesUploaded = 0;
+       for (var idx in completedIndices) {
+          int size = chunkSize;
+           if (idx == totalChunks - 1) {
+             size = totalSize - (idx * chunkSize);
+           }
+           bytesUploaded += size;
+       }
+       if (bytesUploaded > totalSize) bytesUploaded = totalSize;
+       if (onProgress != null) onProgress(bytesUploaded / totalSize);
+    }
 
     // Handle both Web (bytes/stream) and Mobile/Desktop (path)
     final bytes = file.bytes;
@@ -208,6 +254,15 @@ class FolderUploadService {
           }
 
           final i = chunkIndex++;
+
+          // Skip if already uploaded
+          if (completedIndices.contains(i)) {
+             // We don't add to completedChunks (backend already has it)
+             // Just proceed to next
+             startNext();
+             return;
+          }
+
           activeUploads++;
 
           try {
@@ -1349,6 +1404,7 @@ class FolderUploadService {
     SendPort? isolateControlPort;
     final completer = Completer<void>();
     StreamSubscription? sub;
+    Timer? statusTimer;
 
     try {
       // Spawn execution in background isolate
@@ -1365,21 +1421,29 @@ class FolderUploadService {
       sub = receivePort.listen((message) {
         if (message is SendPort) {
           isolateControlPort = message;
+
+          // Start polling status to push to worker
+          statusTimer?.cancel();
+          statusTimer = Timer.periodic(Duration(milliseconds: 500), (timer) {
+            if (isolateControlPort == null) return;
+
+            bool cancelled = isCancelled?.call() ?? false;
+            bool paused = isPaused?.call() ?? false;
+
+            if (cancelled) {
+              isolateControlPort!.send('cancel');
+              timer.cancel();
+            } else if (paused) {
+              isolateControlPort!.send('pause');
+            } else {
+              isolateControlPort!.send('resume');
+            }
+          });
         } else if (message is Map) {
           final type = message['type'];
           if (type == 'progress') {
             final double p = message['value'];
             onProgress?.call(p);
-            
-            // Periodically check cancellation
-            if (isCancelled?.call() == true) {
-              isolateControlPort?.send('cancel');
-            }
-            if (isPaused?.call() == true) {
-              isolateControlPort?.send('pause');
-            } else {
-              isolateControlPort?.send('resume');
-            }
           } else if (type == 'done') {
             completer.complete();
           } else if (type == 'error') {
@@ -1390,6 +1454,7 @@ class FolderUploadService {
 
       await completer.future;
     } finally {
+      statusTimer?.cancel();
       sub?.cancel();
       receivePort.close();
     }
@@ -1442,14 +1507,14 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
     int lastEmitTime = 0;
 
     void emitProgress() {
-       final now = DateTime.now().millisecondsSinceEpoch;
-       if (now - lastEmitTime < 200) return; // Throttle
-       lastEmitTime = now;
-       
-       double p = 0;
-       if (expectedBytes > 0) p = totalBytesReceived / expectedBytes;
-       if (p > 1.0) p = 1.0;
-       sendPort.send({'type': 'progress', 'value': p});
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - lastEmitTime < 200) return; // Throttle
+      lastEmitTime = now;
+
+      double p = 0;
+      if (expectedBytes > 0) p = totalBytesReceived / expectedBytes;
+      if (p > 1.0) p = 1.0;
+      sendPort.send({'type': 'progress', 'value': p});
     }
 
     // Helper to merge
@@ -1511,11 +1576,11 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
                 throw Exception("Cancelled");
               }
               while (isPaused) {
-                 if (isCancelled) {
-                   await sink.close();
-                   throw Exception("Cancelled");
-                 }
-                 await Future.delayed(Duration(milliseconds: 500));
+                if (isCancelled) {
+                  await sink.close();
+                  throw Exception("Cancelled");
+                }
+                await Future.delayed(Duration(milliseconds: 500));
               }
               sink.add(chunk);
               bytesReceivedForThisPart += chunk.length;
@@ -1574,10 +1639,9 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
             'Download incomplete: merged $mergedChunkCount/$expectedChunkCount chunks');
       }
     }
-    
+
     sendPort.send({'type': 'done'});
   } catch (e) {
     sendPort.send({'type': 'error', 'error': e.toString()});
   }
 }
-

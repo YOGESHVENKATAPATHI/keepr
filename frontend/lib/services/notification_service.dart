@@ -1,3 +1,4 @@
+import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'dart:async';
 import 'dart:convert';
@@ -207,7 +208,7 @@ class NotificationService {
       onlyAlertOnce: true,
       ongoing: true,
       autoCancel: false,
-      actions: <AndroidNotificationAction>[],
+      actions: const <AndroidNotificationAction>[], // Removed actions
     );
 
     final NotificationDetails platformChannelSpecifics =
