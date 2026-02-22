@@ -39,8 +39,11 @@ async function performFullWipe() {
         const masterClient = await dbManager.tryConnect(dbManager.MASTER_DB_URL);
         let storageShards = [];
         try {
-            await masterClient.end();
-        } catch (e) {}
+            const res = await masterClient.query('SELECT id FROM storage_shards WHERE is_active = TRUE');
+            storageShards = res.rows;
+        } finally {
+             await masterClient.end();
+        }
 
         const foldersToDelete = ['/keepr_chunks', '/keepr', '/keepr_files']; // Add any other roots
 
