@@ -84,6 +84,7 @@ app.get('/api/health/db', async (req, res) => {
     }
 });
 
+
 // Helper to execute DB actions with retries and transient error handling
 async function executeWithDB(action, maxAttempts = 3) {
     let attempt = 0;
@@ -112,6 +113,44 @@ async function executeWithDB(action, maxAttempts = 3) {
         } catch (e) {
             lastErr = e;
             console.warn(`DB action attempt ${attempt} failed: ${e.code || e.message}`);
+
+            // Handle Missing Table/Column Schema Issues (Lazy Migration)
+            if (e.code === '42P01' || e.code === '42703') { // undefined_table OR undefined_column
+                console.log(`[DB] Schema mismatch detected (${e.code}). Attempting to auto-migrate schema on shard...`);
+                if (client) {
+                    try {
+                        await ensureWorkerTables(client);
+                        console.log('[DB] auto-migration applied successfully. Retrying action...');
+                        // Don't close client here if possible, or reconnect? 
+                        // Actually, ensureWorkerTables uses the client. 
+                        // After migration, we should continue the loop to retry the ACTION.
+                        // But we need to close the client first to avoid leaks if we get a NEW client in next iteration.
+                        // Wait... we can just retry the action with the SAME client? 
+                        // No, the instruction says "executeWithDB(async (client) => ...)" where client is scoped.
+                        // So we must continue the loop to get a fresh client or just retry. 
+                        // The loop gets a *new* client each time. 
+                        // So we should fix the schema on *this* shard (which we have a client for).
+                        // Note: getFittestDB might return a different shard next time? 
+                        // Good point. We should fix it on the current client.
+                        
+                        // But wait! If we fix it on 'client', then 'client.end()' happens, then loop continues.
+                        // The next iteration calls 'getFittestDB()'. If it returns the SAME shard, good. 
+                        // If it returns a DIFFERENT shard, we might hit the error again on that shard.
+                        // This corresponds well to "create every tables as needed" - we fix it wherever we are.
+                        
+                        // We continue the loop.
+                    } catch (schemaErr) {
+                        console.error('[DB] Auto-migration failed:', schemaErr);
+                        // If migration fails, the next retry will likely fail too, but let's stick to the loop.
+                    } finally {
+                        try { await client.end(); } catch (_) {}
+                    }
+                    // Wait a bit before retry
+                    await new Promise(r => setTimeout(r, 500));
+                    continue; 
+                }
+            }
+
             // classify transient errors (DNS / connection / timeout)
             const msg = (e && e.message) ? e.message.toLowerCase() : '';
             const transient = e.code === 'ENOTFOUND' || e.code === 'ECONNREFUSED' || msg.includes('getaddrinfo') || msg.includes('timeout');
@@ -128,6 +167,88 @@ async function executeWithDB(action, maxAttempts = 3) {
     }
     throw lastErr;
 }
+
+// Ensure all necessary tables exist on a worker DB
+async function ensureWorkerTables(client) {
+    // 1. Users & Auth (Basic)
+    await ensureUsersSchema(client);
+
+    // 2. Auth Tokens (Session)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS auth_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            device_info TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            revoked BOOLEAN DEFAULT FALSE
+        );
+    `);
+    
+    // 3. Pre-Users (Onboarding)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS pre_users (
+            token TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+    
+    // 4. Files Table (Metadata)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS files (
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
+            path TEXT NOT NULL,
+            parent_path TEXT,
+            name TEXT NOT NULL,
+            is_folder BOOLEAN DEFAULT FALSE,
+            size_mb NUMERIC,
+            dropbox_path TEXT,
+            file_id_ref TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+    // Add columns if they are missing (migration for older schemas)
+    await client.query("ALTER TABLE files ADD COLUMN IF NOT EXISTS file_id_ref TEXT");
+    await client.query("ALTER TABLE files ADD COLUMN IF NOT EXISTS dropbox_path TEXT");
+    
+    // 5. File Chunks (Split content)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS file_chunks (
+            chunk_id TEXT PRIMARY KEY, 
+            file_id INT NOT NULL,
+            chunk_index INT NOT NULL,
+            shard_id INT NOT NULL,
+            size_mb NUMERIC,
+            status VARCHAR(50) DEFAULT 'pending',
+            dropbox_path TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+
+    // Fix: Ensure chunk_id exists if table was created previously without it
+    // Note: If table exists but has different PK, this might fail or need simpler alter.
+    // If 'chunk_id' is missing, we add it. 
+    await client.query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS chunk_id TEXT");
+
+    // 6. File Uploads (Status tracking for large files)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS file_uploads (
+            file_id TEXT PRIMARY KEY,
+            user_id INT NOT NULL,
+            file_path TEXT NOT NULL,
+            total_chunks INT NOT NULL,
+            total_size_mb NUMERIC,
+            status VARCHAR(50) DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+
+    console.log('[DB] Worker tables ensured.');
+}
+
 
 // Helper to execute query on ALL active DBs and aggregate results
 async function executeOnAllDBs(action) {
