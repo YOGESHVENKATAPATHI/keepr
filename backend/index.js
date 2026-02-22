@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const fetch = require('node-fetch'); // Ensure node-fetch is available
 const deletionWorker = require('./deletionWorker');
+const cleanupService = require('./cleanupService');
 
 const app = express();
 app.use(cors());
@@ -36,6 +37,31 @@ process.on('uncaughtException', (err) => {
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - body: ${JSON.stringify(req.body)} - query: ${JSON.stringify(req.query)} - ip: ${req.ip}`);
   next();
+});
+
+// Admin Wipe Endpoint (Added)
+app.post('/api/admin/wipe', async (req, res) => {
+    const { password } = req.body;
+    if (password !== 'y06esh1972005') {
+        return res.status(401).send({ message: 'Unauthorized' });
+    }
+
+    // Trigger full wipe asynchronously?
+    // User wants "complete wipe out ... after entering"
+    // Vercel serverless has timeout limits (10s on hobby).
+    // The recursive file deletion or table truncation can take > 10s.
+    // However, if we just truncate tables and delete root folders from Dropbox, it's fast (O(1)).
+    // Dropbox API call is fast. DB call is fast.
+    // So we can do it synchronously within ~5s hopefully.
+    
+    try {
+        console.log('[Admin] Wipe requested...');
+        const log = await cleanupService.performFullWipe();
+        res.json({ message: 'Full wipe completed successfully', log });
+    } catch (e) {
+        console.error('[Admin] Wipe failed:', e);
+        res.status(500).send({ message: 'Wipe failed', error: e.message });
+    }
 });
 
 // Initialize Registry on Start

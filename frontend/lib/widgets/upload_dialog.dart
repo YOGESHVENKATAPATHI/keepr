@@ -339,7 +339,7 @@ class _UploadDialogState extends State<UploadDialog> {
                                 style: GoogleFonts.inter(color: Colors.white70))
                           ])),
                           const SizedBox(height: 6),
-                          Text("Supported Format: Any (max 1GB)",
+                          Text("Supported Format: Any",
                               style: GoogleFonts.inter(
                                   color: Colors.white24, fontSize: 11))
                         ],
