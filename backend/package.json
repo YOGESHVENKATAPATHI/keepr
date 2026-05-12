@@ -9,17 +9,20 @@
     "full-clean": "node scripts/full_clean.js --yes"
   },
   "dependencies": {
-    "pg": "^8.11.3",
-    "express": "^4.18.2",
+    "axios": "^1.13.6",
+    "bcryptjs": "^2.4.3",
+    "body-parser": "^1.20.2",
     "cors": "^2.8.5",
-    "nodemailer": "^6.9.7",
+    "docx": "^9.5.1",
     "dotenv": "^16.3.1",
     "dropbox": "^10.34.0",
-    "body-parser": "^1.20.2",
+    "express": "^4.18.2",
     "google-auth-library": "^8.9.0",
-    "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.0",
-    "uuid": "^9.0.0",
-    "minimist": "^1.2.8"
+    "minimist": "^1.2.8",
+    "nodemailer": "^6.9.7",
+    "pdfkit": "^0.15.2",
+    "pg": "^8.11.3",
+    "uuid": "^9.0.0"
   }
 }
