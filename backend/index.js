@@ -939,7 +939,7 @@ app.post('/api/auth/request-pin-reset', async (req, res) => {
             await client.query('INSERT INTO pin_resets (user_id, reset_token, expires_at) VALUES ($1, $2, $3)', [userId, token, expiresAt]);
 
             // send email
-            const base = resetUrlBase || process.env.PIN_RESET_URL || 'http://localhost:3000/pin-reset?token=';
+            const base = resetUrlBase || process.env.PIN_RESET_URL || 'https://keepr-gold.vercel.app/pin-reset?token=';
             const sent = await auth.sendPinResetEmail(email, token, base);
             return sent;
         });
@@ -1163,16 +1163,28 @@ app.post('/api/files/upload-metadata', async (req, res) => {
                     is_folder BOOLEAN DEFAULT FALSE,
                     size_mb NUMERIC DEFAULT 0,
                     dropbox_path TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, path)
                 );
             `);
              try {
                 await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS parent_path TEXT');
-            } catch (e) { /* ignore */ }
+                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+                await workerClient.query('ALTER TABLE files DROP CONSTRAINT IF EXISTS files_user_id_path_key');
+                await workerClient.query('ALTER TABLE files ADD CONSTRAINT files_user_id_path_key UNIQUE(user_id, path)');
+            } catch (e) { /* ignore if columns/constraints already exist */ }
 
             const parentPath = getParentPath(path);
+            // UPSERT: Insert if new, Update if exists (prevents duplicates)
             await workerClient.query(
-                'INSERT INTO files (user_id, path, parent_path, name, is_folder, size_mb, dropbox_path) VALUES ($1, $2, $3, $4, false, $5, $6)',
+                `INSERT INTO files (user_id, path, parent_path, name, is_folder, size_mb, dropbox_path, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, false, $5, $6, NOW(), NOW())
+                 ON CONFLICT (user_id, path) DO UPDATE SET
+                    name = $4,
+                    size_mb = $5,
+                    dropbox_path = $6,
+                    updated_at = NOW()`,
                 [user_id, path, parentPath, name, size_mb, dropbox_path]
             );
         });
