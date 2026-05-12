@@ -11,7 +11,7 @@ const fetch = require('node-fetch'); // Ensure node-fetch is available
 const deletionWorker = require('./deletionWorker');
 const cleanupService = require('./cleanupService');
 const PDFDocument = require('pdfkit');
-const { Document, Packer, Paragraph, TextRun } = require('docx');
+const { Document, Packer, Paragraph, TextRun, Media } = require('docx');
 
 const app = express();
 app.use(cors());
@@ -156,6 +156,16 @@ async function executeWithDB(action, maxAttempts = 3) {
         } catch (e) {
             lastErr = e;
             console.warn(`DB action attempt ${attempt} failed: ${e.code || e.message}`);
+
+            // If the previous action left the session in a failed transaction state,
+            // clear it before running any migration or retry logic.
+            if (client) {
+                try {
+                    await client.query('ROLLBACK');
+                } catch (_) {
+                    // Ignore "no transaction in progress" and keep retry flow.
+                }
+            }
 
             // Handle Missing Table/Column Schema Issues (Lazy Migration)
             if (e.code === '42P01' || e.code === '42703') { // undefined_table OR undefined_column
@@ -474,18 +484,108 @@ function buildTextExport(note, assets) {
     return Buffer.from(lines.join('\n'), 'utf8');
 }
 
+function parseInlineNoteTokens(contentText) {
+    const text = String(contentText || '');
+    const regex = /!\[([^\]]*)\]\(asset:([^\s\)]+)(?:\s+"([^"]*)")?\)/g;
+    const tokens = [];
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(text)) !== null) {
+        const rawBefore = text.substring(lastIndex, match.index);
+        if (rawBefore.isNotEmpty) {
+            tokens.push({ type: 'text', value: rawBefore });
+        }
+
+        const title = match[3] || '';
+        const widthMatch = /w\s*=\s*(\d+)/i.exec(title);
+        const width = widthMatch ? parseInt(widthMatch[1], 10) : 480;
+        tokens.push({ type: 'image', name: String(match[2] || ''), width });
+        lastIndex = regex.lastIndex;
+    }
+
+    const tail = text.substring(lastIndex);
+    if (tail.isNotEmpty) {
+        tokens.push({ type: 'text', value: tail });
+    }
+
+    if (tokens.length === 0) {
+        tokens.push({ type: 'text', value: text });
+    }
+
+    return tokens;
+}
+
+function mapAssetsByName(assets) {
+    const map = new Map();
+    for (const a of (assets || [])) {
+        const key = String(a.asset_name || '');
+        if (key && !map.has(key)) map.set(key, a);
+    }
+    return map;
+}
+
+async function fetchAssetBytes(asset) {
+    if (!asset || !asset.dropbox_path || !asset.storage_shard_ref) return null;
+
+    const token = await storageManager.getAccessTokenForReference({
+        storageSource: asset.storage_source || 'storage_shards',
+        shardRef: String(asset.storage_shard_ref)
+    });
+
+    const res = await fetch('https://content.dropboxapi.com/2/files/download', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Dropbox-API-Arg': JSON.stringify({ path: asset.dropbox_path })
+        }
+    });
+    if (!res.ok) return null;
+    const arrayBuffer = await res.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+}
+
 async function buildDocxExport(note, assets) {
     const children = [
         new Paragraph({
             children: [new TextRun({ text: note.title || 'Untitled note', bold: true, size: 32 })]
         }),
-        new Paragraph({ text: '' }),
-        new Paragraph({ text: note.content_text || '' })
+        new Paragraph({ text: '' })
     ];
 
-    const doc = new Document({
-        sections: [{ children }]
-    });
+    const doc = new Document({ sections: [{ children }] });
+    const assetMap = mapAssetsByName(assets);
+    const tokens = parseInlineNoteTokens(note.content_text || '');
+
+    for (const token of tokens) {
+        if (token.type === 'text') {
+            const lines = String(token.value || '').split('\n');
+            for (const line of lines) {
+                children.push(new Paragraph({ text: line }));
+            }
+            continue;
+        }
+
+        const asset = assetMap.get(token.name);
+        if (!asset) {
+            children.push(new Paragraph({ text: `[missing image: ${token.name}]` }));
+            continue;
+        }
+
+        try {
+            const bytes = await fetchAssetBytes(asset);
+            if (!bytes) {
+                children.push(new Paragraph({ text: `[image unavailable: ${token.name}]` }));
+                continue;
+            }
+            const w = Math.max(120, Math.min(parseInt(String(token.width || 480), 10), 1200));
+            const imageRun = Media.addImage(doc, bytes, w, Math.floor(w * 0.65));
+            children.push(new Paragraph(imageRun));
+        } catch (e) {
+            console.warn('Skipping inline DOCX image:', token.name, e.message);
+            children.push(new Paragraph({ text: `[image error: ${token.name}]` }));
+        }
+    }
 
     return Packer.toBuffer(doc);
 }
@@ -501,9 +601,49 @@ function buildPdfExport(note, assets) {
 
             doc.fontSize(18).text(note.title || 'Untitled note');
             doc.moveDown();
-            doc.fontSize(12).text(note.content_text || '');
-            doc.moveDown();
-            doc.end();
+
+            (async () => {
+                try {
+                    const assetMap = mapAssetsByName(assets);
+                    const tokens = parseInlineNoteTokens(note.content_text || '');
+
+                    for (const token of tokens) {
+                        if (token.type === 'text') {
+                            doc.fontSize(12).text(String(token.value || ''));
+                            continue;
+                        }
+
+                        const asset = assetMap.get(token.name);
+                        if (!asset) {
+                            doc.fillColor('red').fontSize(10).text(`[missing image: ${token.name}]`).fillColor('black');
+                            continue;
+                        }
+
+                        try {
+                            const bytes = await fetchAssetBytes(asset);
+                            if (!bytes) {
+                                doc.fillColor('red').fontSize(10).text(`[image unavailable: ${token.name}]`).fillColor('black');
+                                continue;
+                            }
+
+                            const w = Math.max(120, Math.min(parseInt(String(token.width || 480), 10), 1200));
+                            const maxPdfWidth = Math.max(120, doc.page.width - doc.page.margins.left - doc.page.margins.right);
+                            const finalWidth = Math.min(w, maxPdfWidth);
+
+                            doc.moveDown(0.5);
+                            doc.image(bytes, { fit: [finalWidth, 600], align: 'left' });
+                            doc.moveDown(0.5);
+                        } catch (e) {
+                            console.warn('Skipping inline PDF image:', token.name, e.message);
+                            doc.fillColor('red').fontSize(10).text(`[image error: ${token.name}]`).fillColor('black');
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Error while building PDF export:', e.message);
+                } finally {
+                    doc.end();
+                }
+            })();
         } catch (e) {
             reject(e);
         }
@@ -2250,35 +2390,45 @@ app.delete('/api/notes/:id/assets/:assetId', verifyAuthToken, requireProvisioned
 
     try {
         const deleted = await executeWithDB(async (client) => {
-            const resA = await client.query('SELECT dropbox_path, storage_shard_ref FROM note_assets WHERE id = $1 AND note_id = $2 AND user_id = $3', [assetId, id, req.user.id]);
+            const resA = await client.query(
+                'SELECT dropbox_path, storage_shard_ref, storage_source FROM note_assets WHERE id = $1 AND note_id = $2 AND user_id = $3',
+                [assetId, id, req.user.id]
+            );
             if (resA.rows.length === 0) return false;
             
             const asset = resA.rows[0];
 
             await client.query('BEGIN');
-            await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
+            try {
+                await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
 
-            // Deletion Worker queues paths to delete. But Note Assets have storage_shard_ref, not internal shard_id integer.
-            // Wait, storage_shards has internal id. We can look it up.
-            if (asset.storage_shard_ref && asset.dropbox_path) {
-                const s = await client.query('SELECT id FROM storage_shards WHERE id_ref = $1', [asset.storage_shard_ref]);
-                if (s.rows.length > 0) {
-                     const shard_id = s.rows[0].id;
-                     await client.query(`
-                         CREATE TABLE IF NOT EXISTS deletion_queue (
-                             id SERIAL PRIMARY KEY,
-                             shard_id INT NOT NULL,
-                             paths TEXT[] NOT NULL,
-                             status TEXT DEFAULT 'pending',
-                             retries INT DEFAULT 0,
-                             created_at TIMESTAMP DEFAULT NOW()
-                         )
-                     `);
-                     await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shard_id, [asset.dropbox_path]]);
+                // Queue physical deletion only for primary shard-backed assets.
+                // Worker DBs may not have a storage_shards registry table, so use
+                // storage_shard_ref directly if it is a numeric shard id.
+                const source = String(asset.storage_source || 'storage_shards');
+                if (source === 'storage_shards' && asset.storage_shard_ref && asset.dropbox_path) {
+                    const shardId = parseInt(String(asset.storage_shard_ref), 10);
+                    if (!Number.isNaN(shardId)) {
+                        await client.query(`
+                            CREATE TABLE IF NOT EXISTS deletion_queue (
+                                id SERIAL PRIMARY KEY,
+                                shard_id INT NOT NULL,
+                                paths TEXT[] NOT NULL,
+                                status TEXT DEFAULT 'pending',
+                                retries INT DEFAULT 0,
+                                created_at TIMESTAMP DEFAULT NOW()
+                            )
+                        `);
+                        await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shardId, [asset.dropbox_path]]);
+                    }
                 }
+
+                await client.query('COMMIT');
+                return true;
+            } catch (txErr) {
+                try { await client.query('ROLLBACK'); } catch (_) {}
+                throw txErr;
             }
-            await client.query('COMMIT');
-            return true;
         });
 
         if (!deleted) return res.status(404).send({ message: 'Asset not found' });
@@ -2307,7 +2457,7 @@ app.post('/api/notes/:id/export', verifyAuthToken, requireProvisionedUser, async
             if (noteRes.rows.length === 0) return null;
 
             const assetsRes = await client.query(
-                'SELECT asset_name, mime_type FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
+                'SELECT asset_name, mime_type, dropbox_path, storage_source, storage_shard_ref FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
                 [id, req.user.id]
             );
 
