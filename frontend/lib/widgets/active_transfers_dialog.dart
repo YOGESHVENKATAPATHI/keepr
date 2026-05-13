@@ -1,8 +1,11 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:google_fonts/google_fonts.dart';
+
+import '../services/desktop_transfer_manager.dart';
 
 class ActiveTransfersDialog extends StatefulWidget {
   final List<Map<String, dynamic>> initialTasks;
@@ -27,10 +30,73 @@ class _ActiveTransfersDialogState extends State<ActiveTransfersDialog> {
       for (final task in widget.initialTasks)
         task['taskId'].toString(): Map<String, dynamic>.from(task)
     };
+    
+    // Add existing desktop tasks if applicable
+     if (!kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.windows ||
+            defaultTargetPlatform == TargetPlatform.linux ||
+            defaultTargetPlatform == TargetPlatform.macOS)) {
+      final desktopTasks = DesktopTransferManager().activeTasks;
+      for (final task in desktopTasks) {
+        _tasks[task.taskId] = {
+           'taskId': task.taskId,
+           'name': task.name,
+           'type': task.type,
+           'progress': (task.progress * 100).toInt(),
+           'status': task.status,
+           'backendUrl': task.backendUrl, // Needed?
+        };
+      }
+    }
+
     _attachProgressListener();
   }
 
   void _attachProgressListener() async {
+    if (!kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.windows ||
+            defaultTargetPlatform == TargetPlatform.linux ||
+            defaultTargetPlatform == TargetPlatform.macOS)) {
+      // Desktop Listener
+      _progressSub = DesktopTransferManager().onProgress.listen((event) {
+        if (!mounted) return;
+        final taskId = event['taskId']?.toString();
+        if (taskId == null) return;
+        
+        // Ensure task is in the map (it might be new)
+        if (!_tasks.containsKey(taskId)) {
+           _tasks[taskId] = {
+              'taskId': taskId,
+              'name': event['name'],
+              'type': event['type'],
+              'status': event['status'],
+              'progress': ((event['progress'] as double) * 100).toInt(),
+           };
+        }
+        
+        final existing = _tasks[taskId]!;
+        final status = event['status']?.toString();
+        if (status != null) existing['status'] = status;
+        
+        final progress = event['progress'];
+        if (progress is num) {
+          existing['progress'] = (progress * 100).toInt().clamp(0, 100);
+        }
+
+        if (status == 'completed' || status == 'failed' || status == 'cancelled') {
+           Future.delayed(const Duration(milliseconds: 700), () {
+             if (!mounted) return;
+             setState(() {
+               _tasks.remove(taskId);
+             });
+           });
+        }
+        setState(() {});
+      });
+      return;
+    }
+
+    // Mobile / Background Service Listener
     final service = FlutterBackgroundService();
     if (!await service.isRunning()) return;
 
@@ -73,6 +139,23 @@ class _ActiveTransfersDialogState extends State<ActiveTransfersDialog> {
   }
 
   void _sendAction(Map<String, dynamic> task, String actionId) {
+    if (!kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.windows ||
+            defaultTargetPlatform == TargetPlatform.linux ||
+            defaultTargetPlatform == TargetPlatform.macOS)) {
+      final taskId = task['taskId']?.toString();
+      if (taskId == null) return;
+      
+      if (actionId == 'pause_action') {
+         DesktopTransferManager().pauseTask(taskId);
+      } else if (actionId == 'resume_action') {
+         DesktopTransferManager().resumeTask(taskId);
+      } else if (actionId == 'cancel_action') {
+         DesktopTransferManager().cancelTask(taskId);
+      }
+      return;
+    }
+
     final service = FlutterBackgroundService();
     service.invoke('notification_action', {
       'actionId': actionId,

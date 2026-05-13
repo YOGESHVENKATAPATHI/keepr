@@ -41,7 +41,7 @@ class _LoginScreenState extends State<LoginScreen> {
       'email',
       'openid'
     ], // avoid 'profile' to prevent People API usage on web
-    clientId: kGoogleClientId.isNotEmpty ? kGoogleClientId : null,
+    serverClientId: kGoogleClientId.isNotEmpty ? kGoogleClientId : null,
   );
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
 

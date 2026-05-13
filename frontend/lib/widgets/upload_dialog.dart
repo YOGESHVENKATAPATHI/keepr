@@ -10,6 +10,7 @@ import 'dart:io' as io;
 import '../services/folder_upload_service.dart';
 import '../services/background_upload_service.dart';
 import '../services/notification_service.dart';
+import '../services/desktop_transfer_manager.dart';
 
 class UploadDialog extends StatefulWidget {
   final FolderUploadService uploader;
@@ -54,6 +55,51 @@ class _UploadDialogState extends State<UploadDialog> {
   }
 
   void _initBackgroundListener() async {
+    if (!kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.windows ||
+            defaultTargetPlatform == TargetPlatform.linux ||
+            defaultTargetPlatform == TargetPlatform.macOS)) {
+      DesktopTransferManager().onProgress.listen((event) {
+        if (!mounted) return;
+        final taskId = event['taskId'];
+        if (taskId == null) return;
+        
+        try {
+          final task = _tasks.firstWhere((t) => t.id == taskId);
+          final status = event['status'];
+           setState(() {
+            if (status == 'running') {
+              task.progress = (event['progress'] as num).toDouble();
+              task.isPaused = false;
+            } else if (status == 'paused') {
+              task.isPaused = true;
+            } else if (status == 'completed') {
+              task.progress = 1.0;
+              task.isCompleted = true;
+              task.isPaused = false;
+            } else if (status == 'failed') {
+              task.isFailed = true;
+              task.errorMessage = event['error'];
+              task.isPaused = false;
+            } else if (status == 'cancelled') {
+              task.isFailed = true;
+              task.errorMessage = 'Cancelled';
+              task.isPaused = false;
+            }
+          });
+          
+           if (_tasks.isNotEmpty &&
+            _tasks.every((t) => t.isCompleted || t.isFailed)) {
+            // All visible tasks done
+            widget.onUploadComplete();
+          }
+        } catch (e) {
+          // Task not managed by this dialog (or finished)
+        }
+      });
+      return;
+    }
+
     final service = FlutterBackgroundService();
     if (await service.isRunning()) {
       service.on('progress').listen((event) {
@@ -107,8 +153,8 @@ class _UploadDialogState extends State<UploadDialog> {
     try {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: true,
-        withData: false, // Required for large files to avoid OOM
-        withReadStream: true, // Required for streaming chunks
+        withData: kIsWeb, // On Web, readStream can yield padded/incorrect bytes due to JS ArrayBuffer views. Use withData.
+        withReadStream: !kIsWeb, // On Desktop/Mobile, use stream to avoid OOM for large files.
       );
 
       if (result != null) {
@@ -167,11 +213,6 @@ class _UploadDialogState extends State<UploadDialog> {
             // Upload them in foreground using stream-based upload.
             await _startUploads(foregroundTasks, notifyWhenDone: false);
           }
-
-          if (newTasks.isNotEmpty &&
-              newTasks.every((t) => t.isCompleted || t.isFailed)) {
-            widget.onUploadComplete();
-          }
         } else {
           // Web and Desktop (Windows/Linux/MacOS) - Foreground Upload
           // Desktop apps run continuously so simple async is fine
@@ -179,15 +220,19 @@ class _UploadDialogState extends State<UploadDialog> {
         }
       }
     } finally {
-      if (mounted) setState(() => _isPicking = false);
+      if (mounted) {
+        setState(() {
+          _isPicking = false;
+        });
+      }
     }
   }
 
   Future<void> _startUploads(List<_UploadTask> newTasks,
       {bool notifyWhenDone = true}) async {
-    for (final task in newTasks) {
-      await _processTask(task);
-    }
+    // Parallel execution
+    await Future.wait(newTasks.map((task) => _processTask(task)));
+
     if (notifyWhenDone) {
       widget.onUploadComplete();
     }
@@ -205,34 +250,51 @@ class _UploadDialogState extends State<UploadDialog> {
             });
           }
         });
+        
+        if (mounted) {
+            setState(() {
+              task.progress = 1.0;
+              task.isCompleted = true;
+            });
+        }
       } else {
-        // Desktop (Windows/Linux/MacOS) - Use optimized chunked upload
-        final file = io.File(task.file.path!);
-        final size = await file.length();
-
-        await widget.uploader.uploadFileFromPath(
-          path: task.file.path!,
-          name: task.file.name,
-          size: size,
-          userId: widget.userId,
-          logicalPath: "${widget.currentPath}/${task.file.name}",
-          onProgress: (prog) {
-            if (mounted) {
-              setState(() {
-                task.progress = prog;
-              });
-            }
-          },
-          // Handle cancellation logic if needed
-          // isCancelled: () => false,
-        );
-      }
-
-      if (mounted) {
-        setState(() {
-          task.progress = 1.0;
-          task.isCompleted = true;
-        });
+        // Desktop (Windows/Linux/MacOS) - Use optimized chunked upload via DesktopTransferManager
+        if (!kIsWeb && (defaultTargetPlatform == TargetPlatform.windows || defaultTargetPlatform == TargetPlatform.linux || defaultTargetPlatform == TargetPlatform.macOS)) {
+            await DesktopTransferManager().startUpload(
+             taskId: task.id,
+             filePath: task.file.path!,
+             name: task.file.name,
+             userId: widget.userId,
+             logicalPath: "${widget.currentPath}/${task.file.name}",
+             backendUrl: widget.uploader.backendUrl,
+             uploader: widget.uploader,
+           );
+           // Progress and state updates handled by _initBackgroundListener
+        } else {
+            // Fallback for non-supported platforms (shouldn't be reached given checks)
+            final file = io.File(task.file.path!);
+            final size = await file.length();
+            await widget.uploader.uploadFileFromPath(
+              path: task.file.path!,
+              name: task.file.name,
+              size: size,
+              userId: widget.userId,
+              logicalPath: "${widget.currentPath}/${task.file.name}",
+               onProgress: (prog) {
+                if (mounted) {
+                  setState(() {
+                    task.progress = prog;
+                  });
+                }
+              },
+            );
+             if (mounted) {
+                setState(() {
+                  task.progress = 1.0;
+                  task.isCompleted = true;
+                });
+             }
+        }
       }
     } catch (e, st) {
       print('[UploadDialog] Upload task failed for ${task.file.name}: $e');
@@ -451,7 +513,7 @@ class _UploadDialogState extends State<UploadDialog> {
                 const Icon(Icons.check, color: Color(0xFF10B981), size: 18)
               else if (task.isFailed)
                 const Icon(Icons.error, color: Colors.redAccent, size: 18)
-              else
+              else if (!kIsWeb)
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -459,6 +521,7 @@ class _UploadDialogState extends State<UploadDialog> {
                       icon: Icon(task.isPaused ? Icons.play_arrow : Icons.pause,
                           color: Colors.white70, size: 20),
                       onPressed: () {
+                        if (kIsWeb) return; // Unsupported on Web
                         final service = FlutterBackgroundService();
                         service.invoke('notification_action', {
                           'actionId':
@@ -474,6 +537,7 @@ class _UploadDialogState extends State<UploadDialog> {
                       icon: const Icon(Icons.close,
                           color: Colors.white70, size: 20),
                       onPressed: () {
+                        if (kIsWeb) return; // Unsupported on Web
                         final service = FlutterBackgroundService();
                         service.invoke('notification_action', {
                           'actionId': 'cancel_action',

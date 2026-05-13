@@ -53,19 +53,40 @@ class KeeprApp extends StatelessWidget {
         backendUrl: const String.fromEnvironment('BACKEND_BASE',
             defaultValue: 'https://keepr-gold.vercel.app'));
 
-    // If we found an email in local storage, ensure auth token exists as well (read fallback)
     if (email != null) {
       // Ensure auth_token presence
       try {
         final token = await storage.read(key: 'auth_token') ??
             await getLocalStorageValue('auth_token');
         if (token == null) {
-          // If token missing, don't treat as an active session (clear user email fallback)
+          // If token missing, don't treat as an active session
           await removeLocalStorageValue('user_email');
           email = null;
+        } else {
+          // Token exists, verify it with the backend
+          final profileResp = await api.getProfile(token);
+          if (profileResp != null) {
+            final hasPin = profileResp['profile'] != null &&
+                profileResp['profile']['has_pin'] == true;
+
+            // If the account has a PIN, always require it before entering the app.
+            if (hasPin) {
+              return PinEntryScreen(api: api, uploader: uploader);
+            }
+
+            // No PIN configured yet, allow direct access.
+            return FileManagerScreen(userId: email, api: api, uploader: uploader);
+          } else {
+            // Token invalid or expired
+            await storage.delete(key: 'auth_token');
+            await storage.delete(key: 'user_email');
+            await removeLocalStorageValue('auth_token');
+            await removeLocalStorageValue('user_email');
+            email = null;
+          }
         }
       } catch (e) {
-        // ignore
+        // Network error - fallback to PIN entry which will also likely fail or show network error
       }
     }
 

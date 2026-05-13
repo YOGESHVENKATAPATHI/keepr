@@ -21,9 +21,13 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:uuid/uuid.dart';
+import 'package:path/path.dart' as p;
 
 import '../services/notification_service.dart';
 import '../services/background_upload_service.dart';
+import 'saved_messages_screen.dart';
+import 'notes_editor_screen.dart';
+import 'set_pin_screen.dart';
 
 class FileManagerScreen extends StatefulWidget {
   final String userId;
@@ -54,12 +58,17 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
 
   StreamSubscription? _notificationSubscription;
 
+  double _totalAllocatedBytes = 0;
+  double _totalUsedBytes = 0;
+  bool _loadingStorage = true;
+
   @override
   void initState() {
     super.initState();
     _downloadProgressController = StreamController<double>.broadcast();
     _refresh();
     _startActiveTaskPolling();
+    _loadStorageStats();
 
     _searchController.addListener(() {
       if (!mounted) return;
@@ -90,6 +99,32 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _openActiveTransfersDialog();
       });
+    }
+  }
+
+  Future<void> _loadStorageStats() async {
+    setState(() => _loadingStorage = true);
+    try {
+      final secureStorage = const FlutterSecureStorage();
+      final token = await secureStorage.read(key: 'auth_token');
+      if (token != null) {
+        final res = await widget.api.getStorageStats(token);
+        if (res['ok'] == true && res['stats'] != null) {
+          if (mounted) {
+            setState(() {
+              _totalUsedBytes = (res['stats']['usedBytes'] ?? 0).toDouble();
+              _totalAllocatedBytes = (res['stats']['allocatedBytes'] ?? 0).toDouble();
+              _loadingStorage = false;
+            });
+          }
+          return;
+        }
+      }
+    } catch (e) {
+      print('Failed to load storage stats: $e');
+    }
+    if (mounted) {
+      setState(() => _loadingStorage = false);
     }
   }
 
@@ -443,16 +478,168 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
 
   Future<void> _downloadFolder(String path) async {
     try {
-      _showSnack('Zipping and downloading folder...');
-      final url = widget.uploader.getFolderDownloadUrl(path, widget.userId);
-      if (await canLaunchUrl(Uri.parse(url))) {
-        await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
-      } else {
-        throw Exception("Could not launch url");
+      if (kIsWeb) {
+        _showSnack('Preparing folder download...');
+        final url = widget.uploader.getFolderDownloadUrl(path, widget.userId);
+        if (await canLaunchUrl(Uri.parse(url))) {
+          await launchUrl(Uri.parse(url));
+          return;
+        }
+        throw Exception('Could not launch url');
       }
+
+      // Android/Windows/Desktop: avoid external browser zip endpoint and
+      // download folder contents directly from metadata.
+      if (Platform.isAndroid) {
+        var status = await Permission.manageExternalStorage.status;
+        if (!status.isGranted) {
+          await Permission.manageExternalStorage.request();
+        }
+        if (await Permission.storage.isDenied) {
+          await Permission.storage.request();
+        }
+      }
+
+      final secureStorage = const FlutterSecureStorage();
+      final isMobile = defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS;
+
+      String? baseDirectory;
+      if (isMobile) {
+        baseDirectory = await secureStorage.read(key: 'download_path');
+      }
+      baseDirectory ??= await FilePicker.platform.getDirectoryPath();
+      if (baseDirectory == null || baseDirectory.isEmpty) {
+        _showSnack('Download cancelled');
+        return;
+      }
+
+      final files = await _collectFolderFiles(path);
+      if (files.isEmpty) {
+        _showSnack('No files found in this folder');
+        return;
+      }
+
+      final folderName =
+          (path == '/' ? 'root' : path.split('/').where((s) => s.isNotEmpty).last);
+      final targetRoot = Directory(p.join(baseDirectory, folderName));
+      await targetRoot.create(recursive: true);
+
+      double progress = 0;
+      String currentFile = '';
+      void Function(void Function())? updateDialog;
+
+      if (mounted) {
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => StatefulBuilder(
+            builder: (dialogContext, setDialogState) {
+              updateDialog = setDialogState;
+              return AlertDialog(
+                backgroundColor: KeeprTheme.surface,
+                title: Text('Downloading folder...',
+                    style: GoogleFonts.inter(color: Colors.white)),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    LinearProgressIndicator(
+                      value: progress,
+                      backgroundColor: Colors.white10,
+                      color: KeeprTheme.primary,
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      '${(progress * 100).toStringAsFixed(1)}%',
+                      style: GoogleFonts.inter(color: Colors.white70),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      currentFile,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.inter(color: Colors.white54),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      }
+
+      for (int i = 0; i < files.length; i++) {
+        final item = files[i];
+        final itemPath = (item['path'] ?? '').toString();
+        final relative = _relativePathWithinFolder(path, itemPath);
+        currentFile = relative;
+        updateDialog?.call(() {});
+
+        final target = File(p.join(targetRoot.path, relative));
+        await target.parent.create(recursive: true);
+
+        final dropboxPath = (item['dropbox_path'] ?? item['path']).toString();
+        final isDistributed =
+            (dropboxPath == 'distributed' && item['file_id_ref'] != null);
+
+        if (isDistributed) {
+          final sizeMb =
+              double.tryParse(item['size_mb']?.toString() ?? '0') ?? 0;
+          final bytes = await widget.uploader
+              .downloadDistributedFile(item['file_id_ref'], sizeMb);
+          await target.writeAsBytes(bytes, flush: true);
+        } else {
+          await widget.uploader.downloadFileToPath(dropboxPath, target);
+        }
+
+        progress = (i + 1) / files.length;
+        updateDialog?.call(() {});
+      }
+
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+      _showSnack('Folder downloaded to ${targetRoot.path}');
     } catch (e) {
+      if (mounted && Navigator.of(context, rootNavigator: true).canPop()) {
+        Navigator.of(context, rootNavigator: true).pop();
+      }
       _showSnack('Download failed: $e', isError: true);
     }
+  }
+
+  Future<List<Map<String, dynamic>>> _collectFolderFiles(String folderPath) async {
+    final results = <Map<String, dynamic>>[];
+    final queue = <String>[folderPath];
+
+    while (queue.isNotEmpty) {
+      final current = queue.removeLast();
+      final res = await widget.api.listFiles(widget.userId, path: current);
+      final rawItems = (res['items'] as List?) ?? const [];
+
+      for (final raw in rawItems) {
+        final item = Map<String, dynamic>.from(raw as Map);
+        if (item['is_folder'] == true) {
+          final nextPath = (item['path'] ?? '').toString();
+          if (nextPath.isNotEmpty) queue.add(nextPath);
+        } else {
+          results.add(item);
+        }
+      }
+    }
+
+    return results;
+  }
+
+  String _relativePathWithinFolder(String root, String fullPath) {
+    if (root == '/') {
+      return fullPath.replaceFirst(RegExp(r'^/+'), '');
+    }
+
+    final normalizedRoot = root.endsWith('/') ? root.substring(0, root.length - 1) : root;
+    if (fullPath.startsWith('$normalizedRoot/')) {
+      return fullPath.substring(normalizedRoot.length + 1);
+    }
+    return fullPath.split('/').where((s) => s.isNotEmpty).last;
   }
 
   void _navigateUp() {
@@ -747,6 +934,31 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
           _openActiveTransfersDialog(type: 'upload');
         } else if (value == 'bg_downloads') {
           _openActiveTransfersDialog(type: 'download');
+        } else if (value == 'saved_messages') {
+          Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => SavedMessagesScreen(api: widget.api)));
+        } else if (value == 'notes_studio') {
+          Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => NotesEditorScreen(api: widget.api)));
+        } else if (value == 'reset_pin') {
+          final storage = const FlutterSecureStorage();
+          storage.read(key: 'auth_token').then((token) {
+            if (token != null) {
+              Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => SetPinScreen(
+                            api: widget.api,
+                            token: token,
+                            userEmail: widget.userId,
+                            uploader: widget.uploader,
+                          )));
+            }
+          });
         }
       },
       itemBuilder: (context) => [
@@ -756,6 +968,14 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
             const Icon(Icons.refresh_rounded, color: Colors.white, size: 18),
             const SizedBox(width: 10),
             Text('Refresh', style: GoogleFonts.inter(color: Colors.white)),
+          ]),
+        ),
+        PopupMenuItem(
+          value: 'reset_pin',
+          child: Row(children: [
+            const Icon(Icons.lock_reset, color: Colors.white, size: 18),
+            const SizedBox(width: 10),
+            Text('Reset PIN', style: GoogleFonts.inter(color: Colors.white)),
           ]),
         ),
         const PopupMenuDivider(height: 1),
@@ -784,6 +1004,27 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                 color: Color(0xFFF59E0B), size: 18),
             const SizedBox(width: 10),
             Text('Create Folder',
+                style: GoogleFonts.inter(color: Colors.white)),
+          ]),
+        ),
+        const PopupMenuDivider(height: 1),
+        PopupMenuItem(
+          value: 'saved_messages',
+          child: Row(children: [
+            const Icon(Icons.bookmark_add_outlined,
+                color: Color(0xFF22D3EE), size: 18),
+            const SizedBox(width: 10),
+            Text('Saved Messages',
+                style: GoogleFonts.inter(color: Colors.white)),
+          ]),
+        ),
+        PopupMenuItem(
+          value: 'notes_studio',
+          child: Row(children: [
+            const Icon(Icons.edit_note_rounded,
+                color: Color(0xFFA78BFA), size: 18),
+            const SizedBox(width: 10),
+            Text('Notes Studio',
                 style: GoogleFonts.inter(color: Colors.white)),
           ]),
         ),
@@ -1115,7 +1356,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
                             color: Colors.white54,
                             fontWeight: FontWeight.bold)),
                   ),
-                  if (!kIsWeb) ...[
+                  if (!kIsWeb && !Platform.isWindows) ...[
                     const SizedBox(width: 8),
                     TextButton(
                       onPressed: () => _confirmDelete(it),
@@ -1199,6 +1440,173 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
     }
   }
 
+  Widget _buildStorageOverview() {
+    final size = MediaQuery.of(context).size;
+    final isCompact = size.width < 420;
+
+    if (_loadingStorage) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        child: Container(
+          height: 100,
+          decoration: BoxDecoration(
+            color: Colors.white.withAlpha((0.03 * 255).round()),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.white.withAlpha((0.05 * 255).round())),
+          ),
+          child: const Center(child: CircularProgressIndicator(color: Colors.white24, strokeWidth: 2)),
+        ),
+      );
+    }
+
+    // Format bytes to GB
+    final double usedGb = _totalUsedBytes / (1024 * 1024 * 1024);
+    final double totalGb = _totalAllocatedBytes / (1024 * 1024 * 1024);
+    final double progress = totalGb > 0 ? (usedGb / totalGb).clamp(0.0, 1.0) : 0;
+    
+    // Determine healthy/warning/critical color
+    Color statusColor = const Color(0xFF34D399); // Green
+    if (progress > 0.9) {
+      statusColor = const Color(0xFFEF4444); // Red
+    } else if (progress > 0.7) {
+      statusColor = const Color(0xFFF59E0B); // Orange
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+      child: GlassmorphicContainer(
+        width: double.infinity,
+        height: 100,
+        borderRadius: 16,
+        blur: 10,
+        alignment: Alignment.center,
+        border: 1,
+        linearGradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.white.withAlpha((0.08 * 255).round()),
+            Colors.white.withAlpha((0.02 * 255).round()),
+          ],
+        ),
+        borderGradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.white.withAlpha((0.2 * 255).round()),
+            Colors.white.withAlpha((0.05 * 255).round()),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Row(
+            children: [
+              // Icon
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: statusColor.withAlpha((0.2 * 255).round()),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(Icons.cloud_outlined, color: statusColor, size: 28),
+              ),
+              const SizedBox(width: 16),
+              
+              // Text & Progress
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (isCompact)
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'CLUSTER STORAGE',
+                            style: GoogleFonts.inter(
+                              color: Colors.white70,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 11,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '${usedGb.toStringAsFixed(2)} GB / ${totalGb.toStringAsFixed(2)} GB',
+                            style: GoogleFonts.chivoMono(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      )
+                    else
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            'CLUSTER STORAGE',
+                            style: GoogleFonts.inter(
+                              color: Colors.white70,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 12,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                          Text(
+                            '${usedGb.toStringAsFixed(2)} GB / ${totalGb.toStringAsFixed(2)} GB',
+                            style: GoogleFonts.chivoMono(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ],
+                      ),
+                    const SizedBox(height: 10),
+                    // Progress Bar
+                    Container(
+                      height: 6,
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withAlpha((0.1 * 255).round()),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                      child: FractionallySizedBox(
+                        alignment: Alignment.centerLeft,
+                        widthFactor: progress,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                statusColor.withAlpha((0.6 * 255).round()),
+                                statusColor,
+                              ],
+                            ),
+                            borderRadius: BorderRadius.circular(3),
+                            boxShadow: [
+                              BoxShadow(
+                                color: statusColor.withAlpha((0.5 * 255).round()),
+                                blurRadius: 6,
+                                spreadRadius: 1,
+                              )
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1207,6 +1615,7 @@ class _FileManagerScreenState extends State<FileManagerScreen> {
         child: Column(
           children: [
             _buildTopBar(),
+            if (currentPath == '/') _buildStorageOverview(),
             _buildBreadcrumbs(),
             if (loading)
               const LinearProgressIndicator(

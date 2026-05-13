@@ -177,6 +177,20 @@ class _SetPinScreenState extends State<SetPinScreen> {
                               fontWeight: FontWeight.bold,
                               fontSize: 16)),
                 ),
+              ),
+              const SizedBox(height: 12),
+              TextButton(
+                onPressed: () {
+                  Navigator.of(context).pushReplacement(MaterialPageRoute(
+                      builder: (_) => FileManagerScreen(
+                          userId: widget.userEmail,
+                          api: widget.api,
+                          uploader: widget.uploader ??
+                              FolderUploadService(
+                                  backendUrl: 'https://keepr-gold.vercel.app'))));
+                },
+                child: const Text('Skip for now',
+                    style: TextStyle(color: Colors.white70)),
               )
             ],
           ),

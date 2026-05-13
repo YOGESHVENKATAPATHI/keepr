@@ -9,6 +9,7 @@ import 'dart:io' as io;
 import '../services/folder_upload_service.dart';
 import '../services/background_upload_service.dart';
 import '../services/notification_service.dart';
+import '../services/desktop_transfer_manager.dart';
 
 class DownloadDialog extends StatefulWidget {
   final FolderUploadService uploader;
@@ -62,6 +63,50 @@ class _DownloadDialogState extends State<DownloadDialog> {
   }
 
   void _initBackgroundListener() async {
+    if (!kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.windows ||
+            defaultTargetPlatform == TargetPlatform.linux ||
+            defaultTargetPlatform == TargetPlatform.macOS)) {
+      DesktopTransferManager().onProgress.listen((event) {
+        if (!mounted) return;
+        final taskId = event['taskId'];
+        if (taskId == null) return;
+
+        try {
+          final task = _tasks.firstWhere((t) => t.id == taskId);
+          final status = event['status'];
+           setState(() {
+            if (status == 'running') {
+              task.progress = (event['progress'] as num).toDouble();
+              task.isPaused = false;
+            } else if (status == 'paused') {
+              task.isPaused = true;
+            } else if (status == 'completed') {
+              task.progress = 1.0;
+              task.isCompleted = true;
+              task.isPaused = false;
+            } else if (status == 'failed') {
+              task.isFailed = true;
+              task.errorMessage = event['error'];
+              task.isPaused = false;
+            } else if (status == 'cancelled') {
+              task.isFailed = true;
+              task.errorMessage = 'Cancelled';
+              task.isPaused = false;
+            }
+          });
+
+          if (_tasks.isNotEmpty &&
+              _tasks.every((t) => t.isCompleted || t.isFailed)) {
+            widget.onDownloadComplete();
+          }
+        } catch (e) {
+          // Task not found
+        }
+      });
+      return;
+    }
+
     final service = FlutterBackgroundService();
     if (await service.isRunning()) {
       service.on('progress').listen((event) {
@@ -174,27 +219,42 @@ class _DownloadDialogState extends State<DownloadDialog> {
   }
 
   Future<void> _startForegroundDownloads(List<_DownloadTask> newTasks) async {
-    for (final task in newTasks) {
-      await _processTask(task);
-    }
+    await Future.wait(newTasks.map((task) => _processTask(task)));
     widget.onDownloadComplete();
   }
 
   Future<void> _processTask(_DownloadTask task) async {
     try {
-      final file = io.File(task.targetPath);
-      await widget.uploader.downloadDistributedFileToFile(
-        task.fileIdRef,
-        task.sizeMb,
-        file,
-        onProgress: (prog) {
-          if (mounted) {
-            setState(() {
-              task.progress = prog;
-            });
-          }
-        },
-      );
+      if (!kIsWeb &&
+          (defaultTargetPlatform == TargetPlatform.windows ||
+              defaultTargetPlatform == TargetPlatform.linux ||
+              defaultTargetPlatform == TargetPlatform.macOS)) {
+          await DesktopTransferManager().startDownload(
+            taskId: task.id,
+            fileIdRef: task.fileIdRef,
+            name: task.name,
+            sizeMb: task.sizeMb,
+            targetPath: task.targetPath,
+            userId: widget.userId,
+            backendUrl: widget.uploader.backendUrl,
+            uploader: widget.uploader,
+          );
+      } else {
+          final file = io.File(task.targetPath);
+          await widget.uploader.downloadDistributedFileToFile(
+            task.fileIdRef,
+            task.sizeMb,
+            file,
+            onProgress: (prog) {
+              if (mounted) {
+                setState(() {
+                  task.progress = prog;
+                });
+              }
+            },
+          );
+      }
+      
       if (mounted) {
         setState(() {
           task.progress = 1.0;

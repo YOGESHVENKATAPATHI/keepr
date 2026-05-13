@@ -1481,6 +1481,8 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
     if (msg == 'resume') isPaused = false;
   });
 
+  final client = http.Client();
+
   try {
     // Stats
     int expectedBytes = (totalSizeMb * 1024 * 1024).round();
@@ -1511,6 +1513,10 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
       if (now - lastEmitTime < 200) return; // Throttle
       lastEmitTime = now;
 
+      // Check cancel/pause in the progress loop infrequently if needed, 
+      // but primarily we check in the stream loop.
+      if (isCancelled) return; 
+
       double p = 0;
       if (expectedBytes > 0) p = totalBytesReceived / expectedBytes;
       if (p > 1.0) p = 1.0;
@@ -1539,7 +1545,7 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
       }
     }
 
-    final client = http.Client();
+      final client = http.Client();
 
     try {
       Future<void> fetchAndStore(int index, String path, String token) async {
@@ -1565,20 +1571,24 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
           try {
             final req = http.Request('POST', Uri.parse(url));
             req.headers.addAll(headers);
+            // This client.send might hang if we don't abort it properly, but client.close() does it.
+            // On cancel, we should abort. But client.send() returns a response stream.
+            
             final resp = await client.send(req);
             if (resp.statusCode != 200)
               throw Exception("Status: ${resp.statusCode}");
 
             final sink = partFile.openWrite();
             await for (final chunk in resp.stream) {
+              // Re-check cancellation before processing chunk
               if (isCancelled) {
                 await sink.close();
                 throw Exception("Cancelled");
               }
               while (isPaused) {
                 if (isCancelled) {
-                  await sink.close();
-                  throw Exception("Cancelled");
+                   await sink.close();
+                   throw Exception("Cancelled");
                 }
                 await Future.delayed(Duration(milliseconds: 500));
               }
@@ -1594,7 +1604,10 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
           } catch (e) {
             totalBytesReceived -= bytesReceivedForThisPart;
             emitProgress();
-            if (e.toString().contains("Cancelled")) rethrow;
+            if (e.toString().contains("Cancelled") || isCancelled) {
+               // Rethrow to stop
+               throw Exception("Cancelled"); 
+            }
             if (attempts >= 3) rethrow;
             await Future.delayed(Duration(seconds: attempts));
           }
@@ -1602,21 +1615,24 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
       }
 
       // Execution Loop (Batch of 3)
-      int i = 0;
-      while (i < sortedUnique.length) {
+      for (int i = 0; i < sortedUnique.length;) {
         if (isCancelled) throw Exception("Cancelled");
         while (isPaused) {
           if (isCancelled) throw Exception("Cancelled");
           await Future.delayed(Duration(milliseconds: 500));
         }
+
         final batch = <Future>[];
+        // Only take next 3
         for (int k = 0; k < 3 && i < sortedUnique.length; k++) {
           final c = sortedUnique[i];
           batch.add(fetchAndStore(c['index'], c['path'], c['token']));
           i++;
         }
         await Future.wait(batch);
-        await _tryMerge();
+        
+        // Merge after each batch to free up disk space if needed or just progress
+        await _tryMerge(); 
       }
     } finally {
       client.close();
@@ -1624,24 +1640,39 @@ Future<void> _downloadWorker(Map<String, dynamic> args) async {
       controlPort.close();
       if (await tempDir.exists()) {
         try {
+          // Only delete temp parts if completed or cancelled/failed
           await tempDir.delete(recursive: true);
         } catch (e) {}
       }
       if (isCancelled) {
+         // Clean up partially written target file
         if (await targetFile.exists()) {
-          await targetFile.delete();
+          try {
+             await targetFile.delete();
+          } catch(e) {}
         }
       } else if (mergedChunkCount != expectedChunkCount) {
+         // If we didn't finish merging, we failed
         if (await targetFile.exists()) {
-          await targetFile.delete();
+           try {
+              await targetFile.delete();
+           } catch(e) {}
         }
-        throw Exception(
+        if (!isCancelled) { // Don't throw if we already know it's cancelled
+             throw Exception(
             'Download incomplete: merged $mergedChunkCount/$expectedChunkCount chunks');
+        }
       }
     }
 
     sendPort.send({'type': 'done'});
   } catch (e) {
-    sendPort.send({'type': 'error', 'error': e.toString()});
+    if (e.toString().contains("Cancelled") || isCancelled) {
+       // We can send a specific 'cancelled' type or just error.
+       // The main thread checks isCancelled() so it might just need to know we stopped.
+       sendPort.send({'type': 'error', 'error': 'Cancelled'});
+    } else {
+       sendPort.send({'type': 'error', 'error': e.toString()});
+    }
   }
 }
