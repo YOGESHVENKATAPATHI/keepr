@@ -11,7 +11,7 @@ const fetch = require('node-fetch'); // Ensure node-fetch is available
 const deletionWorker = require('./deletionWorker');
 const cleanupService = require('./cleanupService');
 const PDFDocument = require('pdfkit');
-const { Document, Packer, Paragraph, TextRun, ImageRun } = require('docx');
+const { Document, Packer, Paragraph, TextRun } = require('docx');
 
 const app = express();
 app.use(cors());
@@ -455,160 +455,14 @@ function buildTextExport(note, assets) {
     return Buffer.from(lines.join('\n'), 'utf8');
 }
 
-function parseImageSizeMetadata(rawTitle) {
-    const result = {};
-    if (!rawTitle) return result;
-
-    const tokens = String(rawTitle).trim().split(/\s+/);
-    for (const token of tokens) {
-        const match = token.match(/^(width|w|height|h)=(\d+(?:\.\d+)?)$/i);
-        if (!match) continue;
-        const key = match[1].toLowerCase();
-        const value = Number(match[2]);
-        if (!Number.isFinite(value) || value <= 0) continue;
-        if (key === 'width' || key === 'w') result.width = value;
-        if (key === 'height' || key === 'h') result.height = value;
-    }
-
-    return result;
-}
-
-function fitImageDimensions(width, height, maxWidth, maxHeight) {
-    const fallbackWidth = 420;
-    const fallbackHeight = 280;
-    let resolvedWidth = Number(width);
-    let resolvedHeight = Number(height);
-
-    if (!Number.isFinite(resolvedWidth) || resolvedWidth <= 0) resolvedWidth = fallbackWidth;
-    if (!Number.isFinite(resolvedHeight) || resolvedHeight <= 0) resolvedHeight = fallbackHeight;
-
-    const scale = Math.min(maxWidth / resolvedWidth, maxHeight / resolvedHeight, 1);
-    return {
-        width: Math.max(1, Math.round(resolvedWidth * scale)),
-        height: Math.max(1, Math.round(resolvedHeight * scale))
-    };
-}
-
-function parseNoteBlocks(contentText) {
-    const text = String(contentText || '');
-    const blocks = [];
-    const imagePattern = /!\[([^\]]*)\]\((asset:[^)]+?)(?:\s+"([^"]*)")?\)/g;
-    let lastIndex = 0;
-
-    for (const match of text.matchAll(imagePattern)) {
-        const index = match.index ?? 0;
-        const before = text.slice(lastIndex, index);
-        if (before.trim().length > 0) {
-            blocks.push({ type: 'text', text: before });
-        }
-
-        blocks.push({
-            type: 'image',
-            alt: match[1] || '',
-            assetName: String(match[2] || '').replace(/^asset:/i, '').trim(),
-            size: parseImageSizeMetadata(match[3])
-        });
-
-        lastIndex = index + match[0].length;
-    }
-
-    const tail = text.slice(lastIndex);
-    if (tail.trim().length > 0) {
-        blocks.push({ type: 'text', text: tail });
-    }
-
-    return blocks;
-}
-
-async function resolveAssetLink(asset) {
-    if (!asset || !asset.dropbox_path || !asset.storage_shard_ref) return '';
-
-    const token = await storageManager.getAccessTokenForReference({
-        storageSource: asset.storage_source || 'storage_shards',
-        shardRef: String(asset.storage_shard_ref)
-    });
-
-    const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ path: String(asset.dropbox_path) })
-    });
-
-    if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Dropbox temporary link failed: ${text}`);
-    }
-
-    const payload = await response.json();
-    return payload.link || '';
-}
-
-async function fetchAssetBytes(asset) {
-    const link = await resolveAssetLink(asset);
-    if (!link) throw new Error(`Unable to resolve asset link for ${asset.asset_name || 'attachment'}`);
-
-    const axios = require('axios');
-    const response = await axios.get(link, { responseType: 'arraybuffer' });
-    return Buffer.from(response.data);
-}
-
-function addTextParagraphs(children, text) {
-    const paragraphs = String(text || '')
-        .split(/\n{2,}/)
-        .map((segment) => segment.trim())
-        .filter(Boolean);
-
-    for (const paragraphText of paragraphs) {
-        children.push(new Paragraph({ text: paragraphText }));
-    }
-}
-
 async function buildDocxExport(note, assets) {
-    const assetMap = new Map();
-    for (const asset of assets || []) {
-        if (asset && asset.asset_name) {
-            assetMap.set(String(asset.asset_name), asset);
-        }
-    }
-
     const children = [
         new Paragraph({
             children: [new TextRun({ text: note.title || 'Untitled note', bold: true, size: 32 })]
         }),
-        new Paragraph({ text: '' })
+        new Paragraph({ text: '' }),
+        new Paragraph({ text: note.content_text || '' })
     ];
-
-    for (const block of parseNoteBlocks(note.content_text || '')) {
-        if (block.type === 'text') {
-            addTextParagraphs(children, block.text);
-            children.push(new Paragraph({ text: '' }));
-            continue;
-        }
-
-        const asset = assetMap.get(block.assetName);
-        if (!asset) {
-            children.push(new Paragraph({ text: `[Missing attachment: ${block.assetName}]` }));
-            continue;
-        }
-
-        const imageBytes = await fetchAssetBytes(asset);
-        const fitted = fitImageDimensions(block.size.width, block.size.height, 520, 360);
-        children.push(new Paragraph({
-            children: [
-                new ImageRun({
-                    data: imageBytes,
-                    transformation: {
-                        width: fitted.width,
-                        height: fitted.height
-                    }
-                })
-            ]
-        }));
-        children.push(new Paragraph({ text: '' }));
-    }
 
     const doc = new Document({
         sections: [{ children }]
@@ -617,14 +471,7 @@ async function buildDocxExport(note, assets) {
     return Packer.toBuffer(doc);
 }
 
-async function buildPdfExport(note, assets) {
-    const assetMap = new Map();
-    for (const asset of assets || []) {
-        if (asset && asset.asset_name) {
-            assetMap.set(String(asset.asset_name), asset);
-        }
-    }
-
+function buildPdfExport(note, assets) {
     return new Promise((resolve, reject) => {
         try {
             const doc = new PDFDocument({ margin: 40 });
@@ -633,45 +480,11 @@ async function buildPdfExport(note, assets) {
             doc.on('end', () => resolve(Buffer.concat(chunks)));
             doc.on('error', (err) => reject(err));
 
-            (async () => {
-                doc.fontSize(18).text(note.title || 'Untitled note');
-                doc.moveDown();
-
-                for (const block of parseNoteBlocks(note.content_text || '')) {
-                    if (block.type === 'text') {
-                        const paragraphs = String(block.text || '')
-                            .split(/\n{2,}/)
-                            .map((segment) => segment.trim())
-                            .filter(Boolean);
-
-                        for (const paragraphText of paragraphs) {
-                            doc.fontSize(12).text(paragraphText, { align: 'left' });
-                            doc.moveDown(0.5);
-                        }
-                        doc.moveDown();
-                        continue;
-                    }
-
-                    const asset = assetMap.get(block.assetName);
-                    if (!asset) {
-                        doc.fontSize(11).fillColor('red').text(`[Missing attachment: ${block.assetName}]`);
-                        doc.fillColor('black');
-                        doc.moveDown();
-                        continue;
-                    }
-
-                    const imageBytes = await fetchAssetBytes(asset);
-                    const fitted = fitImageDimensions(block.size.width, block.size.height, 520, 360);
-                    doc.image(imageBytes, {
-                        width: fitted.width,
-                        height: fitted.height,
-                        align: 'left'
-                    });
-                    doc.moveDown();
-                }
-
-                doc.end();
-            })().catch(reject);
+            doc.fontSize(18).text(note.title || 'Untitled note');
+            doc.moveDown();
+            doc.fontSize(12).text(note.content_text || '');
+            doc.moveDown();
+            doc.end();
         } catch (e) {
             reject(e);
         }
@@ -2339,7 +2152,7 @@ app.post('/api/notes/:id/export', verifyAuthToken, requireProvisionedUser, async
             if (noteRes.rows.length === 0) return null;
 
             const assetsRes = await client.query(
-                'SELECT asset_name, mime_type, dropbox_path, storage_source, storage_shard_ref FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
+                'SELECT asset_name, mime_type FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
                 [id, req.user.id]
             );
 
