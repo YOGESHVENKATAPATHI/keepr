@@ -2304,29 +2304,39 @@ app.delete('/api/notes/:id/assets/:assetId', verifyAuthToken, requireProvisioned
             const asset = resA.rows[0];
 
             await client.query('BEGIN');
-            await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
+            try {
+                await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
 
-            // Deletion Worker queues paths to delete. But Note Assets have storage_shard_ref, not internal shard_id integer.
-            // Wait, storage_shards has internal id. We can look it up.
-            if (asset.storage_shard_ref && asset.dropbox_path) {
-                const s = await client.query('SELECT id FROM storage_shards WHERE id_ref = $1', [asset.storage_shard_ref]);
-                if (s.rows.length > 0) {
-                     const shard_id = s.rows[0].id;
-                     await client.query(`
-                         CREATE TABLE IF NOT EXISTS deletion_queue (
-                             id SERIAL PRIMARY KEY,
-                             shard_id INT NOT NULL,
-                             paths TEXT[] NOT NULL,
-                             status TEXT DEFAULT 'pending',
-                             retries INT DEFAULT 0,
-                             created_at TIMESTAMP DEFAULT NOW()
-                         )
-                     `);
-                     await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shard_id, [asset.dropbox_path]]);
+                // Deletion Worker queues paths to delete. But Note Assets have storage_shard_ref, not internal shard_id integer.
+                // Wait, storage_shards has internal id. We can look it up.
+                if (asset.storage_shard_ref && asset.dropbox_path) {
+                    const s = await client.query('SELECT id FROM storage_shards WHERE id_ref = $1', [asset.storage_shard_ref]);
+                    if (s.rows.length > 0) {
+                         const shard_id = s.rows[0].id;
+                         await client.query(`
+                             CREATE TABLE IF NOT EXISTS deletion_queue (
+                                 id SERIAL PRIMARY KEY,
+                                 shard_id INT NOT NULL,
+                                 paths TEXT[] NOT NULL,
+                                 status TEXT DEFAULT 'pending',
+                                 retries INT DEFAULT 0,
+                                 created_at TIMESTAMP DEFAULT NOW()
+                             )
+                         `);
+                         await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shard_id, [asset.dropbox_path]]);
+                    }
                 }
+
+                await client.query('COMMIT');
+                return true;
+            } catch (txErr) {
+                try {
+                    await client.query('ROLLBACK');
+                } catch (_) {
+                    // Ignore rollback errors; the original error is the one we want to surface.
+                }
+                throw txErr;
             }
-            await client.query('COMMIT');
-            return true;
         });
 
         if (!deleted) return res.status(404).send({ message: 'Asset not found' });
