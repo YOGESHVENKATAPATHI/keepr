@@ -455,173 +455,159 @@ function buildTextExport(note, assets) {
     return Buffer.from(lines.join('\n'), 'utf8');
 }
 
-function inferImageType(asset) {
-    const mimeType = String(asset.mime_type || '').toLowerCase();
-    const assetName = String(asset.asset_name || '').toLowerCase();
+function parseImageSizeMetadata(rawTitle) {
+    const result = {};
+    if (!rawTitle) return result;
 
-    if (mimeType.includes('png') || assetName.endsWith('.png')) return 'png';
-    if (mimeType.includes('jpeg') || mimeType.includes('jpg') || assetName.endsWith('.jpg') || assetName.endsWith('.jpeg')) return 'jpg';
-    if (mimeType.includes('gif') || assetName.endsWith('.gif')) return 'gif';
-    if (mimeType.includes('bmp') || assetName.endsWith('.bmp')) return 'bmp';
-    return null;
+    const tokens = String(rawTitle).trim().split(/\s+/);
+    for (const token of tokens) {
+        const match = token.match(/^(width|w|height|h)=(\d+(?:\.\d+)?)$/i);
+        if (!match) continue;
+        const key = match[1].toLowerCase();
+        const value = Number(match[2]);
+        if (!Number.isFinite(value) || value <= 0) continue;
+        if (key === 'width' || key === 'w') result.width = value;
+        if (key === 'height' || key === 'h') result.height = value;
+    }
+
+    return result;
 }
 
-function getImageDimensions(buffer) {
-    if (!Buffer.isBuffer(buffer)) {
-        buffer = Buffer.from(buffer);
-    }
+function fitImageDimensions(width, height, maxWidth, maxHeight) {
+    const fallbackWidth = 420;
+    const fallbackHeight = 280;
+    let resolvedWidth = Number(width);
+    let resolvedHeight = Number(height);
 
-    if (buffer.length >= 24 && buffer.readUInt32BE(0) === 0x89504e47) {
-        return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
-    }
+    if (!Number.isFinite(resolvedWidth) || resolvedWidth <= 0) resolvedWidth = fallbackWidth;
+    if (!Number.isFinite(resolvedHeight) || resolvedHeight <= 0) resolvedHeight = fallbackHeight;
 
-    if (buffer.length >= 10 && buffer.toString('ascii', 0, 3) === 'GIF') {
-        return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
-    }
-
-    if (buffer.length >= 26 && buffer.toString('ascii', 0, 2) === 'BM') {
-        return { width: Math.abs(buffer.readInt32LE(18)), height: Math.abs(buffer.readInt32LE(22)) };
-    }
-
-    if (buffer.length >= 4 && buffer.readUInt16BE(0) === 0xffd8) {
-        let offset = 2;
-        while (offset + 9 < buffer.length) {
-            if (buffer[offset] !== 0xff) {
-                offset += 1;
-                continue;
-            }
-
-            const marker = buffer[offset + 1];
-            if (marker === 0xd9 || marker === 0xda) break;
-
-            const segmentLength = buffer.readUInt16BE(offset + 2);
-            const isStartOfFrame = [0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb].includes(marker);
-            if (isStartOfFrame) {
-                return {
-                    height: buffer.readUInt16BE(offset + 5),
-                    width: buffer.readUInt16BE(offset + 7),
-                };
-            }
-
-            offset += 2 + segmentLength;
-        }
-    }
-
-    return { width: 1200, height: 800 };
-}
-
-async function fetchNoteAssetBuffer(asset) {
-    const accessToken = await storageManager.getAccessTokenForReference({
-        storageSource: asset.storage_source || 'storage_shards',
-        shardRef: String(asset.storage_shard_ref || ''),
-    });
-
-    const linkResponse = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ path: String(asset.dropbox_path || '') })
-    });
-
-    if (!linkResponse.ok) {
-        const text = await linkResponse.text();
-        throw new Error(`Dropbox temporary link failed: ${text}`);
-    }
-
-    const payload = await linkResponse.json();
-    if (!payload.link) {
-        throw new Error('Missing temporary link for asset');
-    }
-
-    const mediaResponse = await fetch(payload.link);
-    if (!mediaResponse.ok) {
-        const text = await mediaResponse.text();
-        throw new Error(`Asset download failed: ${text}`);
-    }
-
-    return mediaResponse.buffer();
-}
-
-async function fetchNoteImageData(asset) {
-    const buffer = await fetchNoteAssetBuffer(asset);
-    const type = inferImageType(asset);
-
-    if (!type) {
-        throw new Error(`Unsupported image type for ${asset.asset_name || 'attachment'}`);
-    }
-
+    const scale = Math.min(maxWidth / resolvedWidth, maxHeight / resolvedHeight, 1);
     return {
-        buffer,
-        type,
-        ...getImageDimensions(buffer),
+        width: Math.max(1, Math.round(resolvedWidth * scale)),
+        height: Math.max(1, Math.round(resolvedHeight * scale))
     };
 }
 
-function buildNoteContentBlocks(note, assets) {
-    const assetByName = new Map((assets || []).map((asset) => [String(asset.asset_name || ''), asset]));
-    const lines = String(note.content_text || '').split(/\r?\n/);
+function parseNoteBlocks(contentText) {
+    const text = String(contentText || '');
     const blocks = [];
+    const imagePattern = /!\[([^\]]*)\]\((asset:[^)]+?)(?:\s+"([^"]*)")?\)/g;
+    let lastIndex = 0;
 
-    for (const line of lines) {
-        const trimmed = line.trim();
-
-        if (!trimmed) {
-            blocks.push({ type: 'blank' });
-            continue;
+    for (const match of text.matchAll(imagePattern)) {
+        const index = match.index ?? 0;
+        const before = text.slice(lastIndex, index);
+        if (before.trim().length > 0) {
+            blocks.push({ type: 'text', text: before });
         }
 
-        const imageMatch = trimmed.match(/^!\[[^\]]*\]\(asset:([^\)]+)\)$/);
-        if (imageMatch) {
-            const asset = assetByName.get(imageMatch[1]);
-            if (asset) {
-                blocks.push({ type: 'image', asset });
-                continue;
-            }
-        }
+        blocks.push({
+            type: 'image',
+            alt: match[1] || '',
+            assetName: String(match[2] || '').replace(/^asset:/i, '').trim(),
+            size: parseImageSizeMetadata(match[3])
+        });
 
-        blocks.push({ type: 'text', text: line });
+        lastIndex = index + match[0].length;
+    }
+
+    const tail = text.slice(lastIndex);
+    if (tail.trim().length > 0) {
+        blocks.push({ type: 'text', text: tail });
     }
 
     return blocks;
 }
 
+async function resolveAssetLink(asset) {
+    if (!asset || !asset.dropbox_path || !asset.storage_shard_ref) return '';
+
+    const token = await storageManager.getAccessTokenForReference({
+        storageSource: asset.storage_source || 'storage_shards',
+        shardRef: String(asset.storage_shard_ref)
+    });
+
+    const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ path: String(asset.dropbox_path) })
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Dropbox temporary link failed: ${text}`);
+    }
+
+    const payload = await response.json();
+    return payload.link || '';
+}
+
+async function fetchAssetBytes(asset) {
+    const link = await resolveAssetLink(asset);
+    if (!link) throw new Error(`Unable to resolve asset link for ${asset.asset_name || 'attachment'}`);
+
+    const axios = require('axios');
+    const response = await axios.get(link, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data);
+}
+
+function addTextParagraphs(children, text) {
+    const paragraphs = String(text || '')
+        .split(/\n{2,}/)
+        .map((segment) => segment.trim())
+        .filter(Boolean);
+
+    for (const paragraphText of paragraphs) {
+        children.push(new Paragraph({ text: paragraphText }));
+    }
+}
+
 async function buildDocxExport(note, assets) {
+    const assetMap = new Map();
+    for (const asset of assets || []) {
+        if (asset && asset.asset_name) {
+            assetMap.set(String(asset.asset_name), asset);
+        }
+    }
+
     const children = [
         new Paragraph({
             children: [new TextRun({ text: note.title || 'Untitled note', bold: true, size: 32 })]
         }),
-        new Paragraph({ text: '' }),
+        new Paragraph({ text: '' })
     ];
 
-    const blocks = buildNoteContentBlocks(note, assets);
-
-    for (const block of blocks) {
-        if (block.type === 'blank') {
+    for (const block of parseNoteBlocks(note.content_text || '')) {
+        if (block.type === 'text') {
+            addTextParagraphs(children, block.text);
             children.push(new Paragraph({ text: '' }));
             continue;
         }
 
-        if (block.type === 'image') {
-            const imageData = await fetchNoteImageData(block.asset);
-            children.push(new Paragraph({
-                spacing: { after: 240 },
-                children: [
-                    new ImageRun({
-                        type: imageData.type,
-                        data: imageData.buffer,
-                        transformation: {
-                            width: Math.max(1, imageData.width),
-                            height: Math.max(1, imageData.height),
-                        },
-                    }),
-                ],
-            }));
+        const asset = assetMap.get(block.assetName);
+        if (!asset) {
+            children.push(new Paragraph({ text: `[Missing attachment: ${block.assetName}]` }));
             continue;
         }
 
-        children.push(new Paragraph({ text: block.text }));
+        const imageBytes = await fetchAssetBytes(asset);
+        const fitted = fitImageDimensions(block.size.width, block.size.height, 520, 360);
+        children.push(new Paragraph({
+            children: [
+                new ImageRun({
+                    data: imageBytes,
+                    transformation: {
+                        width: fitted.width,
+                        height: fitted.height
+                    }
+                })
+            ]
+        }));
+        children.push(new Paragraph({ text: '' }));
     }
 
     const doc = new Document({
@@ -631,26 +617,13 @@ async function buildDocxExport(note, assets) {
     return Packer.toBuffer(doc);
 }
 
-function renderPdfImage(doc, buffer, width, height) {
-    const maxWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-    const maxHeight = 360;
-    const scale = Math.min(maxWidth / width, maxHeight / height, 1);
-    const drawWidth = Math.max(1, Math.round(width * scale));
-    const drawHeight = Math.max(1, Math.round(height * scale));
-
-    if (doc.y + drawHeight > doc.page.height - doc.page.margins.bottom) {
-        doc.addPage();
-    }
-
-    doc.image(buffer, doc.page.margins.left, doc.y, {
-        width: drawWidth,
-        height: drawHeight,
-    });
-    doc.moveDown(0.5);
-}
-
 async function buildPdfExport(note, assets) {
-    const blocks = buildNoteContentBlocks(note, assets);
+    const assetMap = new Map();
+    for (const asset of assets || []) {
+        if (asset && asset.asset_name) {
+            assetMap.set(String(asset.asset_name), asset);
+        }
+    }
 
     return new Promise((resolve, reject) => {
         try {
@@ -660,32 +633,43 @@ async function buildPdfExport(note, assets) {
             doc.on('end', () => resolve(Buffer.concat(chunks)));
             doc.on('error', (err) => reject(err));
 
-            doc.fontSize(18).text(note.title || 'Untitled note');
-            doc.moveDown();
-            doc.fontSize(12);
-
             (async () => {
-                for (const block of blocks) {
-                    if (block.type === 'blank') {
+                doc.fontSize(18).text(note.title || 'Untitled note');
+                doc.moveDown();
+
+                for (const block of parseNoteBlocks(note.content_text || '')) {
+                    if (block.type === 'text') {
+                        const paragraphs = String(block.text || '')
+                            .split(/\n{2,}/)
+                            .map((segment) => segment.trim())
+                            .filter(Boolean);
+
+                        for (const paragraphText of paragraphs) {
+                            doc.fontSize(12).text(paragraphText, { align: 'left' });
+                            doc.moveDown(0.5);
+                        }
                         doc.moveDown();
                         continue;
                     }
 
-                    if (block.type === 'image') {
-                        try {
-                            const imageData = await fetchNoteImageData(block.asset);
-                            renderPdfImage(doc, imageData.buffer, imageData.width, imageData.height);
-                        } catch (err) {
-                            doc.text(`[Image unavailable: ${block.asset.asset_name || 'attachment'}]`);
-                            doc.moveDown(0.5);
-                        }
+                    const asset = assetMap.get(block.assetName);
+                    if (!asset) {
+                        doc.fontSize(11).fillColor('red').text(`[Missing attachment: ${block.assetName}]`);
+                        doc.fillColor('black');
+                        doc.moveDown();
                         continue;
                     }
 
-                    doc.text(block.text);
+                    const imageBytes = await fetchAssetBytes(asset);
+                    const fitted = fitImageDimensions(block.size.width, block.size.height, 520, 360);
+                    doc.image(imageBytes, {
+                        width: fitted.width,
+                        height: fitted.height,
+                        align: 'left'
+                    });
+                    doc.moveDown();
                 }
 
-                doc.moveDown();
                 doc.end();
             })().catch(reject);
         } catch (e) {
@@ -2304,39 +2288,29 @@ app.delete('/api/notes/:id/assets/:assetId', verifyAuthToken, requireProvisioned
             const asset = resA.rows[0];
 
             await client.query('BEGIN');
-            try {
-                await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
+            await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
 
-                // Deletion Worker queues paths to delete. But Note Assets have storage_shard_ref, not internal shard_id integer.
-                // Wait, storage_shards has internal id. We can look it up.
-                if (asset.storage_shard_ref && asset.dropbox_path) {
-                    const s = await client.query('SELECT id FROM storage_shards WHERE id_ref = $1', [asset.storage_shard_ref]);
-                    if (s.rows.length > 0) {
-                         const shard_id = s.rows[0].id;
-                         await client.query(`
-                             CREATE TABLE IF NOT EXISTS deletion_queue (
-                                 id SERIAL PRIMARY KEY,
-                                 shard_id INT NOT NULL,
-                                 paths TEXT[] NOT NULL,
-                                 status TEXT DEFAULT 'pending',
-                                 retries INT DEFAULT 0,
-                                 created_at TIMESTAMP DEFAULT NOW()
-                             )
-                         `);
-                         await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shard_id, [asset.dropbox_path]]);
-                    }
+            // Deletion Worker queues paths to delete. But Note Assets have storage_shard_ref, not internal shard_id integer.
+            // Wait, storage_shards has internal id. We can look it up.
+            if (asset.storage_shard_ref && asset.dropbox_path) {
+                const s = await client.query('SELECT id FROM storage_shards WHERE id_ref = $1', [asset.storage_shard_ref]);
+                if (s.rows.length > 0) {
+                     const shard_id = s.rows[0].id;
+                     await client.query(`
+                         CREATE TABLE IF NOT EXISTS deletion_queue (
+                             id SERIAL PRIMARY KEY,
+                             shard_id INT NOT NULL,
+                             paths TEXT[] NOT NULL,
+                             status TEXT DEFAULT 'pending',
+                             retries INT DEFAULT 0,
+                             created_at TIMESTAMP DEFAULT NOW()
+                         )
+                     `);
+                     await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shard_id, [asset.dropbox_path]]);
                 }
-
-                await client.query('COMMIT');
-                return true;
-            } catch (txErr) {
-                try {
-                    await client.query('ROLLBACK');
-                } catch (_) {
-                    // Ignore rollback errors; the original error is the one we want to surface.
-                }
-                throw txErr;
             }
+            await client.query('COMMIT');
+            return true;
         });
 
         if (!deleted) return res.status(404).send({ message: 'Asset not found' });
@@ -2365,7 +2339,7 @@ app.post('/api/notes/:id/export', verifyAuthToken, requireProvisionedUser, async
             if (noteRes.rows.length === 0) return null;
 
             const assetsRes = await client.query(
-                'SELECT asset_name, mime_type FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
+                'SELECT asset_name, mime_type, dropbox_path, storage_source, storage_shard_ref FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
                 [id, req.user.id]
             );
 
