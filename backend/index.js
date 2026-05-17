@@ -11,7 +11,7 @@ const fetch = require('node-fetch'); // Ensure node-fetch is available
 const deletionWorker = require('./deletionWorker');
 const cleanupService = require('./cleanupService');
 const PDFDocument = require('pdfkit');
-const { Document, Packer, Paragraph, TextRun, Media } = require('docx');
+const { Document, Packer, Paragraph, TextRun, ImageRun } = require('docx');
 
 const app = express();
 app.use(cors());
@@ -88,25 +88,6 @@ app.post('/api/admin/wipe', async (req, res) => {
     }
 });
 
-// Endpoint for Vercel Cron Jobs to trigger cleanup (since serverless functions sleep)
-app.get('/api/admin/trigger-cleanup', async (req, res) => {
-    try {
-        console.log('[Cron] Triggering manual garbage collection...');
-        await deletionWorker.cleanupOrphanedUploads();
-        
-        // Also trigger storageManager delete queues if applicable
-        const shards = await dbManager.fetchActiveShards(false);
-        for (const shard of shards) {
-            await storageManager.processPendingDeletions(shard.id);
-        }
-        
-        res.json({ message: 'Cleanup executed successfully.' });
-    } catch (e) {
-        console.error('[Cron] Cleanup failed:', e);
-        res.status(500).json({ error: e.message });
-    }
-});
-
 // Initialize Registry on Start
 // Run init but don't crash the server if Master DB is unreachable; start in degraded mode and allow health checks / admin fixes
 dbManager.initMasterRegistry().catch(err => {
@@ -156,16 +137,6 @@ async function executeWithDB(action, maxAttempts = 3) {
         } catch (e) {
             lastErr = e;
             console.warn(`DB action attempt ${attempt} failed: ${e.code || e.message}`);
-
-            // If the previous action left the session in a failed transaction state,
-            // clear it before running any migration or retry logic.
-            if (client) {
-                try {
-                    await client.query('ROLLBACK');
-                } catch (_) {
-                    // Ignore "no transaction in progress" and keep retry flow.
-                }
-            }
 
             // Handle Missing Table/Column Schema Issues (Lazy Migration)
             if (e.code === '42P01' || e.code === '42703') { // undefined_table OR undefined_column
@@ -484,65 +455,136 @@ function buildTextExport(note, assets) {
     return Buffer.from(lines.join('\n'), 'utf8');
 }
 
-function parseInlineNoteTokens(contentText) {
-    const text = String(contentText || '');
-    const regex = /!\[([^\]]*)\]\(asset:([^\s\)]+)(?:\s+"([^"]*)")?\)/g;
-    const tokens = [];
-    let lastIndex = 0;
-    let match;
+function inferImageType(asset) {
+    const mimeType = String(asset.mime_type || '').toLowerCase();
+    const assetName = String(asset.asset_name || '').toLowerCase();
 
-    while ((match = regex.exec(text)) !== null) {
-        const rawBefore = text.substring(lastIndex, match.index);
-        if (rawBefore.isNotEmpty) {
-            tokens.push({ type: 'text', value: rawBefore });
+    if (mimeType.includes('png') || assetName.endsWith('.png')) return 'png';
+    if (mimeType.includes('jpeg') || mimeType.includes('jpg') || assetName.endsWith('.jpg') || assetName.endsWith('.jpeg')) return 'jpg';
+    if (mimeType.includes('gif') || assetName.endsWith('.gif')) return 'gif';
+    if (mimeType.includes('bmp') || assetName.endsWith('.bmp')) return 'bmp';
+    return null;
+}
+
+function getImageDimensions(buffer) {
+    if (!Buffer.isBuffer(buffer)) {
+        buffer = Buffer.from(buffer);
+    }
+
+    if (buffer.length >= 24 && buffer.readUInt32BE(0) === 0x89504e47) {
+        return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+    }
+
+    if (buffer.length >= 10 && buffer.toString('ascii', 0, 3) === 'GIF') {
+        return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+    }
+
+    if (buffer.length >= 26 && buffer.toString('ascii', 0, 2) === 'BM') {
+        return { width: Math.abs(buffer.readInt32LE(18)), height: Math.abs(buffer.readInt32LE(22)) };
+    }
+
+    if (buffer.length >= 4 && buffer.readUInt16BE(0) === 0xffd8) {
+        let offset = 2;
+        while (offset + 9 < buffer.length) {
+            if (buffer[offset] !== 0xff) {
+                offset += 1;
+                continue;
+            }
+
+            const marker = buffer[offset + 1];
+            if (marker === 0xd9 || marker === 0xda) break;
+
+            const segmentLength = buffer.readUInt16BE(offset + 2);
+            const isStartOfFrame = [0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb].includes(marker);
+            if (isStartOfFrame) {
+                return {
+                    height: buffer.readUInt16BE(offset + 5),
+                    width: buffer.readUInt16BE(offset + 7),
+                };
+            }
+
+            offset += 2 + segmentLength;
         }
-
-        const title = match[3] || '';
-        const widthMatch = /w\s*=\s*(\d+)/i.exec(title);
-        const width = widthMatch ? parseInt(widthMatch[1], 10) : 480;
-        tokens.push({ type: 'image', name: String(match[2] || ''), width });
-        lastIndex = regex.lastIndex;
     }
 
-    const tail = text.substring(lastIndex);
-    if (tail.isNotEmpty) {
-        tokens.push({ type: 'text', value: tail });
-    }
-
-    if (tokens.length === 0) {
-        tokens.push({ type: 'text', value: text });
-    }
-
-    return tokens;
+    return { width: 1200, height: 800 };
 }
 
-function mapAssetsByName(assets) {
-    const map = new Map();
-    for (const a of (assets || [])) {
-        const key = String(a.asset_name || '');
-        if (key && !map.has(key)) map.set(key, a);
-    }
-    return map;
-}
-
-async function fetchAssetBytes(asset) {
-    if (!asset || !asset.dropbox_path || !asset.storage_shard_ref) return null;
-
-    const token = await storageManager.getAccessTokenForReference({
+async function fetchNoteAssetBuffer(asset) {
+    const accessToken = await storageManager.getAccessTokenForReference({
         storageSource: asset.storage_source || 'storage_shards',
-        shardRef: String(asset.storage_shard_ref)
+        shardRef: String(asset.storage_shard_ref || ''),
     });
 
-    const res = await fetch('https://content.dropboxapi.com/2/files/download', {
+    const linkResponse = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
         method: 'POST',
         headers: {
-            'Authorization': `Bearer ${token}`,
-            'Dropbox-API-Arg': JSON.stringify({ path: asset.dropbox_path })
-        }
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ path: String(asset.dropbox_path || '') })
     });
-    if (!res.ok) return null;
-    const arrayBuffer = await res.arrayBuffer();
-    return Buffer.from(arrayBuffer);
+
+    if (!linkResponse.ok) {
+        const text = await linkResponse.text();
+        throw new Error(`Dropbox temporary link failed: ${text}`);
+    }
+
+    const payload = await linkResponse.json();
+    if (!payload.link) {
+        throw new Error('Missing temporary link for asset');
+    }
+
+    const mediaResponse = await fetch(payload.link);
+    if (!mediaResponse.ok) {
+        const text = await mediaResponse.text();
+        throw new Error(`Asset download failed: ${text}`);
+    }
+
+    return mediaResponse.buffer();
+}
+
+async function fetchNoteImageData(asset) {
+    const buffer = await fetchNoteAssetBuffer(asset);
+    const type = inferImageType(asset);
+
+    if (!type) {
+        throw new Error(`Unsupported image type for ${asset.asset_name || 'attachment'}`);
+    }
+
+    return {
+        buffer,
+        type,
+        ...getImageDimensions(buffer),
+    };
+}
+
+function buildNoteContentBlocks(note, assets) {
+    const assetByName = new Map((assets || []).map((asset) => [String(asset.asset_name || ''), asset]));
+    const lines = String(note.content_text || '').split(/\r?\n/);
+    const blocks = [];
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+
+        if (!trimmed) {
+            blocks.push({ type: 'blank' });
+            continue;
+        }
+
+        const imageMatch = trimmed.match(/^!\[[^\]]*\]\(asset:([^\)]+)\)$/);
+        if (imageMatch) {
+            const asset = assetByName.get(imageMatch[1]);
+            if (asset) {
+                blocks.push({ type: 'image', asset });
+                continue;
+            }
+        }
+
+        blocks.push({ type: 'text', text: line });
+    }
+
+    return blocks;
 }
 
 async function buildDocxExport(note, assets) {
@@ -550,47 +592,66 @@ async function buildDocxExport(note, assets) {
         new Paragraph({
             children: [new TextRun({ text: note.title || 'Untitled note', bold: true, size: 32 })]
         }),
-        new Paragraph({ text: '' })
+        new Paragraph({ text: '' }),
     ];
 
-    const doc = new Document({ sections: [{ children }] });
-    const assetMap = mapAssetsByName(assets);
-    const tokens = parseInlineNoteTokens(note.content_text || '');
+    const blocks = buildNoteContentBlocks(note, assets);
 
-    for (const token of tokens) {
-        if (token.type === 'text') {
-            const lines = String(token.value || '').split('\n');
-            for (const line of lines) {
-                children.push(new Paragraph({ text: line }));
-            }
+    for (const block of blocks) {
+        if (block.type === 'blank') {
+            children.push(new Paragraph({ text: '' }));
             continue;
         }
 
-        const asset = assetMap.get(token.name);
-        if (!asset) {
-            children.push(new Paragraph({ text: `[missing image: ${token.name}]` }));
+        if (block.type === 'image') {
+            const imageData = await fetchNoteImageData(block.asset);
+            children.push(new Paragraph({
+                spacing: { after: 240 },
+                children: [
+                    new ImageRun({
+                        type: imageData.type,
+                        data: imageData.buffer,
+                        transformation: {
+                            width: Math.max(1, imageData.width),
+                            height: Math.max(1, imageData.height),
+                        },
+                    }),
+                ],
+            }));
             continue;
         }
 
-        try {
-            const bytes = await fetchAssetBytes(asset);
-            if (!bytes) {
-                children.push(new Paragraph({ text: `[image unavailable: ${token.name}]` }));
-                continue;
-            }
-            const w = Math.max(120, Math.min(parseInt(String(token.width || 480), 10), 1200));
-            const imageRun = Media.addImage(doc, bytes, w, Math.floor(w * 0.65));
-            children.push(new Paragraph(imageRun));
-        } catch (e) {
-            console.warn('Skipping inline DOCX image:', token.name, e.message);
-            children.push(new Paragraph({ text: `[image error: ${token.name}]` }));
-        }
+        children.push(new Paragraph({ text: block.text }));
     }
+
+    const doc = new Document({
+        sections: [{ children }]
+    });
 
     return Packer.toBuffer(doc);
 }
 
-function buildPdfExport(note, assets) {
+function renderPdfImage(doc, buffer, width, height) {
+    const maxWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const maxHeight = 360;
+    const scale = Math.min(maxWidth / width, maxHeight / height, 1);
+    const drawWidth = Math.max(1, Math.round(width * scale));
+    const drawHeight = Math.max(1, Math.round(height * scale));
+
+    if (doc.y + drawHeight > doc.page.height - doc.page.margins.bottom) {
+        doc.addPage();
+    }
+
+    doc.image(buffer, doc.page.margins.left, doc.y, {
+        width: drawWidth,
+        height: drawHeight,
+    });
+    doc.moveDown(0.5);
+}
+
+async function buildPdfExport(note, assets) {
+    const blocks = buildNoteContentBlocks(note, assets);
+
     return new Promise((resolve, reject) => {
         try {
             const doc = new PDFDocument({ margin: 40 });
@@ -601,49 +662,32 @@ function buildPdfExport(note, assets) {
 
             doc.fontSize(18).text(note.title || 'Untitled note');
             doc.moveDown();
+            doc.fontSize(12);
 
             (async () => {
-                try {
-                    const assetMap = mapAssetsByName(assets);
-                    const tokens = parseInlineNoteTokens(note.content_text || '');
-
-                    for (const token of tokens) {
-                        if (token.type === 'text') {
-                            doc.fontSize(12).text(String(token.value || ''));
-                            continue;
-                        }
-
-                        const asset = assetMap.get(token.name);
-                        if (!asset) {
-                            doc.fillColor('red').fontSize(10).text(`[missing image: ${token.name}]`).fillColor('black');
-                            continue;
-                        }
-
-                        try {
-                            const bytes = await fetchAssetBytes(asset);
-                            if (!bytes) {
-                                doc.fillColor('red').fontSize(10).text(`[image unavailable: ${token.name}]`).fillColor('black');
-                                continue;
-                            }
-
-                            const w = Math.max(120, Math.min(parseInt(String(token.width || 480), 10), 1200));
-                            const maxPdfWidth = Math.max(120, doc.page.width - doc.page.margins.left - doc.page.margins.right);
-                            const finalWidth = Math.min(w, maxPdfWidth);
-
-                            doc.moveDown(0.5);
-                            doc.image(bytes, { fit: [finalWidth, 600], align: 'left' });
-                            doc.moveDown(0.5);
-                        } catch (e) {
-                            console.warn('Skipping inline PDF image:', token.name, e.message);
-                            doc.fillColor('red').fontSize(10).text(`[image error: ${token.name}]`).fillColor('black');
-                        }
+                for (const block of blocks) {
+                    if (block.type === 'blank') {
+                        doc.moveDown();
+                        continue;
                     }
-                } catch (e) {
-                    console.warn('Error while building PDF export:', e.message);
-                } finally {
-                    doc.end();
+
+                    if (block.type === 'image') {
+                        try {
+                            const imageData = await fetchNoteImageData(block.asset);
+                            renderPdfImage(doc, imageData.buffer, imageData.width, imageData.height);
+                        } catch (err) {
+                            doc.text(`[Image unavailable: ${block.asset.asset_name || 'attachment'}]`);
+                            doc.moveDown(0.5);
+                        }
+                        continue;
+                    }
+
+                    doc.text(block.text);
                 }
-            })();
+
+                doc.moveDown();
+                doc.end();
+            })().catch(reject);
         } catch (e) {
             reject(e);
         }
@@ -896,18 +940,6 @@ app.post('/api/auth/google-signin', async (req, res) => {
     } catch (e) {
         console.error('Google sign-in failed', e);
         res.status(500).send({ message: 'Google sign-in failed', error: e.message });
-    }
-});
-
-// GET /api/storage/stats
-app.get('/api/storage/stats', verifyAuthToken, async (req, res) => {
-    try {
-        console.log('[Storage] Fetching aggregated storage stats...');
-        const stats = await storageManager.getTotalStorageStats();
-        res.json({ ok: true, stats });
-    } catch (e) {
-        console.error('[Storage] Failed to fetch storage stats:', e.message);
-        res.status(500).json({ ok: false, error: e.message });
     }
 });
 
@@ -1303,28 +1335,16 @@ app.post('/api/files/upload-metadata', async (req, res) => {
                     is_folder BOOLEAN DEFAULT FALSE,
                     size_mb NUMERIC DEFAULT 0,
                     dropbox_path TEXT,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    UNIQUE(user_id, path)
+                    created_at TIMESTAMP DEFAULT NOW()
                 );
             `);
              try {
                 await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS parent_path TEXT');
-                await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
-                await workerClient.query('ALTER TABLE files DROP CONSTRAINT IF EXISTS files_user_id_path_key');
-                await workerClient.query('ALTER TABLE files ADD CONSTRAINT files_user_id_path_key UNIQUE(user_id, path)');
-            } catch (e) { /* ignore if columns/constraints already exist */ }
+            } catch (e) { /* ignore */ }
 
             const parentPath = getParentPath(path);
-            // UPSERT: Insert if new, Update if exists (prevents duplicates)
             await workerClient.query(
-                `INSERT INTO files (user_id, path, parent_path, name, is_folder, size_mb, dropbox_path, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, false, $5, $6, NOW(), NOW())
-                 ON CONFLICT (user_id, path) DO UPDATE SET
-                    name = $4,
-                    size_mb = $5,
-                    dropbox_path = $6,
-                    updated_at = NOW()`,
+                'INSERT INTO files (user_id, path, parent_path, name, is_folder, size_mb, dropbox_path) VALUES ($1, $2, $3, $4, false, $5, $6)',
                 [user_id, path, parentPath, name, size_mb, dropbox_path]
             );
         });
@@ -1566,8 +1586,7 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
 
         // 2. Not found, allocate new
         const account = await storageManager.getFittestStorageAccount(sizeMb);
-        const newChunkId = generateUUID(); // Define unique chunk ID early
-        const remotePath = `/keepr_chunks/${fileId}/${newChunkId}.bin`; // Use newChunkId to guarantee absolutely no overlap on retry
+        const remotePath = `/keepr_chunks/${fileId}/${chunkIndex}.bin`;
 
         // 3. Reserve space in DB (Handle race condition & PK overlaps)
         let allocated = null;
@@ -1576,6 +1595,9 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
         while (!allocated && attempts < 3) {
             attempts++;
             try {
+                // Generate a unique ID for this chunk (Fix for duplicate key error on default '0')
+                const newChunkId = generateUUID(); // Use helper or uuidv4
+
                 await executeWithDB(async (client) => {
                      await client.query(
                          `INSERT INTO file_chunks (chunk_id, file_id, chunk_index, shard_id, size_mb, status, dropbox_path) 
@@ -1956,120 +1978,6 @@ app.post('/api/files/download-info', async (req, res) => {
     }
 });
 
-// 5. Stream Distributed File: Handle HTTP Range requests for video/audio streaming
-app.get('/api/files/stream/:fileIdRef', async (req, res) => {
-    const fileIdRef = req.params.fileIdRef;
-    const token = req.query.token;
-    
-    if (!token) return res.status(401).send('Missing token');
-    
-    try {
-        const authRow = await executeWithDB(async (client) => {
-            const r = await client.query('SELECT user_id FROM auth_tokens WHERE token = $1 AND revoked = FALSE', [token]);
-            return r.rows[0];
-        });
-        if (!authRow) return res.status(401).send('Invalid token');
-
-        const metaRes = await executeWithDB(async (client) => {
-            const r = await client.query('SELECT total_chunks, total_size_mb FROM file_uploads WHERE file_id=$1', [fileIdRef]);
-            return r.rows[0];
-        });
-        if (!metaRes) return res.status(404).send('File not found');
-        
-        const totalSize = Math.round((metaRes.total_size_mb || 0) * 1024 * 1024);
-
-        const chunks = await executeWithDB(async (client) => {
-            const resChunks = await client.query(
-                'SELECT chunk_index, shard_id, dropbox_path, size_mb FROM file_chunks WHERE file_id = $1 ORDER BY chunk_index ASC',
-                [fileIdRef]
-            );
-            return resChunks.rows;
-        });
-
-        const range = req.headers.range;
-        let start = 0;
-        let end = totalSize - 1;
-        let isPartial = false;
-
-        if (range) {
-            const parts = range.replace(/bytes=/, "").split("-");
-            start = parseInt(parts[0], 10);
-            end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
-            isPartial = true;
-        }
-
-        const chunksize = (end - start) + 1;
-
-        if (isPartial) {
-            res.status(206);
-            res.header('Content-Range', `bytes ${start}-${end}/${totalSize}`);
-        } else {
-            res.status(200);
-        }
-        
-        res.header('Accept-Ranges', 'bytes');
-        res.header('Content-Length', chunksize);
-        
-        const fileName = req.query.name;
-        if (fileName) {
-            res.type(fileName); // Express automatically sets the correct Content-Type based on the extension
-        } else {
-            res.header('Content-Type', 'application/octet-stream');
-        }
-
-        const CHUNK_SIZE = 4 * 1024 * 1024;
-        let currentByte = start;
-        let bytesRemaining = chunksize;
-
-        for (const chunk of chunks) {
-            const chunkStart = chunk.chunk_index * CHUNK_SIZE;
-            const chunkLen = chunk.size_mb ? Math.round(chunk.size_mb * 1024 * 1024) : CHUNK_SIZE;
-            const chunkEnd = chunkStart + chunkLen - 1;
-
-            if (currentByte > chunkEnd) continue;
-            if (bytesRemaining <= 0) break;
-
-            const overlapStart = Math.max(currentByte, chunkStart);
-            const overlapEnd = Math.min(currentByte + bytesRemaining - 1, chunkEnd);
-            const overlapLen = overlapEnd - overlapStart + 1;
-
-            if (overlapLen <= 0) continue;
-
-            const shardToken = await storageManager.getAccessTokenForShard(chunk.shard_id);
-            if (!shardToken) throw new Error('No token for shard');
-
-            const dbxStart = overlapStart - chunkStart;
-            const dbxEnd = overlapEnd - chunkStart;
-
-            const response = await fetch('https://content.dropboxapi.com/2/files/download', {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${shardToken}`,
-                    'Dropbox-API-Arg': JSON.stringify({ path: chunk.dropbox_path }),
-                    'Range': `bytes=${dbxStart}-${dbxEnd}`
-                }
-            });
-
-            if (!response.ok) {
-                console.error(`Dropbox download failed: ${response.status}`);
-                res.end();
-                return;
-            }
-
-            const arrayBuffer = await response.arrayBuffer();
-            res.write(Buffer.from(arrayBuffer));
-
-            currentByte += overlapLen;
-            bytesRemaining -= overlapLen;
-        }
-
-        res.end();
-    } catch (e) {
-        console.error('Stream Error', e);
-        if (!res.headersSent) res.status(500).send('Stream failed');
-    }
-});
-
 // --- SAVED MESSAGES ROUTES ---
 
 app.get('/api/messages/saved', verifyAuthToken, requireProvisionedUser, async (req, res) => {
@@ -2390,45 +2298,35 @@ app.delete('/api/notes/:id/assets/:assetId', verifyAuthToken, requireProvisioned
 
     try {
         const deleted = await executeWithDB(async (client) => {
-            const resA = await client.query(
-                'SELECT dropbox_path, storage_shard_ref, storage_source FROM note_assets WHERE id = $1 AND note_id = $2 AND user_id = $3',
-                [assetId, id, req.user.id]
-            );
+            const resA = await client.query('SELECT dropbox_path, storage_shard_ref FROM note_assets WHERE id = $1 AND note_id = $2 AND user_id = $3', [assetId, id, req.user.id]);
             if (resA.rows.length === 0) return false;
             
             const asset = resA.rows[0];
 
             await client.query('BEGIN');
-            try {
-                await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
+            await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
 
-                // Queue physical deletion only for primary shard-backed assets.
-                // Worker DBs may not have a storage_shards registry table, so use
-                // storage_shard_ref directly if it is a numeric shard id.
-                const source = String(asset.storage_source || 'storage_shards');
-                if (source === 'storage_shards' && asset.storage_shard_ref && asset.dropbox_path) {
-                    const shardId = parseInt(String(asset.storage_shard_ref), 10);
-                    if (!Number.isNaN(shardId)) {
-                        await client.query(`
-                            CREATE TABLE IF NOT EXISTS deletion_queue (
-                                id SERIAL PRIMARY KEY,
-                                shard_id INT NOT NULL,
-                                paths TEXT[] NOT NULL,
-                                status TEXT DEFAULT 'pending',
-                                retries INT DEFAULT 0,
-                                created_at TIMESTAMP DEFAULT NOW()
-                            )
-                        `);
-                        await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shardId, [asset.dropbox_path]]);
-                    }
+            // Deletion Worker queues paths to delete. But Note Assets have storage_shard_ref, not internal shard_id integer.
+            // Wait, storage_shards has internal id. We can look it up.
+            if (asset.storage_shard_ref && asset.dropbox_path) {
+                const s = await client.query('SELECT id FROM storage_shards WHERE id_ref = $1', [asset.storage_shard_ref]);
+                if (s.rows.length > 0) {
+                     const shard_id = s.rows[0].id;
+                     await client.query(`
+                         CREATE TABLE IF NOT EXISTS deletion_queue (
+                             id SERIAL PRIMARY KEY,
+                             shard_id INT NOT NULL,
+                             paths TEXT[] NOT NULL,
+                             status TEXT DEFAULT 'pending',
+                             retries INT DEFAULT 0,
+                             created_at TIMESTAMP DEFAULT NOW()
+                         )
+                     `);
+                     await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shard_id, [asset.dropbox_path]]);
                 }
-
-                await client.query('COMMIT');
-                return true;
-            } catch (txErr) {
-                try { await client.query('ROLLBACK'); } catch (_) {}
-                throw txErr;
             }
+            await client.query('COMMIT');
+            return true;
         });
 
         if (!deleted) return res.status(404).send({ message: 'Asset not found' });
@@ -2457,7 +2355,7 @@ app.post('/api/notes/:id/export', verifyAuthToken, requireProvisionedUser, async
             if (noteRes.rows.length === 0) return null;
 
             const assetsRes = await client.query(
-                'SELECT asset_name, mime_type, dropbox_path, storage_source, storage_shard_ref FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
+                'SELECT asset_name, mime_type FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
                 [id, req.user.id]
             );
 
