@@ -1,0 +1,12 @@
+# Ignore backend dependency installs and local environment
+/backend/node_modules/
+/backend/.env
+/backend/test.pdf
+/backend/scripts/sync_dbs.js
+
+# Flutter local artifacts
+/frontend/.flutter-plugins
+/frontend/android/.kotlin/
+
+# Installer build output
+/installers/Output/
