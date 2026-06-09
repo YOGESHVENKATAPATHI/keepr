@@ -1309,7 +1309,7 @@ app.post('/api/files/create-folder', async (req, res) => {
             const parentPath = getParentPath(path);
 
             await workerClient.query(
-                'INSERT INTO files (user_id, path, parent_path, name, is_folder) VALUES ($1, $2, $3, $4, true)',
+                'INSERT INTO files (user_id, path, parent_path, name, is_folder) VALUES ($1, $2, $3, $4, true) ON CONFLICT (user_id, path) DO NOTHING',
                 [user_id, path, parentPath, name]
             );
         });
@@ -1343,7 +1343,7 @@ app.post('/api/files/upload-metadata', async (req, res) => {
 
             const parentPath = getParentPath(path);
             await workerClient.query(
-                'INSERT INTO files (user_id, path, parent_path, name, is_folder, size_mb, dropbox_path) VALUES ($1, $2, $3, $4, false, $5, $6)',
+                'INSERT INTO files (user_id, path, parent_path, name, is_folder, size_mb, dropbox_path) VALUES ($1, $2, $3, $4, false, $5, $6) ON CONFLICT (user_id, path) DO UPDATE SET size_mb = EXCLUDED.size_mb, dropbox_path = EXCLUDED.dropbox_path, parent_path = EXCLUDED.parent_path',
                 [user_id, path, parentPath, name, size_mb, dropbox_path]
             );
         });
