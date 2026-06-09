@@ -8,9 +8,14 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:universal_html/html.dart' as html;
 import 'package:url_launcher/url_launcher.dart';
+
+import 'package:desktop_drop/desktop_drop.dart';
+import 'package:pasteboard/pasteboard.dart';
+import 'package:image/image.dart' as img;
 
 import 'package:flutter_markdown/flutter_markdown.dart';
 import '../services/api_service.dart';
@@ -54,36 +59,98 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
     _webDragOverSub?.cancel();
     _webDropSub?.cancel();
     _webPasteSub?.cancel();
+    if (!kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
+      HardwareKeyboard.instance.removeHandler(_desktopPasteHandler);
+    }
     _titleController.dispose();
     _contentController.dispose();
     super.dispose();
   }
 
   void _setupWebFileIntake() {
-    if (!kIsWeb) return;
+    if (kIsWeb) {
+      _webDragOverSub = html.document.onDragOver.listen((event) {
+        event.preventDefault();
+      });
 
-    _webDragOverSub = html.document.onDragOver.listen((event) {
-      event.preventDefault();
-    });
+      _webDropSub = html.document.onDrop.listen((event) async {
+        event.preventDefault();
+        if (_activeNoteId == null || _token == null) return;
 
-    _webDropSub = html.document.onDrop.listen((event) async {
-      event.preventDefault();
-      if (_activeNoteId == null || _token == null) return;
+        final files = event.dataTransfer?.files;
+        if (files == null || files.isEmpty) return;
+        await _uploadAssetsFromWebFiles(files.toList());
+      });
 
-      final files = event.dataTransfer?.files;
-      if (files == null || files.isEmpty) return;
-      await _uploadAssetsFromWebFiles(files.toList());
-    });
+      _webPasteSub = html.document.onPaste.listen((event) async {
+        if (_activeNoteId == null || _token == null) return;
+        final data = event.clipboardData;
+        final files = data?.files;
+        if (files == null || files.isEmpty) return;
 
-    _webPasteSub = html.document.onPaste.listen((event) async {
-      if (_activeNoteId == null || _token == null) return;
-      final data = event.clipboardData;
-      final files = data?.files;
-      if (files == null || files.isEmpty) return;
+        event.preventDefault();
+        await _uploadAssetsFromWebFiles(files.toList());
+      });
+    }
 
-      event.preventDefault();
-      await _uploadAssetsFromWebFiles(files.toList());
-    });
+    if (!kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
+      HardwareKeyboard.instance.addHandler(_desktopPasteHandler);
+    }
+  }
+
+  bool _desktopPasteHandler(KeyEvent event) {
+    if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.keyV) {
+      if (HardwareKeyboard.instance.isControlPressed || HardwareKeyboard.instance.isMetaPressed) {
+        _checkDesktopPasteboard();
+      }
+    }
+    return false; // Let textfields handle text paste
+  }
+
+  Future<void> _checkDesktopPasteboard() async {
+    // Wait slightly so any text paste processes first
+    await Future.delayed(const Duration(milliseconds: 100));
+    if (_activeNoteId == null || _token == null || !mounted) return;
+
+    try {
+      final files = await Pasteboard.files();
+      if (files != null && files.isNotEmpty) {
+        setState(() => _loading = true);
+        for (final filePath in files) {
+          final file = File(filePath);
+          if (await file.exists()) {
+            final bytes = await file.readAsBytes();
+            final name = filePath.split(Platform.pathSeparator).last;
+            await _uploadSingleAsset(bytes: bytes, fileName: name, mimeType: _inferMime(name));
+          }
+        }
+        await _openNote(_activeNoteId!);
+        _showSnack('Pasted files attached');
+        if (mounted) setState(() => _loading = false);
+        return;
+      }
+
+      final bytes = await Pasteboard.image;
+      if (bytes != null && bytes.isNotEmpty) {
+        setState(() => _loading = true);
+        
+        // Decode raw bytes (could be BMP/TIFF/etc. from Windows/Mac clipboard)
+        final image = img.decodeImage(bytes);
+        Uint8List finalBytes = bytes;
+        if (image != null) {
+          // Re-encode to standard PNG format to prevent backend PDFKit failures
+          finalBytes = img.encodePng(image);
+        }
+
+        final fileName = 'pasted_image_${DateTime.now().millisecondsSinceEpoch}.png';
+        await _uploadSingleAsset(bytes: finalBytes, fileName: fileName, mimeType: 'image/png');
+        await _openNote(_activeNoteId!);
+        _showSnack('Pasted image attached');
+        if (mounted) setState(() => _loading = false);
+      }
+    } catch (e) {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
   Future<void> _bootstrap() async {
@@ -602,14 +669,35 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
           ),
           const VerticalDivider(width: 1),
           Expanded(
-            child: selected == null
-                ? Center(
-                    child: Text(
-                      'Create or select a note',
-                      style: GoogleFonts.inter(color: Colors.white70),
-                    ),
-                  )
-                : Padding(
+            child: DropTarget(
+              onDragDone: (detail) async {
+                if (_activeNoteId == null || _token == null) return;
+                setState(() => _loading = true);
+                try {
+                  for (final xfile in detail.files) {
+                    final bytes = await xfile.readAsBytes();
+                    await _uploadSingleAsset(
+                      bytes: bytes,
+                      fileName: xfile.name,
+                      mimeType: _inferMime(xfile.name),
+                    );
+                  }
+                  await _openNote(_activeNoteId!);
+                  _showSnack('Media attached from drop');
+                } catch (e) {
+                  _showSnack('Drop failed: $e', isError: true);
+                } finally {
+                  if (mounted) setState(() => _loading = false);
+                }
+              },
+              child: selected == null
+                  ? Center(
+                      child: Text(
+                        'Create or select a note',
+                        style: GoogleFonts.inter(color: Colors.white70),
+                      ),
+                    )
+                  : Padding(
                     padding: const EdgeInsets.all(12),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -781,6 +869,7 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
                       ],
                     ),
                   ),
+            ),
           )
         ],
       ),

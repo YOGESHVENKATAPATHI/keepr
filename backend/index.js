@@ -28,8 +28,9 @@ const fetch = require('node-fetch'); // Ensure node-fetch is available
 const deletionWorker = require('./deletionWorker');
 const cleanupService = require('./cleanupService');
 const PDFDocument = require('pdfkit');
-const { Document, Packer, Paragraph, TextRun, ImageRun } = require('docx');
+const { Document, Packer, Paragraph, TextRun, ImageRun, HeadingLevel } = require('docx');
 const sizeOf = require('image-size').imageSize;
+const { marked } = require('marked');
 
 const app = express();
 app.use(cors());
@@ -464,114 +465,192 @@ function requireProvisionedUser(req, res, next) {
     }
     return next();
 }
+    // ... (rest of code)
 
 function buildTextExport(note, assets) {
-    const lines = [
-        `Title: ${note.title || ''}`,
-        '',
-        note.content_text || ''
-    ];
-    return Buffer.from(lines.join('\n'), 'utf8');
+    let text = note.content_text || '';
+    
+    // For raw text, we can keep the markdown mostly as is. 
+    // It is generally readable. We'll add the title at the top.
+    const fullText = `${note.title || 'Untitled note'}\n\n${text}\n\n---\nExported from Keepr Notes Studio`;
+    return Buffer.from(fullText, 'utf8');
+}
+
+async function fetchAssetBuffer(asset) {
+    if (!asset || !asset.dropbox_path || !asset.storage_shard_ref) return null;
+    const storageManager = require('./storageManager');
+    try {
+        const token = await storageManager.getAccessTokenForReference({
+            storageSource: 'storage_shards',
+            shardRef: String(asset.storage_shard_ref)
+        });
+
+        const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ path: String(asset.dropbox_path) })
+        });
+
+        if (response.ok) {
+            const payload = await response.json();
+            const imgRes = await fetch(payload.link);
+            return await imgRes.arrayBuffer();
+        }
+    } catch (e) {
+        console.error('Fetch asset error:', e);
+    }
+    return null;
 }
 
 async function buildDocxExport(note, assets) {
-    const children = [
-        new Paragraph({
-            children: [new TextRun({ text: note.title || 'Untitled note', bold: true, size: 32 })]
-        }),
-        new Paragraph({ text: '' })
-    ];
-
     const text = note.content_text || '';
-    const regex = /!\[.*?\]\(asset:(.+?)(?:\s+"([^"]+)")?\)/g;
+    const tokens = marked.lexer(text);
     
-    let lastIndex = 0;
-    let match;
-    
-    while ((match = regex.exec(text)) !== null) {
-        const textBefore = text.slice(lastIndex, match.index);
-        if (textBefore.trim()) {
-            children.push(new Paragraph({ text: textBefore.trim() }));
-            children.push(new Paragraph({ text: '' }));
-        } else if (lastIndex !== 0 && textBefore.includes('\n')) {
-            children.push(new Paragraph({ text: '' }));
-        }
+    const children = [];
+    children.push(new Paragraph({
+        text: note.title || 'Untitled note',
+        heading: HeadingLevel.TITLE,
+    }));
 
-        const assetName = match[1];
-        const widthStr = match[2];
-        let parsedWidth = widthStr ? parseInt(widthStr, 10) : 480;
-        if (parsedWidth > 600) parsedWidth = 600; // max width for docx
-        
-        const asset = assets.find(a => a.asset_name === assetName);
-        if (asset && asset.dropbox_path && asset.storage_shard_ref) {
-            try {
-                const token = await storageManager.getAccessTokenForReference({
-                    storageSource: 'storage_shards',
-                    shardRef: String(asset.storage_shard_ref)
-                });
-
-                const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${token}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ path: String(asset.dropbox_path) })
-                });
-
-                if (response.ok) {
-                    const payload = await response.json();
-                    const imgRes = await fetch(payload.link);
-                    const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
-                    
-                    try {
-                        const dimensions = sizeOf(imgBuffer);
-                        const ratio = dimensions.height / dimensions.width;
-                        const height = parsedWidth * ratio;
-                        
+    async function parseDocxTokens(tokensList) {
+        for (const token of tokensList) {
+            switch (token.type) {
+                case 'heading':
+                    const levels = {
+                        1: HeadingLevel.HEADING_1,
+                        2: HeadingLevel.HEADING_2,
+                        3: HeadingLevel.HEADING_3,
+                        4: HeadingLevel.HEADING_4,
+                        5: HeadingLevel.HEADING_5,
+                        6: HeadingLevel.HEADING_6
+                    };
+                    children.push(new Paragraph({
+                        text: token.text,
+                        heading: levels[token.depth] || HeadingLevel.HEADING_1
+                    }));
+                    break;
+                case 'paragraph':
+                    if (token.tokens && token.tokens.length > 0) {
+                        const runs = [];
+                        await parseDocxInlineTokens(token.tokens, runs, children);
+                        if (runs.length > 0) {
+                            children.push(new Paragraph({ children: runs }));
+                        }
+                    } else {
+                        children.push(new Paragraph({ text: token.text }));
+                    }
+                    break;
+                case 'list':
+                    for (let i = 0; i < token.items.length; i++) {
+                        const item = token.items[i];
+                        const runs = [];
+                        if (item.tokens) {
+                            await parseDocxInlineTokens(item.tokens, runs, children);
+                        } else {
+                            runs.push(new TextRun({ text: item.text }));
+                        }
                         children.push(new Paragraph({
+                            children: runs,
+                            bullet: !token.ordered ? { level: 0 } : undefined,
+                            numbering: token.ordered ? { reference: "numbered", level: 0 } : undefined
+                        }));
+                    }
+                    break;
+                case 'space':
+                case 'br':
+                    children.push(new Paragraph({ text: '' }));
+                    break;
+                default:
+                    if (token.raw) {
+                        children.push(new Paragraph({ text: token.raw }));
+                    }
+                    break;
+            }
+        }
+    }
+
+    async function parseDocxInlineTokens(inlineTokens, runs, rootChildren) {
+        for (const inline of inlineTokens) {
+            if (inline.type === 'strong') {
+                runs.push(new TextRun({ text: inline.text, bold: true }));
+            } else if (inline.type === 'em') {
+                runs.push(new TextRun({ text: inline.text, italics: true }));
+            } else if (inline.type === 'codespan') {
+                runs.push(new TextRun({ text: inline.text, font: 'Courier New' }));
+            } else if (inline.type === 'link') {
+                runs.push(new TextRun({ text: inline.text, color: '0000FF', underline: {} }));
+            } else if (inline.type === 'image') {
+                let assetName = inline.href;
+                let parsedWidth = 480;
+                if (assetName.startsWith('asset:')) {
+                    assetName = assetName.replace('asset:', '');
+                } else {
+                    runs.push(new TextRun({ text: `[External Image: ${assetName}]`, color: '888888' }));
+                    continue;
+                }
+                
+                if (inline.title) {
+                    const parsed = parseInt(inline.title, 10);
+                    if (!isNaN(parsed)) parsedWidth = parsed;
+                }
+                
+                const asset = assets.find(a => a.asset_name === assetName);
+                const imgBuffer = await fetchAssetBuffer(asset);
+                
+                if (imgBuffer) {
+                    try {
+                        const buf = Buffer.from(imgBuffer);
+                        const dimensions = sizeOf(buf);
+                        const ratio = dimensions.height / dimensions.width;
+                        const finalWidth = parsedWidth > 600 ? 600 : parsedWidth;
+                        const finalHeight = finalWidth * ratio;
+                        
+                        // Push accumulated runs to paragraph before image
+                        if (runs.length > 0) {
+                            rootChildren.push(new Paragraph({ children: [...runs] }));
+                            runs.length = 0; // clear runs
+                        }
+                        
+                        rootChildren.push(new Paragraph({
                             children: [
                                 new ImageRun({
-                                    data: imgBuffer,
-                                    transformation: { width: parsedWidth, height }
+                                    data: buf,
+                                    transformation: { width: finalWidth, height: finalHeight }
                                 })
                             ]
                         }));
-                        children.push(new Paragraph({ text: '' }));
-                    } catch (imgErr) {
-                        children.push(new Paragraph({
-                            children: [new TextRun({ text: `[Unsupported image format for DOCX: ${asset.mime_type}]`, color: "FF0000" })]
-                        }));
-                        children.push(new Paragraph({ text: '' }));
+                    } catch (e) {
+                        runs.push(new TextRun({ text: `[Image Error: ${e.message}]`, color: 'FF0000' }));
                     }
                 } else {
-                    children.push(new Paragraph({
-                        children: [new TextRun({ text: `[Failed to fetch asset: ${assetName}]`, color: "FF0000" })]
-                    }));
-                    children.push(new Paragraph({ text: '' }));
+                    runs.push(new TextRun({ text: `[Asset not found: ${assetName}]`, color: 'FF0000' }));
                 }
-            } catch (e) {
-                children.push(new Paragraph({
-                    children: [new TextRun({ text: `[Error fetching asset: ${assetName}]`, color: "FF0000" })]
-                }));
-                children.push(new Paragraph({ text: '' }));
+            } else if (inline.type === 'text' || inline.type === 'escape') {
+                runs.push(new TextRun({ text: inline.text || inline.raw }));
+            } else {
+                if (inline.tokens) {
+                    await parseDocxInlineTokens(inline.tokens, runs, rootChildren);
+                } else {
+                    runs.push(new TextRun({ text: inline.raw }));
+                }
             }
-        } else {
-            children.push(new Paragraph({
-                children: [new TextRun({ text: `[Asset not found: ${assetName}]`, color: "FF0000" })]
-            }));
-            children.push(new Paragraph({ text: '' }));
         }
-
-        lastIndex = regex.lastIndex;
     }
 
-    const textAfter = text.slice(lastIndex);
-    if (textAfter.trim()) {
-        children.push(new Paragraph({ text: textAfter.trim() }));
-    }
+    await parseDocxTokens(tokens);
 
     const doc = new Document({
+        numbering: {
+            config: [
+                {
+                    reference: "numbered",
+                    levels: [{ level: 0, format: "decimal", text: "%1.", alignment: "start" }]
+                }
+            ]
+        },
         sections: [{ children }]
     });
 
@@ -587,50 +666,97 @@ async function buildPdfExport(note, assets) {
             doc.on('end', () => resolve(Buffer.concat(chunks)));
             doc.on('error', (err) => reject(err));
 
-            doc.fontSize(18).text(note.title || 'Untitled note');
+            doc.font('Helvetica-Bold').fontSize(24).text(note.title || 'Untitled note');
             doc.moveDown();
 
             const text = note.content_text || '';
-            const regex = /!\[.*?\]\(asset:(.+?)(?:\s+"([^"]+)")?\)/g;
-            
-            let lastIndex = 0;
-            let match;
-            
-            while ((match = regex.exec(text)) !== null) {
-                const textBefore = text.slice(lastIndex, match.index);
-                if (textBefore.trim()) {
-                    doc.fontSize(12).text(textBefore.trim());
-                    doc.moveDown(0.5);
-                } else if (lastIndex !== 0 && textBefore.includes('\n')) {
-                    doc.moveDown(0.5);
+            const tokens = marked.lexer(text);
+
+            async function renderPdfTokens(tokensList) {
+                for (const token of tokensList) {
+                    switch (token.type) {
+                        case 'heading':
+                            const hSizes = { 1: 20, 2: 18, 3: 16, 4: 14, 5: 12, 6: 12 };
+                            doc.font('Helvetica-Bold').fontSize(hSizes[token.depth] || 12).text(token.text);
+                            doc.moveDown(0.5);
+                            break;
+                        case 'paragraph':
+                            if (token.tokens && token.tokens.length > 0) {
+                                await renderPdfInlineTokens(token.tokens, doc);
+                                doc.text('', { continued: false }); 
+                            } else {
+                                doc.font('Helvetica').fontSize(12).text(token.text);
+                            }
+                            doc.moveDown(0.5);
+                            break;
+                        case 'list':
+                            doc.moveDown(0.5);
+                            for (let i = 0; i < token.items.length; i++) {
+                                const item = token.items[i];
+                                const prefix = token.ordered ? `${i + 1}. ` : '•  ';
+                                doc.font('Helvetica').fontSize(12).text(prefix, { continued: true });
+                                if (item.tokens) {
+                                    await renderPdfInlineTokens(item.tokens, doc);
+                                } else {
+                                    doc.text(item.text, { continued: true });
+                                }
+                                doc.text('', { continued: false });
+                            }
+                            doc.moveDown(0.5);
+                            break;
+                        case 'space':
+                        case 'br':
+                            doc.moveDown(0.5);
+                            break;
+                        default:
+                            if (token.raw) {
+                                doc.font('Helvetica').fontSize(12).text(token.raw);
+                                doc.moveDown(0.5);
+                            }
+                            break;
+                    }
                 }
+            }
 
-                const assetName = match[1];
-                const widthStr = match[2];
-                const parsedWidth = widthStr ? parseInt(widthStr, 10) : 480;
-                
-                const asset = assets.find(a => a.asset_name === assetName);
-                if (asset && asset.dropbox_path && asset.storage_shard_ref) {
-                    try {
-                        const token = await storageManager.getAccessTokenForReference({
-                            storageSource: 'storage_shards',
-                            shardRef: String(asset.storage_shard_ref)
-                        });
-
-                        const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
-                            method: 'POST',
-                            headers: {
-                                'Authorization': `Bearer ${token}`,
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({ path: String(asset.dropbox_path) })
-                        });
-
-                        if (response.ok) {
-                            const payload = await response.json();
-                            const imgRes = await fetch(payload.link);
-                            const imgBuffer = await imgRes.arrayBuffer();
-                            
+            async function renderPdfInlineTokens(inlineTokens, doc) {
+                for (let i = 0; i < inlineTokens.length; i++) {
+                    const inline = inlineTokens[i];
+                    const continued = (i !== inlineTokens.length - 1);
+                    
+                    if (inline.type === 'strong') {
+                        doc.font('Helvetica-Bold').fontSize(12).text(inline.text, { continued });
+                    } else if (inline.type === 'em') {
+                        doc.font('Helvetica-Oblique').fontSize(12).text(inline.text, { continued });
+                    } else if (inline.type === 'codespan') {
+                        doc.font('Courier').fontSize(12).text(inline.text, { continued });
+                    } else if (inline.type === 'link') {
+                        doc.font('Helvetica').fontSize(12).fillColor('blue')
+                           .text(inline.text, { link: inline.href, underline: true, continued });
+                        doc.fillColor('black');
+                    } else if (inline.type === 'image') {
+                        doc.text('', { continued: false });
+                        doc.moveDown(0.5);
+                        
+                        let assetName = inline.href;
+                        let parsedWidth = 480;
+                        if (assetName.startsWith('asset:')) {
+                            assetName = assetName.replace('asset:', '');
+                        } else {
+                            doc.fontSize(10).fillColor('gray').text(`[External Image: ${assetName}]`).fillColor('black');
+                            doc.moveDown();
+                            if (continued) doc.text('', { continued: true });
+                            continue;
+                        }
+                        
+                        if (inline.title) {
+                            const parsed = parseInt(inline.title, 10);
+                            if (!isNaN(parsed)) parsedWidth = parsed;
+                        }
+                        
+                        const asset = assets.find(a => a.asset_name === assetName);
+                        const imgBuffer = await fetchAssetBuffer(asset);
+                        
+                        if (imgBuffer) {
                             try {
                                 const buf = Buffer.from(imgBuffer);
                                 const dimensions = sizeOf(buf);
@@ -645,32 +771,31 @@ async function buildPdfExport(note, assets) {
                                 doc.image(buf, doc.x, doc.y, { width: finalWidth });
                                 doc.y += scaledHeight;
                                 doc.moveDown(0.5);
-                            } catch (imgErr) {
-                                console.error('Image rendering error:', imgErr);
-                                doc.fontSize(10).fillColor('red').text(`[Image Error: ${imgErr.message}]`).fillColor('black');
+                            } catch (e) {
+                                doc.fontSize(10).fillColor('red').text(`[Image Error: ${e.message}]`).fillColor('black');
                                 doc.moveDown(0.5);
                             }
                         } else {
-                            doc.fontSize(10).fillColor('red').text(`[Failed to fetch asset: ${assetName}]`).fillColor('black');
+                            doc.fontSize(10).fillColor('red').text(`[Asset not found: ${assetName}]`).fillColor('black');
                             doc.moveDown(0.5);
                         }
-                    } catch (e) {
-                        doc.fontSize(10).fillColor('red').text(`[Error fetching asset: ${assetName}]`).fillColor('black');
-                        doc.moveDown(0.5);
+                        
+                        if (continued) {
+                            doc.font('Helvetica').fontSize(12).text('', { continued: true });
+                        }
+                    } else if (inline.type === 'text' || inline.type === 'escape') {
+                        doc.font('Helvetica').fontSize(12).text(inline.text || inline.raw, { continued });
+                    } else {
+                        if (inline.tokens) {
+                            await renderPdfInlineTokens(inline.tokens, doc);
+                        } else {
+                            doc.font('Helvetica').fontSize(12).text(inline.raw, { continued });
+                        }
                     }
-                } else {
-                    doc.fontSize(10).fillColor('red').text(`[Asset not found: ${assetName}]`).fillColor('black');
-                    doc.moveDown(0.5);
                 }
-
-                lastIndex = regex.lastIndex;
             }
 
-            const textAfter = text.slice(lastIndex);
-            if (textAfter.trim()) {
-                doc.fontSize(12).text(textAfter.trim());
-            }
-
+            await renderPdfTokens(tokens);
             doc.end();
         } catch (e) {
             reject(e);
