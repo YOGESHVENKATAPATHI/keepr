@@ -30,7 +30,6 @@ const cleanupService = require('./cleanupService');
 const PDFDocument = require('pdfkit');
 const { Document, Packer, Paragraph, TextRun, ImageRun, HeadingLevel } = require('docx');
 const sizeOf = require('image-size').imageSize;
-const { marked } = require('marked');
 
 const app = express();
 app.use(cors());
@@ -506,6 +505,7 @@ async function fetchAssetBuffer(asset) {
 }
 
 async function buildDocxExport(note, assets) {
+    const { marked } = await import('marked');
     const text = note.content_text || '';
     const tokens = marked.lexer(text);
     
@@ -669,6 +669,7 @@ async function buildPdfExport(note, assets) {
             doc.font('Helvetica-Bold').fontSize(24).text(note.title || 'Untitled note');
             doc.moveDown();
 
+            const { marked } = await import('marked');
             const text = note.content_text || '';
             const tokens = marked.lexer(text);
 
