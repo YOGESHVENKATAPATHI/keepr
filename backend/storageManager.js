@@ -395,7 +395,16 @@ async function getAccessTokenForReference({ storageSource, shardRef }) {
     }
 }
 
+let cachedStats = null;
+let lastStatsFetchTime = 0;
+const STATS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 async function getTotalStorageStats() {
+    const now = Date.now();
+    if (cachedStats && (now - lastStatsFetchTime < STATS_CACHE_TTL_MS)) {
+        return cachedStats;
+    }
+
     let totalAllocated = 0;
     let totalUsed = 0;
     
@@ -435,7 +444,8 @@ async function getTotalStorageStats() {
         const chunk = allAccounts.slice(i, i + CHUNK_SIZE);
         const promises = chunk.map(async (account) => {
             try {
-                const accessToken = await refreshAccessToken(account.refresh_token, account.app_key, account.app_secret);
+                const cacheKey = `shard_token_stats_${account.id}_${account.source}`;
+                const accessToken = await getCachedToken(cacheKey, () => refreshAccessToken(account.refresh_token, account.app_key, account.app_secret));
                 const usageData = await getLiveSpaceUsage(accessToken);
                 return { allocated: usageData.allocated, used: usageData.used };
             } catch (err) {
@@ -449,12 +459,19 @@ async function getTotalStorageStats() {
             totalAllocated += res.allocated;
             totalUsed += res.used;
         }
+        
+        if (i + CHUNK_SIZE < allAccounts.length) {
+            await new Promise(r => setTimeout(r, 1000));
+        }
     }
 
-    return {
+    cachedStats = {
         usedBytes: totalUsed,
         allocatedBytes: totalAllocated
     };
+    lastStatsFetchTime = Date.now();
+
+    return cachedStats;
 }
 
 module.exports = {
