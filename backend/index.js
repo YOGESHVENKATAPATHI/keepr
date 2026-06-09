@@ -2,6 +2,23 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const dbManager = require('./dbManager');
+const { randomUUID } = require('crypto');
+
+async function executeScatterGather(action) {
+    const clients = await dbManager.getAllWorkerDBs();
+    const promises = clients.map(async (db) => {
+        try {
+            return await action(db.client, db.id);
+        } catch (e) {
+            console.error(`Scatter action failed on DB ${db.id}:`, e);
+            return null;
+        } finally {
+            try { await db.client.end(); } catch (_) {}
+        }
+    });
+    return await Promise.all(promises);
+}
+
 const { tryConnect, MASTER_DB_URL } = dbManager;
 const storageManager = require('./storageManager');
 const auth = require('./auth');
@@ -10,6 +27,9 @@ const { v4: uuidv4 } = require('uuid');
 const fetch = require('node-fetch'); // Ensure node-fetch is available
 const deletionWorker = require('./deletionWorker');
 const cleanupService = require('./cleanupService');
+const PDFDocument = require('pdfkit');
+const { Document, Packer, Paragraph, TextRun, ImageRun } = require('docx');
+const sizeOf = require('image-size').imageSize;
 
 const app = express();
 app.use(cors());
@@ -35,9 +55,31 @@ process.on('uncaughtException', (err) => {
 
 // Request logging middleware
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - body: ${JSON.stringify(req.body)} - query: ${JSON.stringify(req.query)} - ip: ${req.ip}`);
-  next();
+    if (process.env.LOG_VERBOSE_HTTP === 'true') {
+        console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - body: ${JSON.stringify(req.body)} - query: ${JSON.stringify(req.query)} - ip: ${req.ip}`);
+    }
+    next();
 });
+
+const tokenCache = new Map();
+const TOKEN_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function getTokenCache(token) {
+    const cached = tokenCache.get(token);
+    if (!cached) return null;
+    if (cached.expiresAt < Date.now()) {
+        tokenCache.delete(token);
+        return null;
+    }
+    return cached.user;
+}
+
+function setTokenCache(token, user) {
+    tokenCache.set(token, {
+        user,
+        expiresAt: Date.now() + TOKEN_CACHE_TTL_MS
+    });
+}
 
 // Admin Wipe Endpoint (Added)
 app.post('/api/admin/wipe', async (req, res) => {
@@ -53,7 +95,7 @@ app.post('/api/admin/wipe', async (req, res) => {
     // However, if we just truncate tables and delete root folders from Dropbox, it's fast (O(1)).
     // Dropbox API call is fast. DB call is fast.
     // So we can do it synchronously within ~5s hopefully.
-    
+
     try {
         console.log('[Admin] Wipe requested...');
         const log = await cleanupService.performFullWipe();
@@ -80,7 +122,7 @@ app.get('/api/health/db', async (req, res) => {
     } catch (e) {
         res.status(500).json({ ok: false, error: e.message });
     } finally {
-        if (client) try { await client.end(); } catch(e) {}
+        if (client) try { await client.end(); } catch (e) { }
     }
 });
 
@@ -119,6 +161,7 @@ async function executeWithDB(action, maxAttempts = 3) {
                 console.log(`[DB] Schema mismatch detected (${e.code}). Attempting to auto-migrate schema on shard...`);
                 if (client) {
                     try {
+                        try { await client.query('ROLLBACK'); } catch (_) { }
                         await ensureWorkerTables(client);
                         console.log('[DB] auto-migration applied successfully. Retrying action...');
                         // Don't close client here if possible, or reconnect? 
@@ -132,22 +175,22 @@ async function executeWithDB(action, maxAttempts = 3) {
                         // So we should fix the schema on *this* shard (which we have a client for).
                         // Note: getFittestDB might return a different shard next time? 
                         // Good point. We should fix it on the current client.
-                        
+
                         // But wait! If we fix it on 'client', then 'client.end()' happens, then loop continues.
                         // The next iteration calls 'getFittestDB()'. If it returns the SAME shard, good. 
                         // If it returns a DIFFERENT shard, we might hit the error again on that shard.
                         // This corresponds well to "create every tables as needed" - we fix it wherever we are.
-                        
+
                         // We continue the loop.
                     } catch (schemaErr) {
                         console.error('[DB] Auto-migration failed:', schemaErr);
                         // If migration fails, the next retry will likely fail too, but let's stick to the loop.
                     } finally {
-                        try { await client.end(); } catch (_) {}
+                        try { await client.end(); } catch (_) { }
                     }
                     // Wait a bit before retry
                     await new Promise(r => setTimeout(r, 500));
-                    continue; 
+                    continue;
                 }
             }
 
@@ -156,11 +199,11 @@ async function executeWithDB(action, maxAttempts = 3) {
             const transient = e.code === 'ENOTFOUND' || e.code === 'ECONNREFUSED' || msg.includes('getaddrinfo') || msg.includes('timeout');
             if (!transient) {
                 // fatal, rethrow
-                if (client) try { await client.end(); } catch(_){}
+                if (client) try { await client.end(); } catch (_) { }
                 throw e;
             }
             // transient: wait and retry (exponential backoff)
-            if (client) try { await client.end(); } catch(_){}
+            if (client) try { await client.end(); } catch (_) { }
             await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 500));
             continue;
         }
@@ -184,7 +227,7 @@ async function ensureWorkerTables(client) {
             revoked BOOLEAN DEFAULT FALSE
         );
     `);
-    
+
     // 3. Pre-Users (Onboarding)
     await client.query(`
         CREATE TABLE IF NOT EXISTS pre_users (
@@ -193,7 +236,7 @@ async function ensureWorkerTables(client) {
             created_at TIMESTAMP DEFAULT NOW()
         );
     `);
-    
+
     // 4. Files Table (Metadata)
     await client.query(`
         CREATE TABLE IF NOT EXISTS files (
@@ -213,7 +256,7 @@ async function ensureWorkerTables(client) {
     // Add columns if they are missing (migration for older schemas)
     await client.query("ALTER TABLE files ADD COLUMN IF NOT EXISTS file_id_ref TEXT");
     await client.query("ALTER TABLE files ADD COLUMN IF NOT EXISTS dropbox_path TEXT");
-    
+
     // 5. File Chunks (Split content)
     await client.query(`
         CREATE TABLE IF NOT EXISTS file_chunks (
@@ -246,6 +289,87 @@ async function ensureWorkerTables(client) {
         );
     `);
 
+    // 7. PIN reset tokens
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS pin_resets (
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
+            reset_token TEXT UNIQUE NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            used BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+
+    // 8. Saved messages (no cross-table references to avoid shard coupling)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS saved_messages (
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
+            message_text TEXT NOT NULL,
+            tags JSONB DEFAULT '[]'::jsonb,
+            is_pinned BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+    await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_saved_messages_user_pinned_created
+        ON saved_messages (user_id, is_pinned DESC, created_at DESC);
+    `);
+
+    // 9. Notes (no foreign keys; shard-local records)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS user_notes (
+            id TEXT PRIMARY KEY,
+            user_id INT NOT NULL,
+            title TEXT NOT NULL,
+            content_text TEXT DEFAULT '',
+            content_json JSONB DEFAULT '{}'::jsonb,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+    await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_user_notes_user_updated
+        ON user_notes (user_id, updated_at DESC);
+    `);
+
+    // 10. Note assets (no foreign keys)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS note_assets (
+            id TEXT PRIMARY KEY,
+            note_id TEXT NOT NULL,
+            user_id INT NOT NULL,
+            asset_name TEXT NOT NULL,
+            mime_type TEXT,
+            size_mb NUMERIC,
+            dropbox_path TEXT NOT NULL,
+            storage_source TEXT NOT NULL DEFAULT 'storage_shards',
+            storage_shard_ref TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+    await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_note_assets_note_user_created
+        ON note_assets (note_id, user_id, created_at DESC);
+    `);
+
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS latex_documents (
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
+            title TEXT NOT NULL,
+            source_text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+    await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_latex_documents_user_updated
+        ON latex_documents (user_id, updated_at DESC);
+    `);
+
     console.log('[DB] Worker tables ensured.');
 }
 
@@ -263,13 +387,13 @@ async function executeOnAllDBs(action) {
             console.error(`Query failed on DB ${id}:`, e.message);
             return []; // Return empty on failure to allow partial results
         } finally {
-             try { await client.end(); } catch (_) {}
+            try { await client.end(); } catch (_) { }
         }
     });
 
     const resultsArray = await Promise.all(promises);
     // Flatten
-    return resultsArray.flat(); 
+    return resultsArray.flat();
 }
 
 // --- DB Migration Utilities ---
@@ -282,6 +406,278 @@ async function ensureUsersSchema(client) {
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pin_locked_until TIMESTAMP NULL");
 }
 
+async function ensureMessagesAndNotesSchema(client) {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS saved_messages (
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
+            message_text TEXT NOT NULL,
+            tags JSONB DEFAULT '[]'::jsonb,
+            is_pinned BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS user_notes (
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
+            title TEXT NOT NULL,
+            content_text TEXT DEFAULT '',
+            content_json JSONB DEFAULT '{}'::jsonb,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS note_assets (
+            id SERIAL PRIMARY KEY,
+            note_id INT NOT NULL,
+            user_id INT NOT NULL,
+            asset_name TEXT NOT NULL,
+            mime_type TEXT,
+            size_mb NUMERIC,
+            dropbox_path TEXT NOT NULL,
+            storage_source TEXT NOT NULL DEFAULT 'storage_shards',
+            storage_shard_ref TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS latex_documents (
+            id SERIAL PRIMARY KEY,
+            user_id INT NOT NULL,
+            title TEXT NOT NULL,
+            source_text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    `);
+}
+
+function requireProvisionedUser(req, res, next) {
+    if (!req.user || !req.user.id || req.user.preUser) {
+        return res.status(403).send({ message: 'Complete account setup first.' });
+    }
+    return next();
+}
+
+function buildTextExport(note, assets) {
+    const lines = [
+        `Title: ${note.title || ''}`,
+        '',
+        note.content_text || ''
+    ];
+    return Buffer.from(lines.join('\n'), 'utf8');
+}
+
+async function buildDocxExport(note, assets) {
+    const children = [
+        new Paragraph({
+            children: [new TextRun({ text: note.title || 'Untitled note', bold: true, size: 32 })]
+        }),
+        new Paragraph({ text: '' })
+    ];
+
+    const text = note.content_text || '';
+    const regex = /!\[.*?\]\(asset:(.+?)(?:\s+"([^"]+)")?\)/g;
+    
+    let lastIndex = 0;
+    let match;
+    
+    while ((match = regex.exec(text)) !== null) {
+        const textBefore = text.slice(lastIndex, match.index);
+        if (textBefore.trim()) {
+            children.push(new Paragraph({ text: textBefore.trim() }));
+            children.push(new Paragraph({ text: '' }));
+        } else if (lastIndex !== 0 && textBefore.includes('\n')) {
+            children.push(new Paragraph({ text: '' }));
+        }
+
+        const assetName = match[1];
+        const widthStr = match[2];
+        let parsedWidth = widthStr ? parseInt(widthStr, 10) : 480;
+        if (parsedWidth > 600) parsedWidth = 600; // max width for docx
+        
+        const asset = assets.find(a => a.asset_name === assetName);
+        if (asset && asset.dropbox_path && asset.storage_shard_ref) {
+            try {
+                const token = await storageManager.getAccessTokenForReference({
+                    storageSource: 'storage_shards',
+                    shardRef: String(asset.storage_shard_ref)
+                });
+
+                const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ path: String(asset.dropbox_path) })
+                });
+
+                if (response.ok) {
+                    const payload = await response.json();
+                    const imgRes = await fetch(payload.link);
+                    const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+                    
+                    try {
+                        const dimensions = sizeOf(imgBuffer);
+                        const ratio = dimensions.height / dimensions.width;
+                        const height = parsedWidth * ratio;
+                        
+                        children.push(new Paragraph({
+                            children: [
+                                new ImageRun({
+                                    data: imgBuffer,
+                                    transformation: { width: parsedWidth, height }
+                                })
+                            ]
+                        }));
+                        children.push(new Paragraph({ text: '' }));
+                    } catch (imgErr) {
+                        children.push(new Paragraph({
+                            children: [new TextRun({ text: `[Unsupported image format for DOCX: ${asset.mime_type}]`, color: "FF0000" })]
+                        }));
+                        children.push(new Paragraph({ text: '' }));
+                    }
+                } else {
+                    children.push(new Paragraph({
+                        children: [new TextRun({ text: `[Failed to fetch asset: ${assetName}]`, color: "FF0000" })]
+                    }));
+                    children.push(new Paragraph({ text: '' }));
+                }
+            } catch (e) {
+                children.push(new Paragraph({
+                    children: [new TextRun({ text: `[Error fetching asset: ${assetName}]`, color: "FF0000" })]
+                }));
+                children.push(new Paragraph({ text: '' }));
+            }
+        } else {
+            children.push(new Paragraph({
+                children: [new TextRun({ text: `[Asset not found: ${assetName}]`, color: "FF0000" })]
+            }));
+            children.push(new Paragraph({ text: '' }));
+        }
+
+        lastIndex = regex.lastIndex;
+    }
+
+    const textAfter = text.slice(lastIndex);
+    if (textAfter.trim()) {
+        children.push(new Paragraph({ text: textAfter.trim() }));
+    }
+
+    const doc = new Document({
+        sections: [{ children }]
+    });
+
+    return Packer.toBuffer(doc);
+}
+
+async function buildPdfExport(note, assets) {
+    return new Promise(async (resolve, reject) => {
+        try {
+            const doc = new PDFDocument({ margin: 40 });
+            const chunks = [];
+            doc.on('data', (chunk) => chunks.push(chunk));
+            doc.on('end', () => resolve(Buffer.concat(chunks)));
+            doc.on('error', (err) => reject(err));
+
+            doc.fontSize(18).text(note.title || 'Untitled note');
+            doc.moveDown();
+
+            const text = note.content_text || '';
+            const regex = /!\[.*?\]\(asset:(.+?)(?:\s+"([^"]+)")?\)/g;
+            
+            let lastIndex = 0;
+            let match;
+            
+            while ((match = regex.exec(text)) !== null) {
+                const textBefore = text.slice(lastIndex, match.index);
+                if (textBefore.trim()) {
+                    doc.fontSize(12).text(textBefore.trim());
+                    doc.moveDown(0.5);
+                } else if (lastIndex !== 0 && textBefore.includes('\n')) {
+                    doc.moveDown(0.5);
+                }
+
+                const assetName = match[1];
+                const widthStr = match[2];
+                const parsedWidth = widthStr ? parseInt(widthStr, 10) : 480;
+                
+                const asset = assets.find(a => a.asset_name === assetName);
+                if (asset && asset.dropbox_path && asset.storage_shard_ref) {
+                    try {
+                        const token = await storageManager.getAccessTokenForReference({
+                            storageSource: 'storage_shards',
+                            shardRef: String(asset.storage_shard_ref)
+                        });
+
+                        const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${token}`,
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ path: String(asset.dropbox_path) })
+                        });
+
+                        if (response.ok) {
+                            const payload = await response.json();
+                            const imgRes = await fetch(payload.link);
+                            const imgBuffer = await imgRes.arrayBuffer();
+                            
+                            try {
+                                const buf = Buffer.from(imgBuffer);
+                                const dimensions = sizeOf(buf);
+                                const ratio = dimensions.height / dimensions.width;
+                                const finalWidth = parsedWidth > 500 ? 500 : parsedWidth;
+                                const scaledHeight = finalWidth * ratio;
+                                
+                                if (doc.y + scaledHeight > doc.page.height - doc.page.margins.bottom) {
+                                    doc.addPage();
+                                }
+                                
+                                doc.image(buf, doc.x, doc.y, { width: finalWidth });
+                                doc.y += scaledHeight;
+                                doc.moveDown(0.5);
+                            } catch (imgErr) {
+                                console.error('Image rendering error:', imgErr);
+                                doc.fontSize(10).fillColor('red').text(`[Image Error: ${imgErr.message}]`).fillColor('black');
+                                doc.moveDown(0.5);
+                            }
+                        } else {
+                            doc.fontSize(10).fillColor('red').text(`[Failed to fetch asset: ${assetName}]`).fillColor('black');
+                            doc.moveDown(0.5);
+                        }
+                    } catch (e) {
+                        doc.fontSize(10).fillColor('red').text(`[Error fetching asset: ${assetName}]`).fillColor('black');
+                        doc.moveDown(0.5);
+                    }
+                } else {
+                    doc.fontSize(10).fillColor('red').text(`[Asset not found: ${assetName}]`).fillColor('black');
+                    doc.moveDown(0.5);
+                }
+
+                lastIndex = regex.lastIndex;
+            }
+
+            const textAfter = text.slice(lastIndex);
+            if (textAfter.trim()) {
+                doc.fontSize(12).text(textAfter.trim());
+            }
+
+            doc.end();
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
 // --- AUTH ROUTES ---
 
 app.post('/api/auth/send-otp', async (req, res) => {
@@ -291,7 +687,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
         console.warn('[Auth] send-otp missing email');
         return res.status(400).send('Email required');
     }
-    
+
     const success = await auth.sendOTP(email);
     if (success) {
         console.log(`[Auth] OTP sent to ${email}`);
@@ -307,13 +703,13 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     console.log(`[Auth] verify-otp attempt for email=${email}`);
     if (auth.verifyOTP(email, otp)) {
         console.log(`[Auth] OTP verified for ${email}`);
-        
+
         try {
             const result = await executeWithDB(async (client) => {
                 // Check if user already exists
                 await ensureUsersSchema(client);
                 const q = await client.query('SELECT id, pin_hash FROM users WHERE email = $1', [email]);
-                
+
                 // Ensure auth_tokens exists
                 await client.query(`
                     CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -344,7 +740,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
                     await client.query(`
                        CREATE INDEX IF NOT EXISTS pre_users_created_idx ON pre_users (created_at);
                     `);
-                    
+
                     const newToken = uuidv4();
                     await client.query('INSERT INTO pre_users (token, email) VALUES ($1, $2)', [newToken, email]);
                     return { token: newToken, isNew: true };
@@ -373,6 +769,12 @@ async function verifyAuthToken(req, res, next) {
     if (parts.length !== 2) return res.status(401).send({ message: 'Invalid Authorization format' });
     const token = parts[1];
 
+    const cachedUser = getTokenCache(token);
+    if (cachedUser) {
+        req.user = cachedUser;
+        return next();
+    }
+
     try {
         // 1) Check for fully-provisioned token in auth_tokens
         const row = await executeWithDB(async (client) => {
@@ -392,6 +794,7 @@ async function verifyAuthToken(req, res, next) {
         });
         if (row && !row.revoked) {
             req.user = { id: row.user_id, token };
+            setTokenCache(token, req.user);
             return next();
         }
 
@@ -416,6 +819,7 @@ async function verifyAuthToken(req, res, next) {
         if (pre && pre.email) {
             // Allow access but mark as onboarding/pre-user (limited privileges expected by handlers)
             req.user = { id: null, email: pre.email, token, preUser: true };
+            setTokenCache(token, req.user);
             return next();
         }
 
@@ -739,6 +1143,7 @@ app.post('/api/auth/revoke-token', verifyAuthToken, async (req, res) => {
             await client.query('UPDATE auth_tokens SET revoked = TRUE WHERE token = $1', [token]);
             // Optionally remove tokens from sessions or cleanup
         });
+        tokenCache.delete(token);
         res.json({ ok: true });
     } catch (e) {
         console.error('Revoke token failed', e);
@@ -800,7 +1205,7 @@ app.post('/api/admin/add-db-shard', async (req, res) => {
     // protect this route in production
     const { connectionString, nickname } = req.body;
     console.log('[Admin] add-db-shard called', { connectionString: connectionString ? '***' : null, nickname });
-    
+
     let client;
     try {
         client = await tryConnect(MASTER_DB_URL);
@@ -809,10 +1214,10 @@ app.post('/api/admin/add-db-shard', async (req, res) => {
             [connectionString, nickname]
         );
         res.send('Shard added');
-    } catch(e) {
+    } catch (e) {
         res.status(500).send(e.message);
     } finally {
-        if (client) try { await client.end(); } catch(e) {}
+        if (client) try { await client.end(); } catch (e) { }
     }
 });
 
@@ -820,7 +1225,7 @@ app.post('/api/admin/add-storage-shard', async (req, res) => {
     // protect this route in production
     const { refreshToken, appKey, appSecret } = req.body;
     console.log('[Admin] add-storage-shard called', { hasRefreshToken: !!refreshToken, appKey: appKey ? '***' : null });
-    
+
     let client;
     try {
         client = await tryConnect(MASTER_DB_URL);
@@ -829,10 +1234,10 @@ app.post('/api/admin/add-storage-shard', async (req, res) => {
             [refreshToken, appKey, appSecret]
         );
         res.send('Storage shard added');
-    } catch(e) {
+    } catch (e) {
         res.status(500).send(e.message);
     } finally {
-        if (client) try { await client.end(); } catch(e) {}
+        if (client) try { await client.end(); } catch (e) { }
     }
 });
 
@@ -840,15 +1245,30 @@ app.post('/api/admin/add-storage-shard', async (req, res) => {
 // --- FILE ROUTES ---
 
 app.get('/api/storage/best-account', async (req, res) => {
-    const sizeMb = parseFloat(req.query.size_mb || '0');
-    console.log(`[Storage] best-account requested for size: ${sizeMb.toFixed(2)}MB`);
     try {
+        let sizeMb = 0;
+        if (req.query.size_mb) {
+            sizeMb = parseFloat(req.query.size_mb) || 0;
+        }
+
         const account = await storageManager.getFittestStorageAccount(sizeMb);
-        console.log(`[Storage] returning shard id=${account.shard_id}`);
-        res.json(account);
+        res.json({
+            access_token: account.access_token,
+            shard_id: account.shard_id
+        });
     } catch (e) {
-        console.error('[Storage] best-account error:', e);
-        res.status(500).send(e.message);
+        console.error('Failed to get best storage account:', e.message);
+        res.status(500).json({ message: 'Storage capacity exhausted or unavailable', error: e.message });
+    }
+});
+
+app.get('/api/storage/cluster-status', verifyAuthToken, async (req, res) => {
+    try {
+        const stats = await storageManager.getTotalStorageStats();
+        res.json(stats);
+    } catch (e) {
+        console.error('Failed to get cluster status:', e.message);
+        res.status(500).json({ message: 'Failed to fetch cluster status', error: e.message });
     }
 });
 
@@ -887,7 +1307,7 @@ app.post('/api/files/create-folder', async (req, res) => {
 
             const name = path.split('/').filter(Boolean).pop() || '/';
             const parentPath = getParentPath(path);
-            
+
             await workerClient.query(
                 'INSERT INTO files (user_id, path, parent_path, name, is_folder) VALUES ($1, $2, $3, $4, true)',
                 [user_id, path, parentPath, name]
@@ -917,7 +1337,7 @@ app.post('/api/files/upload-metadata', async (req, res) => {
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             `);
-             try {
+            try {
                 await workerClient.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS parent_path TEXT');
             } catch (e) { /* ignore */ }
 
@@ -941,7 +1361,7 @@ app.get('/api/files/list', async (req, res) => {
     try {
         // Use executeOnAllDBs to query ALL shards
         const result = await executeOnAllDBs(async (workerClient) => {
-             // Ensure schema (idempotent)
+            // Ensure schema (idempotent)
             await workerClient.query(`
                 CREATE TABLE IF NOT EXISTS files (
                     id SERIAL PRIMARY KEY,
@@ -1001,15 +1421,15 @@ app.get('/api/files/list', async (req, res) => {
 app.get('/api/files/download-zip', async (req, res) => {
     const { path, user_id } = req.query;
     console.log('[Files] download-zip requested', { path, user_id });
-    
+
     try {
         // 1. Get Token
         const account = await storageManager.getFittestStorageAccount();
         const token = account.access_token;
-        
+
         // 2. Call Dropbox download_zip
         const dbxUrl = 'https://content.dropboxapi.com/2/files/download_zip';
-        
+
         const response = await fetch(dbxUrl, {
             method: 'POST',
             headers: {
@@ -1022,8 +1442,8 @@ app.get('/api/files/download-zip', async (req, res) => {
             const errText = await response.text();
             // Dropbox specific error handling
             if (response.status === 409) {
-                 // path not found etc
-                 return res.status(404).send("Folder not found or path error.");
+                // path not found etc
+                return res.status(404).send("Folder not found or path error.");
             }
             throw new Error(`Dropbox error: ${response.statusText} - ${errText}`);
         }
@@ -1032,7 +1452,7 @@ app.get('/api/files/download-zip', async (req, res) => {
         const safeName = (path === '/' ? 'root' : path.split('/').pop()) || 'archive';
         res.setHeader('Content-Type', 'application/zip');
         res.setHeader('Content-Disposition', `attachment; filename="${safeName}.zip"`);
-        
+
         // Pipe the node-fetch body string (buffer) or stream to express res
         response.body.pipe(res);
 
@@ -1045,7 +1465,7 @@ app.get('/api/files/download-zip', async (req, res) => {
 
 // Helper for UUID
 function generateUUID() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
         var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
         return v.toString(16);
     });
@@ -1057,10 +1477,10 @@ app.post('/api/upload/init', async (req, res) => {
     const { user_id, path, name, total_size_mb, total_chunks } = req.body;
     console.log('[Upload] init', { user_id, path, chunks: total_chunks });
     const fileId = generateUUID();
-    
+
     try {
         await executeWithDB(async (client) => {
-             await client.query(`
+            await client.query(`
                 CREATE TABLE IF NOT EXISTS file_uploads (
                     file_id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
@@ -1072,7 +1492,7 @@ app.post('/api/upload/init', async (req, res) => {
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             `);
-             await client.query(`
+            await client.query(`
                 CREATE TABLE IF NOT EXISTS file_chunks (
                     id SERIAL PRIMARY KEY,
                     file_id TEXT NOT NULL,
@@ -1092,14 +1512,14 @@ app.post('/api/upload/init', async (req, res) => {
             } catch (e) {
                 console.log('Schema update skipped/failed', e.message);
             }
-            
+
             await client.query(
                 'INSERT INTO file_uploads (file_id, user_id, path, name, total_size_mb, total_chunks) VALUES ($1, $2, $3, $4, $5, $6)',
                 [fileId, user_id, path, name, total_size_mb, total_chunks]
             );
         });
         res.json({ fileId });
-    } catch(e) {
+    } catch (e) {
         console.error('Init Upload Failed', e);
         res.status(500).send(e.message);
     }
@@ -1113,7 +1533,7 @@ app.post('/api/upload/status', async (req, res) => {
                 'SELECT chunk_index, size_mb, status FROM file_chunks WHERE file_id = $1 AND status = \'uploaded\'',
                 [fileId]
             );
-            
+
             const uploadRes = await client.query(
                 'SELECT total_chunks FROM file_uploads WHERE file_id = $1',
                 [fileId]
@@ -1141,26 +1561,26 @@ app.post('/api/upload/status', async (req, res) => {
 // 2. Allocate Chunk: Decide where to put a specific chunk
 app.post('/api/upload/allocate-chunk', async (req, res) => {
     const { fileId, chunkIndex, sizeMb } = req.body;
-    
+
     try {
         // 1. Check if already allocated (Idempotency)
         let existing = null;
         await executeWithDB(async (client) => {
             const res = await client.query(
-                'SELECT shard_id, dropbox_path FROM file_chunks WHERE file_id=$1 AND chunk_index=$2', 
+                'SELECT shard_id, dropbox_path FROM file_chunks WHERE file_id=$1 AND chunk_index=$2',
                 [fileId, chunkIndex]
             );
             if (res.rows.length > 0) existing = res.rows[0];
         });
 
         if (existing) {
-             console.log(`[Upload] Chunk ${chunkIndex} already allocated on shard ${existing.shard_id}`);
-             const token = await storageManager.getAccessTokenForShard(existing.shard_id);
-             return res.json({
-                 shardId: existing.shard_id,
-                 accessToken: token,
-                 uploadPath: existing.dropbox_path
-             });
+            console.log(`[Upload] Chunk ${chunkIndex} already allocated on shard ${existing.shard_id}`);
+            const token = await storageManager.getAccessTokenForShard(existing.shard_id);
+            return res.json({
+                shardId: existing.shard_id,
+                accessToken: token,
+                uploadPath: existing.dropbox_path
+            });
         }
 
         // 2. Not found, allocate new
@@ -1170,7 +1590,7 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
         // 3. Reserve space in DB (Handle race condition & PK overlaps)
         let allocated = null;
         let attempts = 0;
-        
+
         while (!allocated && attempts < 3) {
             attempts++;
             try {
@@ -1178,28 +1598,28 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
                 const newChunkId = generateUUID(); // Use helper or uuidv4
 
                 await executeWithDB(async (client) => {
-                     await client.query(
-                         `INSERT INTO file_chunks (chunk_id, file_id, chunk_index, shard_id, size_mb, status, dropbox_path) 
+                    await client.query(
+                        `INSERT INTO file_chunks (chunk_id, file_id, chunk_index, shard_id, size_mb, status, dropbox_path) 
                           VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
-                         [newChunkId, fileId, chunkIndex, account.shard_id, sizeMb, remotePath]
-                     );
+                        [newChunkId, fileId, chunkIndex, account.shard_id, sizeMb, remotePath]
+                    );
                 });
                 allocated = { shardId: account.shard_id, uploadPath: remotePath };
             } catch (dbErr) {
                 // Check if it's a constraint violation
                 if (dbErr.message && (dbErr.message.includes('unique') || dbErr.message.includes('duplicate') || dbErr.code === '23505')) {
-                     
-                     // A. Check if it's a LOGICAL collision (file_id + chunk_index already exists)
-                     let raceExisting = null;
-                     await executeWithDB(async (client) => {
+
+                    // A. Check if it's a LOGICAL collision (file_id + chunk_index already exists)
+                    let raceExisting = null;
+                    await executeWithDB(async (client) => {
                         const res = await client.query(
-                            'SELECT shard_id, dropbox_path FROM file_chunks WHERE file_id=$1 AND chunk_index=$2', 
+                            'SELECT shard_id, dropbox_path FROM file_chunks WHERE file_id=$1 AND chunk_index=$2',
                             [fileId, chunkIndex]
                         );
                         if (res.rows.length > 0) raceExisting = res.rows[0];
-                     });
-                     
-                     if (raceExisting) {
+                    });
+
+                    if (raceExisting) {
                         console.log(`[Upload] Chunk ${chunkIndex} allocation found existing (race/retry).`);
                         const token = await storageManager.getAccessTokenForShard(raceExisting.shard_id);
                         return res.json({
@@ -1207,16 +1627,16 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
                             accessToken: token,
                             uploadPath: raceExisting.dropbox_path
                         });
-                     }
+                    }
 
-                     // B. If logical record NOT found, it was a random PK collision (unlikely with UUID) or '0' default collision
-                     console.warn(`[Upload] Chunk ${chunkIndex} allocation PK collision (attempt ${attempts}). Retrying...`);
-                     continue; // Retry insert loop with new UUID
+                    // B. If logical record NOT found, it was a random PK collision (unlikely with UUID) or '0' default collision
+                    console.warn(`[Upload] Chunk ${chunkIndex} allocation PK collision (attempt ${attempts}). Retrying...`);
+                    continue; // Retry insert loop with new UUID
                 }
                 throw dbErr; // valid DB error
             }
         }
-        
+
         if (allocated) {
             return res.json({
                 shardId: allocated.shardId,
@@ -1224,9 +1644,9 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
                 uploadPath: allocated.uploadPath
             });
         }
-        
+
         throw new Error("Unable to allocate chunk after multiple retries.");
-    } catch(e) {
+    } catch (e) {
         console.error('Allocate Chunk Failed', e);
         res.status(500).send(e.message);
     }
@@ -1236,15 +1656,15 @@ app.post('/api/upload/allocate-chunk', async (req, res) => {
 app.post('/api/upload/cancel', async (req, res) => {
     const { fileId } = req.body;
     if (!fileId) return res.status(400).send('fileId required');
-    
+
     console.log(`[Upload] Cancelling upload for fileId=${fileId}`);
     try {
         await executeWithDB(async (client) => {
-             // 1. Delete chunks (Metadata)
-             await client.query('DELETE FROM file_chunks WHERE file_id=$1', [fileId]);
-             // 2. Delete file record (Metadata)
-             await client.query('DELETE FROM file_uploads WHERE file_id=$1', [fileId]);
-             // 3. Ideally cleanup actual files from storage if possible (deferred)
+            // 1. Delete chunks (Metadata)
+            await client.query('DELETE FROM file_chunks WHERE file_id=$1', [fileId]);
+            // 2. Delete file record (Metadata)
+            await client.query('DELETE FROM file_uploads WHERE file_id=$1', [fileId]);
+            // 3. Ideally cleanup actual files from storage if possible (deferred)
         });
         res.json({ ok: true });
     } catch (e) {
@@ -1257,28 +1677,28 @@ app.post('/api/upload/cancel', async (req, res) => {
 app.post('/api/upload/finalize', async (req, res) => {
     const { fileId, chunks } = req.body; // chunks is array of { index, shardId, path, success }
     console.log(`[Upload] finalizing ${fileId}`);
-    
+
     try {
         await executeWithDB(async (client) => {
             // Update status
             await client.query("UPDATE file_uploads SET status='completed' WHERE file_id=$1", [fileId]);
-            
+
             // DB MIGRATION FIX: Ensure no strict constraints block us if schema drifted
             try {
                 await client.query('ALTER TABLE file_chunks ALTER COLUMN shard_id DROP NOT NULL');
-            } catch(e) {}
+            } catch (e) { }
             try {
                 await client.query('ALTER TABLE file_chunks ALTER COLUMN storage_shard_id DROP NOT NULL');
-            } catch(e) {}
+            } catch (e) { }
             try {
                 await client.query('ALTER TABLE file_chunks ALTER COLUMN chunk_id DROP NOT NULL');
                 await client.query("ALTER TABLE file_chunks ALTER COLUMN chunk_id SET DEFAULT 0");
-            } catch(e) {}
+            } catch (e) { }
 
             // Log chunks
             for (const c of chunks) {
                 // Handle case where shardId is missing (legacy/error)
-                const safeShardId = c.shardId || c.shard_id || 0; 
+                const safeShardId = c.shardId || c.shard_id || 0;
 
                 // Convert size (bytes) if provided
                 const sizeBytes = c.size || c.size_bytes || 0;
@@ -1296,7 +1716,7 @@ app.post('/api/upload/finalize', async (req, res) => {
                         `UPDATE file_chunks 
                          SET status='completed', shard_id=$3, dropbox_path=$4, size_mb=$5 
                          WHERE file_id=$1 AND chunk_index=$2`,
-                         [fileId, c.index, safeShardId, c.path, sizeMb]
+                        [fileId, c.index, safeShardId, c.path, sizeMb]
                     );
                     // console.log(`Updated pending chunk for file=${fileId} index=${c.index}`);
                     continue;
@@ -1312,7 +1732,7 @@ app.post('/api/upload/finalize', async (req, res) => {
                 } catch (insertErr) {
                     // FALLBACK 1: Maybe 'shard_id' column doesn't exist? Try only storage_shard_id
                     if (insertErr.message && insertErr.message.includes('shard_id')) {
-                         try {
+                        try {
                             const newChunkId = generateUUID();
                             await client.query(
                                 `INSERT INTO file_chunks 
@@ -1321,7 +1741,7 @@ app.post('/api/upload/finalize', async (req, res) => {
                                 [fileId, c.index, safeShardId, c.path, sizeMb, newChunkId]
                             );
                             continue; // Success
-                         } catch (e2) { /* ignore, try next fallback */ }
+                        } catch (e2) { /* ignore, try next fallback */ }
                     }
 
                     // FALLBACK 2: Explicit chunk_id needed? (Redundant if we already add it, but keep for safety)
@@ -1335,18 +1755,18 @@ app.post('/api/upload/finalize', async (req, res) => {
                         );
                     } else {
                         console.error("Unknown Insert Error detail:", insertErr);
-                         // Last ditch: try basic insert again in case transient
-                         throw insertErr;
+                        // Last ditch: try basic insert again in case transient
+                        throw insertErr;
                     }
                 }
             }
-            
+
             // Get original metadata to insert into main 'files' table for listing
             const metaRes = await client.query('SELECT * FROM file_uploads WHERE file_id=$1', [fileId]);
             const meta = metaRes.rows[0];
-            
+
             if (meta) {
-                 await client.query(`
+                await client.query(`
                     CREATE TABLE IF NOT EXISTS files (
                         id SERIAL PRIMARY KEY,
                         user_id TEXT NOT NULL,
@@ -1360,12 +1780,12 @@ app.post('/api/upload/finalize', async (req, res) => {
                         created_at TIMESTAMP DEFAULT NOW()
                     );
                 `);
-                
-                 // Add column if missing
-                try { await client.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS file_id_ref TEXT'); } catch(e){}
+
+                // Add column if missing
+                try { await client.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS file_id_ref TEXT'); } catch (e) { }
 
                 const parentPath = getParentPath(meta.path);
-                
+
                 // Note: dropbox_path is effectively 'distributed://<fileId>' or similar, or specific entry
                 // We'll mark it with a special prefix so download knows to look up chunks
                 await client.query(
@@ -1375,9 +1795,9 @@ app.post('/api/upload/finalize', async (req, res) => {
             }
         });
         res.json({ ok: true });
-    } catch(e) {
-         console.error('Finalize Failed', e);
-         res.status(500).send(e.message);
+    } catch (e) {
+        console.error('Finalize Failed', e);
+        res.status(500).send(e.message);
     }
 });
 
@@ -1405,55 +1825,55 @@ app.post('/api/files/delete', async (req, res) => {
 
             // Function to delete a single file record and its chunks (Batched)
             async function deleteOneFile(file) {
-                 if (file.is_folder) return; // safety
+                if (file.is_folder) return; // safety
 
-                 // Distributed File
-                 if (file.dropbox_path === 'distributed' && file.file_id_ref) {
-                     // Batch chunk deletion loop to handle millions of chunks
-                     let hasMoreChunks = true;
-                     while(hasMoreChunks) {
-                         // Use ctid (physical row location) to identify rows if 'id' column is missing or for efficient batching
-                         const chunkRes = await client.query(
-                             'SELECT ctid, shard_id, dropbox_path FROM file_chunks WHERE file_id = $1 LIMIT 1000',
-                             [file.file_id_ref]
-                         );
-                         
-                         if (chunkRes.rows.length === 0) {
-                             hasMoreChunks = false;
-                             break;
-                         }
+                // Distributed File
+                if (file.dropbox_path === 'distributed' && file.file_id_ref) {
+                    // Batch chunk deletion loop to handle millions of chunks
+                    let hasMoreChunks = true;
+                    while (hasMoreChunks) {
+                        // Use ctid (physical row location) to identify rows if 'id' column is missing or for efficient batching
+                        const chunkRes = await client.query(
+                            'SELECT ctid, shard_id, dropbox_path FROM file_chunks WHERE file_id = $1 LIMIT 1000',
+                            [file.file_id_ref]
+                        );
 
-                         const shardMap = {};
-                         const chunkCtids = [];
-                         for (const c of chunkRes.rows) {
+                        if (chunkRes.rows.length === 0) {
+                            hasMoreChunks = false;
+                            break;
+                        }
+
+                        const shardMap = {};
+                        const chunkCtids = [];
+                        for (const c of chunkRes.rows) {
                             if (!shardMap[c.shard_id]) shardMap[c.shard_id] = [];
                             shardMap[c.shard_id].push(c.dropbox_path);
                             chunkCtids.push(c.ctid);
-                         }
-                         
-                         // Insert into deletion queue instead of direct delete
-                         for (const sId of Object.keys(shardMap)) {
-                             // shardMap[sId] is array of paths
-                             await client.query(
-                                 'INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', 
-                                 [sId, shardMap[sId]]
-                             );
-                         }
-                         
-                         // Delete this batch from DB using ctid
-                         // Note: Passing array of ctids requires explicit cast to tid[]
-                         await client.query('DELETE FROM file_chunks WHERE ctid = ANY($1::tid[])', [chunkCtids]);
-                     }
-                     // Clean upload record
-                     await client.query('DELETE FROM file_uploads WHERE file_id = $1', [file.file_id_ref]);
+                        }
 
-                 } else {
-                     // Legacy/Simple File
-                     // Logic omitted for brevity, assumed cleaned up or handled manually
-                 }
+                        // Insert into deletion queue instead of direct delete
+                        for (const sId of Object.keys(shardMap)) {
+                            // shardMap[sId] is array of paths
+                            await client.query(
+                                'INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)',
+                                [sId, shardMap[sId]]
+                            );
+                        }
 
-                 // Remove from 'files' table
-                 await client.query('DELETE FROM files WHERE id = $1', [file.id]);
+                        // Delete this batch from DB using ctid
+                        // Note: Passing array of ctids requires explicit cast to tid[]
+                        await client.query('DELETE FROM file_chunks WHERE ctid = ANY($1::tid[])', [chunkCtids]);
+                    }
+                    // Clean upload record
+                    await client.query('DELETE FROM file_uploads WHERE file_id = $1', [file.file_id_ref]);
+
+                } else {
+                    // Legacy/Simple File
+                    // Logic omitted for brevity, assumed cleaned up or handled manually
+                }
+
+                // Remove from 'files' table
+                await client.query('DELETE FROM files WHERE id = $1', [file.id]);
             }
 
             // 1. Resolve target
@@ -1463,26 +1883,26 @@ app.post('/api/files/delete', async (req, res) => {
 
             if (target.is_folder) {
                 console.log(`[Delete] Deleting folder recursively: ${path}`);
-                
+
                 // 1. Delete all descendant files in batches
-                while(true) {
+                while (true) {
                     const fileBatch = await client.query(
-                        "SELECT * FROM files WHERE user_id=$1 AND path LIKE $2 AND is_folder=false LIMIT 200", 
+                        "SELECT * FROM files WHERE user_id=$1 AND path LIKE $2 AND is_folder=false LIMIT 200",
                         [userId, path + '/%']
                     );
-                    
+
                     if (fileBatch.rows.length === 0) break;
-                    
+
                     console.log(`[Delete] Processing batch of ${fileBatch.rows.length} files...`);
                     for (const f of fileBatch.rows) {
                         await deleteOneFile(f);
                     }
                 }
-                
+
                 // 2. Delete all subfolders records
                 // Since we don't have FK constraints on parent_path, we can just bulk delete
                 await client.query(
-                    "DELETE FROM files WHERE user_id=$1 AND path LIKE $2 AND is_folder=true", 
+                    "DELETE FROM files WHERE user_id=$1 AND path LIKE $2 AND is_folder=true",
                     [userId, path + '/%']
                 );
 
@@ -1493,11 +1913,11 @@ app.post('/api/files/delete', async (req, res) => {
                 // Just a file
                 await deleteOneFile(target);
             }
-            
+
             res.json({ ok: true });
         });
 
-    } catch(e) {
+    } catch (e) {
         console.error('[Delete] Failed', e);
         res.status(500).send(e.message);
     }
@@ -1508,7 +1928,7 @@ app.post('/api/files/delete', async (req, res) => {
 app.post('/api/files/download-info', async (req, res) => {
     const { fileIdRef } = req.body;
     console.log('[Download] get info for', fileIdRef);
-    
+
     try {
         const chunks = await executeWithDB(async (client) => {
             const resChunks = await client.query(
@@ -1526,7 +1946,7 @@ app.post('/api/files/download-info', async (req, res) => {
         for (const sId of uniqueShardIds) {
             try {
                 tokenMap[sId] = await storageManager.getAccessTokenForShard(sId);
-            } catch(e) {
+            } catch (e) {
                 console.error(`Failed to get token for shard ${sId}`, e);
             }
         }
@@ -1541,19 +1961,647 @@ app.post('/api/files/download-info', async (req, res) => {
                 });
             }
         });
-        
+
         // Optionally include file-level metadata to help the client verify integrity
         const metaRes = await executeWithDB(async (client) => {
             const r = await client.query('SELECT total_chunks, total_size_mb FROM file_uploads WHERE file_id=$1', [fileIdRef]);
             return r.rows[0];
         });
 
-        chunksWithTokens.sort((a,b) => a.index - b.index);
+        chunksWithTokens.sort((a, b) => a.index - b.index);
         res.json({ chunks: chunksWithTokens, total_chunks: metaRes?.total_chunks || null, total_size_mb: metaRes?.total_size_mb || null });
 
-    } catch(e) {
+    } catch (e) {
         console.error('Download Info Failed', e);
         res.status(500).send(e.message);
+    }
+});
+
+// --- SAVED MESSAGES ROUTES ---
+
+app.get('/api/messages/saved', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    try {
+        const rows = await executeWithDB(async (client) => {
+            const result = await client.query(
+                `SELECT id, user_id, message_text, tags, is_pinned, created_at, updated_at
+                 FROM saved_messages
+                 WHERE user_id = $1
+                 ORDER BY is_pinned DESC, created_at DESC`,
+                [req.user.id]
+            );
+            return result.rows;
+        });
+
+        res.json({ items: rows });
+    } catch (e) {
+        console.error('List saved messages failed', e);
+        res.status(500).send({ message: 'Failed to list saved messages', error: e.message });
+    }
+});
+
+app.post('/api/messages/saved', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const { messageText, tags, isPinned } = req.body || {};
+    if (!messageText || !String(messageText).trim()) {
+        return res.status(400).send({ message: 'messageText is required' });
+    }
+
+    try {
+        const row = await executeWithDB(async (client) => {
+            const result = await client.query(
+                `INSERT INTO saved_messages (user_id, message_text, tags, is_pinned)
+                 VALUES ($1, $2, $3::jsonb, $4)
+                 RETURNING id, user_id, message_text, tags, is_pinned, created_at, updated_at`,
+                [
+                    req.user.id,
+                    String(messageText),
+                    JSON.stringify(Array.isArray(tags) ? tags : []),
+                    Boolean(isPinned)
+                ]
+            );
+            return result.rows[0];
+        });
+
+        res.json({ item: row });
+    } catch (e) {
+        console.error('Create saved message failed', e);
+        res.status(500).send({ message: 'Failed to create saved message', error: e.message });
+    }
+});
+
+app.delete('/api/messages/saved/:id', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).send({ message: 'Invalid id' });
+
+    try {
+        const deleted = await executeWithDB(async (client) => {
+            const result = await client.query(
+                'DELETE FROM saved_messages WHERE id = $1 AND user_id = $2 RETURNING id',
+                [id, req.user.id]
+            );
+            return result.rowCount > 0;
+        });
+
+        if (!deleted) return res.status(404).send({ message: 'Saved message not found' });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Delete saved message failed', e);
+        res.status(500).send({ message: 'Failed to delete saved message', error: e.message });
+    }
+});
+
+// --- NOTES ROUTES ---
+
+app.get('/api/notes', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    try {
+        const results = await executeScatterGather(async (client, shardId) => {
+            const result = await client.query(
+                `SELECT id, user_id, title, content_text, content_json, created_at, updated_at
+                 FROM user_notes
+                 WHERE user_id = $1
+                 ORDER BY updated_at DESC`,
+                [req.user.id]
+            );
+            return result.rows.map(row => ({ ...row, shard_id: shardId }));
+        });
+        
+        // Flatten and sort the combined results
+        const items = results.flat().filter(Boolean);
+        items.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+
+        res.json({ items });
+    } catch (e) {
+        console.error('List notes failed', e);
+        res.status(500).send({ message: 'Failed to list notes', error: e.message });
+    }
+});
+
+app.post('/api/notes', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const { title, contentText, contentJson } = req.body || {};
+    const safeTitle = (title && String(title).trim()) ? String(title).trim() : 'Untitled note';
+    const noteId = randomUUID();
+
+    try {
+        const item = await executeWithDB(async (client) => {
+            const result = await client.query(
+                `INSERT INTO user_notes (id, user_id, title, content_text, content_json)
+                 VALUES ($1, $2, $3, $4, $5::jsonb)
+                 RETURNING id, user_id, title, content_text, content_json, created_at, updated_at`,
+                [noteId, req.user.id, safeTitle, String(contentText || ''), JSON.stringify(contentJson || {})]
+            );
+            return result.rows[0];
+        });
+        res.json({ item });
+    } catch (e) {
+        console.error('Create note failed', e);
+        res.status(500).send({ message: 'Failed to create note', error: e.message });
+    }
+});
+
+app.get('/api/notes/:id', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = req.params.id;
+    if (!id) return res.status(400).send({ message: 'Invalid note id' });
+
+    try {
+        const results = await executeScatterGather(async (client, shardId) => {
+            const noteRes = await client.query(
+                `SELECT id, user_id, title, content_text, content_json, created_at, updated_at
+                 FROM user_notes
+                 WHERE id = $1 AND user_id = $2`,
+                [id, req.user.id]
+            );
+            if (noteRes.rows.length === 0) return null;
+
+            const assetsRes = await client.query(
+                `SELECT id, note_id, user_id, asset_name, mime_type, size_mb, dropbox_path, storage_source, storage_shard_ref, created_at
+                 FROM note_assets
+                 WHERE note_id = $1 AND user_id = $2
+                 ORDER BY created_at DESC`,
+                [id, req.user.id]
+            );
+
+            return {
+                item: { ...noteRes.rows[0], shard_id: shardId },
+                assets: assetsRes.rows.map(a => ({ ...a, shard_id: shardId }))
+            };
+        });
+
+        const payload = results.find(Boolean);
+
+        if (!payload) return res.status(404).send({ message: 'Note not found' });
+        res.json(payload);
+    } catch (e) {
+        console.error('Get note failed', e);
+        res.status(500).send({ message: 'Failed to fetch note', error: e.message });
+    }
+});
+
+app.put('/api/notes/:id', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = req.params.id;
+    if (!id) return res.status(400).send({ message: 'Invalid note id' });
+
+    const { title, contentText, contentJson } = req.body || {};
+    if (!title && contentText === undefined && contentJson === undefined) {
+        return res.status(400).send({ message: 'No fields provided to update' });
+    }
+
+    try {
+        const results = await executeScatterGather(async (client, shardId) => {
+            const sets = [];
+            const values = [];
+            let i = 1;
+            if (title !== undefined) {
+                sets.push(`title = $${i++}`);
+                values.push(String(title).trim() || 'Untitled note');
+            }
+            if (contentText !== undefined) {
+                sets.push(`content_text = $${i++}`);
+                values.push(String(contentText));
+            }
+            if (contentJson !== undefined) {
+                sets.push(`content_json = $${i++}::jsonb`);
+                values.push(JSON.stringify(contentJson));
+            }
+
+            sets.push(`updated_at = NOW()`);
+            values.push(id, req.user.id);
+
+            const result = await client.query(
+                `UPDATE user_notes
+                 SET ${sets.join(', ')}
+                 WHERE id = $${i} AND user_id = $${i + 1}
+                 RETURNING id, user_id, title, content_text, content_json, created_at, updated_at`,
+                values
+            );
+            return result.rows.length > 0 ? { ...result.rows[0], shard_id: shardId } : null;
+        });
+
+        const item = results.find(Boolean);
+
+        if (!item) return res.status(404).send({ message: 'Note not found' });
+        res.json({ item });
+    } catch (e) {
+        console.error('Update note failed', e);
+        res.status(500).send({ message: 'Failed to update note', error: e.message });
+    }
+});
+
+app.delete('/api/notes/:id', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).send({ message: 'Invalid note id' });
+
+    try {
+        const deleted = await executeWithDB(async (client) => {
+            await client.query('DELETE FROM note_assets WHERE note_id = $1 AND user_id = $2', [id, req.user.id]);
+            const result = await client.query('DELETE FROM user_notes WHERE id = $1 AND user_id = $2 RETURNING id', [id, req.user.id]);
+            return result.rowCount > 0;
+        });
+
+        if (!deleted) return res.status(404).send({ message: 'Note not found' });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Delete note failed', e);
+        res.status(500).send({ message: 'Failed to delete note', error: e.message });
+    }
+});
+
+app.post('/api/notes/:id/media/init', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const noteId = req.params.id;
+    if (!noteId) return res.status(400).send({ message: 'Invalid note id' });
+
+    const { fileName, mimeType, sizeMb } = req.body || {};
+    if (!fileName) return res.status(400).send({ message: 'fileName is required' });
+
+    try {
+        const results = await executeScatterGather(async (client) => {
+            const result = await client.query('SELECT id FROM user_notes WHERE id = $1 AND user_id = $2', [noteId, req.user.id]);
+            return result.rows.length > 0;
+        });
+        const noteExists = results.some(Boolean);
+        if (!noteExists) return res.status(404).send({ message: 'Note not found' });
+
+        const account = await storageManager.getFittestStorageAccountForNotes(parseFloat(sizeMb || 0));
+        const safeName = String(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
+        const uploadPath = `/keepr_notes/${req.user.id}/${noteId}/${Date.now()}_${safeName}`;
+
+        res.json({
+            accessToken: account.access_token,
+            uploadPath,
+            storageSource: account.storage_source || 'storage_shards',
+            storageShardRef: account.shard_ref || String(account.shard_id)
+        });
+    } catch (e) {
+        console.error('Init note media upload failed', e);
+        res.status(500).send({ message: 'Failed to initialize media upload', error: e.message });
+    }
+});
+
+app.post('/api/notes/:id/media/complete', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const noteId = req.params.id;
+    if (!noteId) return res.status(400).send({ message: 'Invalid note id' });
+
+    const { assetName, mimeType, sizeMb, dropboxPath, storageSource, storageShardRef } = req.body || {};
+    if (!assetName || !dropboxPath || !storageShardRef) {
+        return res.status(400).send({ message: 'assetName, dropboxPath, and storageShardRef are required' });
+    }
+    
+    const assetId = randomUUID();
+
+    try {
+        const results = await executeScatterGather(async (client) => {
+            const noteRes = await client.query('SELECT id FROM user_notes WHERE id = $1 AND user_id = $2', [noteId, req.user.id]);
+            if (noteRes.rows.length === 0) return null;
+
+            const insertRes = await client.query(
+                `INSERT INTO note_assets (id, note_id, user_id, asset_name, mime_type, size_mb, dropbox_path, storage_source, storage_shard_ref)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 RETURNING id, note_id, user_id, asset_name, mime_type, size_mb, dropbox_path, storage_source, storage_shard_ref, created_at`,
+                [
+                    assetId,
+                    noteId,
+                    req.user.id,
+                    String(assetName),
+                    mimeType ? String(mimeType) : null,
+                    sizeMb ? parseFloat(sizeMb) : null,
+                    String(dropboxPath),
+                    storageSource ? String(storageSource) : 'storage_shards',
+                    String(storageShardRef)
+                ]
+            );
+            return insertRes.rows[0];
+        });
+
+        const item = results.find(Boolean);
+        if (!item) return res.status(404).send({ message: 'Note not found' });
+        res.json({ item });
+    } catch (e) {
+        console.error('Complete note media upload failed', e);
+        res.status(500).send({ message: 'Failed to register media upload', error: e.message });
+    }
+});
+
+app.post('/api/notes/media/temp-link', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const { dropboxPath, storageSource, storageShardRef } = req.body || {};
+    if (!dropboxPath || !storageShardRef) {
+        return res.status(400).send({ message: 'dropboxPath and storageShardRef are required' });
+    }
+
+    try {
+        const token = await storageManager.getAccessTokenForReference({
+            storageSource: storageSource || 'storage_shards',
+            shardRef: String(storageShardRef)
+        });
+
+        const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ path: String(dropboxPath) })
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(`Dropbox temporary link failed: ${text}`);
+        }
+
+        const payload = await response.json();
+        res.json({ link: payload.link });
+    } catch (e) {
+        console.error('Get note media temp link failed', e);
+        res.status(500).send({ message: 'Failed to get temporary link', error: e.message });
+    }
+});
+
+app.delete('/api/notes/:id/assets/:assetId', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = req.params.id;
+    const assetId = req.params.assetId;
+    if (!id || !assetId) return res.status(400).send({ message: 'Invalid id' });
+
+    try {
+        const results = await executeScatterGather(async (client) => {
+            const resA = await client.query('SELECT dropbox_path, storage_shard_ref FROM note_assets WHERE id = $1 AND note_id = $2 AND user_id = $3', [assetId, id, req.user.id]);
+            if (resA.rows.length === 0) return false;
+
+            const asset = resA.rows[0];
+
+            await client.query('BEGIN');
+            await client.query('DELETE FROM note_assets WHERE id = $1', [assetId]);
+
+            if (asset.storage_shard_ref && asset.dropbox_path) {
+                const mClient = await dbManager.tryConnect(dbManager.MASTER_DB_URL);
+                let s;
+                try {
+                    s = await mClient.query('SELECT id FROM storage_shards WHERE id = $1', [parseInt(asset.storage_shard_ref, 10)]);
+                } finally {
+                    await mClient.end();
+                }
+                
+                if (s && s.rows.length > 0) {
+                    const shard_id = s.rows[0].id;
+                    await client.query(`
+                         CREATE TABLE IF NOT EXISTS deletion_queue (
+                             id SERIAL PRIMARY KEY,
+                             shard_id INT NOT NULL,
+                             paths TEXT[] NOT NULL,
+                             status TEXT DEFAULT 'pending',
+                             retries INT DEFAULT 0,
+                             created_at TIMESTAMP DEFAULT NOW()
+                         )
+                     `);
+                    await client.query('INSERT INTO deletion_queue (shard_id, paths) VALUES ($1, $2)', [shard_id, [asset.dropbox_path]]);
+                }
+            }
+            await client.query('COMMIT');
+            return true;
+        });
+
+        const deleted = results.some(Boolean);
+        if (!deleted) return res.status(404).send({ message: 'Asset not found' });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Delete note asset failed', e);
+        res.status(500).send({ message: 'Failed to delete note asset', error: e.message });
+    }
+});
+
+app.post('/api/notes/:id/export', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = req.params.id;
+    if (!id) return res.status(400).send({ message: 'Invalid note id' });
+
+    const format = String((req.body && req.body.format) || 'txt').toLowerCase();
+    if (!['txt', 'pdf', 'docx'].includes(format)) {
+        return res.status(400).send({ message: 'Supported formats: txt, pdf, docx' });
+    }
+
+    try {
+        const results = await executeScatterGather(async (client) => {
+            const noteRes = await client.query(
+                'SELECT id, title, content_text FROM user_notes WHERE id = $1 AND user_id = $2',
+                [id, req.user.id]
+            );
+            if (noteRes.rows.length === 0) return null;
+
+            const assetsRes = await client.query(
+                'SELECT asset_name, mime_type, dropbox_path, storage_shard_ref FROM note_assets WHERE note_id = $1 AND user_id = $2 ORDER BY created_at ASC',
+                [id, req.user.id]
+            );
+
+            return {
+                note: noteRes.rows[0],
+                assets: assetsRes.rows
+            };
+        });
+
+        const payload = results.find(Boolean);
+
+        if (!payload) return res.status(404).send({ message: 'Note not found' });
+
+        const safeTitle = String(payload.note.title || 'note').replace(/[^a-zA-Z0-9._-]/g, '_');
+
+        if (format === 'txt') {
+            const buffer = buildTextExport(payload.note, payload.assets);
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.txt"`);
+            return res.send(buffer);
+        }
+
+        if (format === 'pdf') {
+            const buffer = await buildPdfExport(payload.note, payload.assets);
+            res.setHeader('Content-Type', 'application/pdf');
+            res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.pdf"`);
+            return res.send(buffer);
+        }
+
+        const buffer = await buildDocxExport(payload.note, payload.assets);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.docx"`);
+        return res.send(buffer);
+    } catch (e) {
+        console.error('Export note failed', e);
+        res.status(500).send({ message: 'Failed to export note', error: e.message });
+    }
+});
+
+// --- LATEX DOCUMENT ROUTES (Vercel-safe, no native TeX binaries) ---
+
+app.get('/api/latex/docs', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    try {
+        const items = await executeWithDB(async (client) => {
+            const r = await client.query(
+                `SELECT id, user_id, title, source_text, created_at, updated_at
+                 FROM latex_documents
+                 WHERE user_id = $1
+                 ORDER BY updated_at DESC`,
+                [req.user.id]
+            );
+            return r.rows;
+        });
+        res.json({ items });
+    } catch (e) {
+        console.error('List latex docs failed', e);
+        res.status(500).send({ message: 'Failed to list latex docs', error: e.message });
+    }
+});
+
+app.post('/api/latex/docs', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const title = String((req.body && req.body.title) || 'Untitled latex doc').trim();
+    const sourceText = String((req.body && req.body.sourceText) || '');
+    try {
+        const item = await executeWithDB(async (client) => {
+            const r = await client.query(
+                `INSERT INTO latex_documents (user_id, title, source_text)
+                 VALUES ($1, $2, $3)
+                 RETURNING id, user_id, title, source_text, created_at, updated_at`,
+                [req.user.id, title || 'Untitled latex doc', sourceText]
+            );
+            return r.rows[0];
+        });
+        res.json({ item });
+    } catch (e) {
+        console.error('Create latex doc failed', e);
+        res.status(500).send({ message: 'Failed to create latex doc', error: e.message });
+    }
+});
+
+app.get('/api/latex/docs/:id', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).send({ message: 'Invalid id' });
+    try {
+        const item = await executeWithDB(async (client) => {
+            const r = await client.query(
+                `SELECT id, user_id, title, source_text, created_at, updated_at
+                 FROM latex_documents
+                 WHERE id = $1 AND user_id = $2`,
+                [id, req.user.id]
+            );
+            return r.rows[0] || null;
+        });
+        if (!item) return res.status(404).send({ message: 'Document not found' });
+        res.json({ item });
+    } catch (e) {
+        console.error('Get latex doc failed', e);
+        res.status(500).send({ message: 'Failed to fetch latex doc', error: e.message });
+    }
+});
+
+app.put('/api/latex/docs/:id', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).send({ message: 'Invalid id' });
+
+    const title = String((req.body && req.body.title) || 'Untitled latex doc').trim();
+    const sourceText = String((req.body && req.body.sourceText) || '');
+    try {
+        const item = await executeWithDB(async (client) => {
+            const r = await client.query(
+                `UPDATE latex_documents
+                 SET title = $1, source_text = $2, updated_at = NOW()
+                 WHERE id = $3 AND user_id = $4
+                 RETURNING id, user_id, title, source_text, created_at, updated_at`,
+                [title || 'Untitled latex doc', sourceText, id, req.user.id]
+            );
+            return r.rows[0] || null;
+        });
+        if (!item) return res.status(404).send({ message: 'Document not found' });
+        res.json({ item });
+    } catch (e) {
+        console.error('Update latex doc failed', e);
+        res.status(500).send({ message: 'Failed to update latex doc', error: e.message });
+    }
+});
+
+app.delete('/api/latex/docs/:id', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).send({ message: 'Invalid id' });
+    try {
+        const deleted = await executeWithDB(async (client) => {
+            const r = await client.query('DELETE FROM latex_documents WHERE id = $1 AND user_id = $2 RETURNING id', [id, req.user.id]);
+            return r.rowCount > 0;
+        });
+        if (!deleted) return res.status(404).send({ message: 'Document not found' });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Delete latex doc failed', e);
+        res.status(500).send({ message: 'Failed to delete latex doc', error: e.message });
+    }
+});
+
+app.post('/api/latex/docs/:id/export', verifyAuthToken, requireProvisionedUser, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).send({ message: 'Invalid id' });
+    const format = String((req.body && req.body.format) || 'tex').toLowerCase();
+    if (!['tex', 'txt', 'pdf', 'docx', 'doc'].includes(format)) {
+        return res.status(400).send({ message: 'Supported formats: tex, txt, pdf, docx, doc' });
+    }
+
+    try {
+        const item = await executeWithDB(async (client) => {
+            const r = await client.query('SELECT id, title, source_text FROM latex_documents WHERE id = $1 AND user_id = $2', [id, req.user.id]);
+            return r.rows[0] || null;
+        });
+
+        if (!item) return res.status(404).send({ message: 'Document not found' });
+
+        const safeTitle = String(item.title || 'latex_doc').replace(/[^a-zA-Z0-9._-]/g, '_');
+        const textBuffer = Buffer.from(String(item.source_text || ''), 'utf8');
+
+        if (format === 'tex') {
+            res.setHeader('Content-Type', 'application/x-tex; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.tex"`);
+            return res.send(textBuffer);
+        }
+
+        if (format === 'txt') {
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.txt"`);
+            return res.send(textBuffer);
+        }
+
+        if (format === 'pdf') {
+            try {
+                const axios = require('axios');
+                const formData = new URLSearchParams();
+                formData.append('code', String(item.source_text || ''));
+                const response = await axios.post('https://rtex.probablyaweb.site/api/v2', formData.toString(), {
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+                });
+
+                if (response.data && response.data.status === 'success') {
+                    const pdfResponse = await axios.get(`https://rtex.probablyaweb.site/api/v2/${response.data.filename}`, {
+                        responseType: 'arraybuffer'
+                    });
+                    res.setHeader('Content-Type', 'application/pdf');
+                    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.pdf"`);
+                    return res.send(pdfResponse.data);
+                } else {
+                    res.status(500).send({ message: 'LaTeX PDF API compilation failed: ' + (response.data.description || 'Unknown error') });
+                    return;
+                }
+            } catch (err) {
+                console.error('LaTeX PDF API compilation error:', err.message);
+                res.status(500).send({ message: 'Failed to compile LaTeX via API', error: err.message });
+                return;
+            }
+        }
+
+        const exportNoteLike = {
+            title: item.title,
+            content_text: String(item.source_text || '')
+        };
+
+        const docx = await buildDocxExport(exportNoteLike, []);
+        if (format === 'doc') {
+            res.setHeader('Content-Type', 'application/msword');
+            res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.doc"`);
+            return res.send(docx);
+        }
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.docx"`);
+        return res.send(docx);
+    } catch (e) {
+        console.error('Export latex doc failed', e);
+        res.status(500).send({ message: 'Failed to export latex doc', error: e.message });
     }
 });
 

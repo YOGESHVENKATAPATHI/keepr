@@ -49,3 +49,10 @@ flutter {
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 }
+
+// Work around AGP/L8 baseline profile generation failures on Windows paths.
+tasks.configureEach {
+    if (name == "compileReleaseArtProfile") {
+        enabled = false
+    }
+}

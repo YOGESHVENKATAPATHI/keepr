@@ -1,8 +1,17 @@
 require('dotenv').config();
-const { Client } = require('pg');
+const { Client, Pool } = require('pg');
 const dns = require('dns');
 const { promisify } = require('util');
 const resolve4 = promisify(dns.resolve4);
+
+const DNS_CACHE_TTL_MS = 5 * 60 * 1000;
+const SHARD_CACHE_TTL_MS = 30 * 1000;
+const dnsCache = new Map();
+const dbPools = new Map(); // Pool Cache for O(1) connection reuse
+let workerShardCache = {
+    expiresAt: 0,
+    shards: []
+};
 
 // Set public DNS servers to bypass potential system DNS issues
 try {
@@ -12,10 +21,7 @@ try {
 }
 
 // MASTER REGISTRY CONNECTION STRING
-// Using environment variable for security and easier editing
 const MASTER_DB_URL = process.env.MASTER_DB_URL;
-
-// Helpers removed to simplify connection logic and rely on pg client
 
 
 async function tryConnectWithRetries(connString, maxAttempts = 5) {
@@ -23,29 +29,30 @@ async function tryConnectWithRetries(connString, maxAttempts = 5) {
     while (attempt < maxAttempts) {
         attempt++;
         
-        // Manual DNS Resolution Strategy
         let targetConnString = connString;
         let sniServerName = undefined;
 
         try {
-            // Parse URL to check hostname
-            // connString might be a valid URI (postgres://...)
             if (connString.startsWith('postgres')) {
                 const u = new URL(connString);
                 
-                // CRITICAL: Remove sslmode params to prevent 'pg' from enforcing 'verify-full' 
-                // against the IP address, which causes hostname mismatch errors.
                 u.searchParams.delete('sslmode');
                 u.searchParams.delete('ssl');
 
-                // Check if hostname is domain-like (not an IP) and not localhost
                 if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(u.hostname) && u.hostname !== 'localhost') {
-                    // Manually resolve using the custom DNS servers
-                    const ips = await resolve4(u.hostname);
-                    if (ips && ips.length > 0) {
-                        sniServerName = u.hostname; // Save original host for SNI
-                        console.log(`[DB] Resolved ${u.hostname} -> ${ips[0]}`);
-                        u.hostname = ips[0]; // Replace with resolved IP
+                    const now = Date.now();
+                    const cached = dnsCache.get(u.hostname);
+
+                    if (cached && cached.expiresAt > now) {
+                        sniServerName = u.hostname;
+                        u.hostname = cached.ip;
+                    } else {
+                        const ips = await resolve4(u.hostname);
+                        if (ips && ips.length > 0) {
+                            sniServerName = u.hostname; 
+                            dnsCache.set(u.hostname, { ip: ips[0], expiresAt: now + DNS_CACHE_TTL_MS });
+                            u.hostname = ips[0]; 
+                        }
                     }
                 }
                 targetConnString = u.toString();
@@ -54,29 +61,37 @@ async function tryConnectWithRetries(connString, maxAttempts = 5) {
             console.warn('Manual DNS resolution skipped:', dnsErr.message);
         }
 
-        // Use explicit SSL configuration for Neon consistency
-        // If we replaced host with IP, we MUST provide servername for SNI
-        const clientConfig = { 
-            connectionString: targetConnString,
-            ssl: { 
-                rejectUnauthorized: false,
-                servername: sniServerName,
-                // BYPASS HOSTNAME VALIDATION manually.
-                // Since we connect to an IP (98.x.x.x) but the cert is for *.neon.tech,
-                // default validation fails. We trust the connection because we resolved it correctly 
-                // and 'rejectUnauthorized: false' handles the CA trust level for this context.
-                checkServerIdentity: () => undefined 
-            }
-        };
-        
-        // Debug connection details
-        // console.log(`[DB-DEBUG] Connecting to: ${targetConnString} (SNI: ${sniServerName})`);
-
-        const client = new Client(clientConfig);
-
         try {
-            await client.connect();
-            return client; // connected
+            // Get or Create Pool
+            if (!dbPools.has(targetConnString)) {
+                const poolConfig = { 
+                    connectionString: targetConnString,
+                    ssl: { 
+                        rejectUnauthorized: false,
+                        servername: sniServerName,
+                        checkServerIdentity: () => undefined 
+                    },
+                    max: 20, // Max 20 active connections per pool
+                    idleTimeoutMillis: 30000,
+                    connectionTimeoutMillis: 10000,
+                };
+                dbPools.set(targetConnString, new Pool(poolConfig));
+            }
+
+            const pool = dbPools.get(targetConnString);
+            const client = await pool.connect();
+            
+            // MAGIC FIX: Override .end() to securely release the connection back to the pool!
+            // This prevents index.js from actually destroying the TCP connection when it calls .end()
+            let released = false;
+            client.end = async () => {
+                if (!released) {
+                    released = true;
+                    client.release();
+                }
+            };
+
+            return client; // connected PoolClient
         } catch (err) {
             if (err.code === '28P01') {
                 console.error('Authentication failed when connecting to DB.');
@@ -84,9 +99,6 @@ async function tryConnectWithRetries(connString, maxAttempts = 5) {
             }
 
             console.warn(`[DB] Connection attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
-            if (client) {
-                try { await client.end(); } catch (e) {}
-            }
             
             if (attempt < maxAttempts) {
                 await new Promise(r => setTimeout(r, Math.pow(2, attempt - 1) * 1000));
@@ -94,6 +106,34 @@ async function tryConnectWithRetries(connString, maxAttempts = 5) {
         }
     }
     throw new Error(`Exceeded connection retry attempts for DB`);
+}
+
+async function fetchActiveShards(force = false) {
+    const now = Date.now();
+    if (!force && workerShardCache.expiresAt > now && workerShardCache.shards.length > 0) {
+        return workerShardCache.shards;
+    }
+
+    let masterClient = null;
+    try {
+        masterClient = await tryConnectWithRetries(MASTER_DB_URL, 3);
+        const res = await masterClient.query(`
+            SELECT id, connection_string, nickname
+            FROM db_shards
+            WHERE is_active = TRUE
+            ORDER BY current_usage_mb ASC;
+        `);
+
+        workerShardCache = {
+            expiresAt: now + SHARD_CACHE_TTL_MS,
+            shards: res.rows
+        };
+        return res.rows;
+    } finally {
+        if (masterClient) {
+            try { await masterClient.end(); } catch (_) {}
+        }
+    }
 }
 
 async function initMasterRegistry() {
@@ -145,24 +185,8 @@ async function initMasterRegistry() {
  * and returns a connected Client to that Worker DB.
  */
 async function getFittestDB() {
-    let masterClient = null;
     try {
-        // Connect to Master to get shard list
-        masterClient = await tryConnectWithRetries(MASTER_DB_URL, 3);
-
-        const res = await masterClient.query(`
-            SELECT id, connection_string 
-            FROM db_shards 
-            WHERE is_active = TRUE 
-            ORDER BY current_usage_mb ASC;
-        `);
-
-        // Close master connection as we don't need it anymore
-        // (Assuming we want to connect to a worker, not proxy via master)
-        await masterClient.end(); 
-        masterClient = null;
-
-        const shards = res.rows;
+        let shards = await fetchActiveShards(false);
         
         if (shards.length === 0) {
             console.error("No shards registered in Master DB.");
@@ -179,13 +203,22 @@ async function getFittestDB() {
                 console.warn(`[DB] Failed to connect to shard ${shard.id}, trying next...`);
             }
         }
+
+        // Force-refresh shard list once and retry quickly
+        shards = await fetchActiveShards(true);
+        for (const shard of shards) {
+            try {
+                const workerClient = await tryConnectWithRetries(shard.connection_string, 1);
+                console.log(`[DB] Connected to Worker DB after refresh (shard id=${shard.id})`);
+                return workerClient;
+            } catch (_) {
+                // try next
+            }
+        }
         
         throw new Error("All database shards are unreachable.");
 
     } catch (err) {
-        if (masterClient) {
-            try { await masterClient.end(); } catch(e) {}
-        }
         console.error("Error in getFittestDB:", err);
         throw err;
     }
@@ -197,19 +230,9 @@ async function getFittestDB() {
  */
 async function getAllWorkerDBs() {
     const clients = [];
-    let masterClient = null;
     
     try {
-        masterClient = await tryConnectWithRetries(MASTER_DB_URL, 3);
-        const res = await masterClient.query(`
-            SELECT id, connection_string, nickname
-            FROM db_shards 
-            WHERE is_active = TRUE;
-        `);
-        await masterClient.end();
-        masterClient = null;
-
-        const shards = res.rows;
+        const shards = await fetchActiveShards(false);
         
         // 1. Uniquify connection strings (include Master if not in shards to be safe?)
         // For now, trust the shards table.
@@ -232,7 +255,6 @@ async function getAllWorkerDBs() {
 
     } catch (e) {
         console.error("Failed to fetch shards for broadcast:", e);
-        if (masterClient) try { await masterClient.end(); } catch (_) {}
     }
 
     if (clients.length === 0) {
@@ -267,5 +289,6 @@ module.exports = {
     getAllWorkerDBs,
     updateShardUsage,
     tryConnect: tryConnectWithRetries, // Export as generic helper
-    MASTER_DB_URL
+    MASTER_DB_URL,
+    fetchActiveShards
 };

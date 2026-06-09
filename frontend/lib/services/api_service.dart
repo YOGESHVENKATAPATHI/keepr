@@ -279,7 +279,7 @@ class ApiService {
     return Map<String, dynamic>.from(data['item'] as Map);
   }
 
-  Future<Map<String, dynamic>> getNote(String token, int id) async {
+  Future<Map<String, dynamic>> getNote(String token, String id) async {
     final url = Uri.parse('$backendBase/api/notes/$id');
     final resp = await http.get(url, headers: {
       'Authorization': 'Bearer $token',
@@ -293,7 +293,7 @@ class ApiService {
 
   Future<Map<String, dynamic>> updateNote(
     String token,
-    int id, {
+    String id, {
     required String title,
     required String contentText,
     Map<String, dynamic> contentJson = const {},
@@ -316,7 +316,7 @@ class ApiService {
     return Map<String, dynamic>.from(data['item'] as Map);
   }
 
-  Future<void> deleteNote(String token, int id) async {
+  Future<void> deleteNote(String token, String id) async {
     final url = Uri.parse('$backendBase/api/notes/$id');
     final resp = await http.delete(url, headers: {
       'Authorization': 'Bearer $token',
@@ -329,7 +329,7 @@ class ApiService {
 
   Future<Map<String, dynamic>> initNoteMediaUpload(
     String token,
-    int noteId, {
+    String noteId, {
     required String fileName,
     required String mimeType,
     required double sizeMb,
@@ -350,7 +350,7 @@ class ApiService {
 
   Future<Map<String, dynamic>> completeNoteMediaUpload(
     String token,
-    int noteId, {
+    String noteId, {
     required String assetName,
     required String mimeType,
     required double sizeMb,
@@ -403,7 +403,7 @@ class ApiService {
     return data['link']?.toString() ?? '';
   }
 
-  Future<void> deleteNoteAsset(String token, int noteId, int assetId) async {
+  Future<void> deleteNoteAsset(String token, String noteId, String assetId) async {
     final url = Uri.parse('$backendBase/api/notes/$noteId/assets/$assetId');
     final resp = await http.delete(url, headers: {'Authorization': 'Bearer $token'});
     if (resp.statusCode != 200) {
@@ -413,7 +413,7 @@ class ApiService {
 
   Future<ExportedNoteFile> exportNote(
     String token,
-    int noteId,
+    String noteId,
     String format,
   ) async {
     final url = Uri.parse('$backendBase/api/notes/$noteId/export');
@@ -442,18 +442,16 @@ class ApiService {
     );
   }
 
-  Future<Map<String, dynamic>> getStorageStats(String token) async {
-    final url = Uri.parse('$backendBase/api/storage/stats');
+  // Cluster Storage
+  Future<Map<String, dynamic>> getClusterStorageStats(String token) async {
+    final url = Uri.parse('$backendBase/api/storage/cluster-status');
     final resp = await http.get(url, headers: {
       'Authorization': 'Bearer $token',
       'Content-Type': 'application/json'
     });
     if (resp.statusCode != 200) {
-      throw Exception('Failed to fetch storage stats: ${resp.body}');
+      throw Exception('Failed to fetch cluster storage stats: ${resp.body}');
     }
     return jsonDecode(resp.body) as Map<String, dynamic>;
   }
-
-  // LaTeX documents
-  
 }

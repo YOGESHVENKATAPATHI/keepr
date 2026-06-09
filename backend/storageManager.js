@@ -1,6 +1,24 @@
 const { MASTER_DB_URL, tryConnect } = require('./dbManager');
 const fetch = require('node-fetch');
 
+const DROPBOX_MASTER_DB_URL =
+    process.env.DROPBOX_MASTER_DB_URL || process.env.EXTRA_MASTER_DB_URL || '';
+
+// Token Cache to bypass 100ms OAuth handshake overhead (valid for 3.5 hours)
+const accessTokenCache = new Map(); // key -> { token, expiresAt }
+const CACHE_TTL_MS = 3.5 * 60 * 60 * 1000;
+
+async function getCachedToken(key, refreshFn) {
+    const now = Date.now();
+    const cached = accessTokenCache.get(key);
+    if (cached && cached.expiresAt > now) {
+        return cached.token;
+    }
+    const token = await refreshFn();
+    accessTokenCache.set(key, { token, expiresAt: now + CACHE_TTL_MS });
+    return token;
+}
+
 // Helper to get live space usage from Dropbox
 async function getLiveSpaceUsage(accessToken) {
     const url = 'https://api.dropboxapi.com/2/users/get_space_usage';
@@ -28,20 +46,7 @@ async function getLiveSpaceUsage(accessToken) {
 async function getFittestStorageAccount(requiredSizeMb = 0) {
     let masterClient = null;
     try {
-        // Use central connection logic
         masterClient = await tryConnect(MASTER_DB_URL);
-        
-        console.log(`[Storage] Looking for account with ${requiredSizeMb.toFixed(2)}MB free space...`);
-
-        // Find all active candidates to check live (ignoring DB cached usage to be fully "lively")
-        const res = await masterClient.query(`
-            SELECT *
-            FROM storage_shards 
-            WHERE is_active = TRUE
-            ORDER BY id ASC;
-        `);
-
-        console.log(`[Storage] Found ${res.rows.length} active shards. Starting live checks...`);
         
         // 0. Calculate Reserved Space (Pending Chunks) to avoid over-allocation
         let pendingMap = {};
@@ -53,21 +58,28 @@ async function getFittestStorageAccount(requiredSizeMb = 0) {
                 GROUP BY shard_id
             `);
             pendingRes.rows.forEach(r => pendingMap[r.shard_id] = parseFloat(r.pending_mb));
-            console.log('[Storage] Pending allocations map:', pendingMap);
         } catch (e) {
-            // Table might not exist yet if no uploads started
             console.warn('[Storage] Skipping pending check (table missing?):', e.message);
         }
 
-        let bestCandidate = null;
+        // O(1) Optimization: Let the DB filter and sort accounts with enough estimated free space
+        const res = await masterClient.query(`
+            SELECT *
+            FROM storage_shards 
+            WHERE is_active = TRUE 
+              AND (max_capacity_mb - current_usage_mb) >= $1
+            ORDER BY current_usage_mb ASC
+            LIMIT 5;
+        `, [requiredSizeMb]);
 
-        // Live Validation Loop
+        // Live Validation Loop - Should break on the FIRST successful account (O(1) instead of O(N))
         for (const account of res.rows) {
             try {
-                // 1. Refresh Token
-                const accessToken = await refreshAccessToken(account.refresh_token, account.app_key, account.app_secret);
+                // 1. Get Token (Cached)
+                const cacheKey = `shard_${account.id}`;
+                const accessToken = await getCachedToken(cacheKey, () => refreshAccessToken(account.refresh_token, account.app_key, account.app_secret));
                 
-                // 2. Check Live Usage
+                // 2. Check Live Usage (Only for top candidate)
                 const usageData = await getLiveSpaceUsage(accessToken);
                 const usedMb = usageData.used / (1024 * 1024);
                 const allocatedMb = usageData.allocated / (1024 * 1024);
@@ -77,50 +89,148 @@ async function getFittestStorageAccount(requiredSizeMb = 0) {
                 const effectiveUsedMb = usedMb + pendingMb;
                 const freeMb = allocatedMb - effectiveUsedMb;
 
-                console.log(`[Storage] Live Check Shard ${account.id}: Free=${freeMb.toFixed(2)}MB (Live Used: ${usedMb.toFixed(2)} + Pending: ${pendingMb.toFixed(2)} / Alloc: ${allocatedMb.toFixed(0)})`);
-
-                // 3. Update DB with REAL usage (keep DB consistent with Dropbox)
+                // 3. Update DB with REAL usage
                 await masterClient.query(
                     'UPDATE storage_shards SET current_usage_mb = $1 WHERE id = $2',
                     [usedMb, account.id]
                 );
 
-                // 4. Check eligibility
+                // 4. Return FIRST eligible candidate immediately
                 if (freeMb >= requiredSizeMb) {
-                    // If we haven't picked one, or this one has MORE free space, pick it.
-                    // (Simple strategy: Pick first fitting, or max free space? "Fittest" implies best fit or most space.)
-                    // Let's pick the one with most free space to balance load? Or just first compliant?
-                    // User said "check eligible accounts".
-                    
-                    if (!bestCandidate || freeMb > bestCandidate.freeMb) {
-                         bestCandidate = {
-                             access_token: accessToken,
-                             shard_id: account.id,
-                             freeMb: freeMb
-                         };
-                    }
+                    return {
+                        access_token: accessToken,
+                        shard_id: account.id
+                    };
                 } 
-
             } catch (err) {
-                console.error(`[Storage] Error checking shard ${account.id}:`, err.message);
+                console.warn(`[Storage] Error checking shard ${account.id}, skipping to next:`, err.message);
             }
         }
         
-        if (bestCandidate) {
-            console.log(`[Storage] Selected best shard id=${bestCandidate.shard_id} with ${bestCandidate.freeMb.toFixed(2)}MB free.`);
-            return {
-                access_token: bestCandidate.access_token,
-                shard_id: bestCandidate.shard_id
-            };
-        }
-        
-        throw new Error("All active accounts failed live check or are full.");
+        throw new Error("All top candidate accounts failed live check or are full.");
 
     } catch (err) {
         console.error("Error in getFittestStorageAccount:", err);
         throw err;
     } finally {
         if(masterClient) await masterClient.end();
+    }
+}
+
+async function getFittestStorageAccountForNotes(requiredSizeMb = 0) {
+    const primary = await getAccountsFromStorageShards(requiredSizeMb);
+    if (primary) return primary;
+
+    const external = await getAccountsFromExternalRegistry(requiredSizeMb);
+    if (external) return external;
+
+    throw new Error('No eligible storage account found in primary or external registry.');
+}
+
+async function getAccountsFromStorageShards(requiredSizeMb = 0) {
+    let masterClient = null;
+    try {
+        masterClient = await tryConnect(MASTER_DB_URL);
+        const res = await masterClient.query(`
+            SELECT *
+            FROM storage_shards
+            WHERE is_active = TRUE AND (max_capacity_mb - current_usage_mb) >= $1
+            ORDER BY current_usage_mb ASC
+            LIMIT 5;
+        `, [requiredSizeMb]);
+
+        for (const account of res.rows) {
+            try {
+                const cacheKey = `shard_${account.id}`;
+                const accessToken = await getCachedToken(cacheKey, () => refreshAccessToken(account.refresh_token, account.app_key, account.app_secret));
+                const usageData = await getLiveSpaceUsage(accessToken);
+                const usedMb = usageData.used / (1024 * 1024);
+                const allocatedMb = usageData.allocated / (1024 * 1024);
+                const freeMb = allocatedMb - usedMb;
+
+                await masterClient.query('UPDATE storage_shards SET current_usage_mb = $1 WHERE id = $2', [usedMb, account.id]);
+
+                if (freeMb >= requiredSizeMb) {
+                    return {
+                        access_token: accessToken,
+                        shard_id: account.id,
+                        shard_ref: String(account.id),
+                        storage_source: 'storage_shards',
+                        freeMb
+                    };
+                }
+            } catch (e) {
+                console.warn(`[Storage] Primary shard ${account.id} check failed: ${e.message}`);
+            }
+        }
+        return null;
+    } catch (e) {
+        console.warn('[Storage] Primary registry check failed:', e.message);
+        return null;
+    } finally {
+        if (masterClient) {
+            try { await masterClient.end(); } catch (_) {}
+        }
+    }
+}
+
+async function getAccountsFromExternalRegistry(requiredSizeMb = 0) {
+    if (!DROPBOX_MASTER_DB_URL) return null;
+
+    let client = null;
+    try {
+        client = await tryConnect(DROPBOX_MASTER_DB_URL);
+        const res = await client.query(`
+            SELECT
+                id,
+                app_key,
+                app_secret,
+                refresh_token,
+                access_token,
+                account_id,
+                uid,
+                scope,
+                app_name
+            FROM dropbox_app_credentials
+            ORDER BY id ASC;
+        `);
+
+        // O(1) optimization for external registry too (we cannot natively filter max_capacity via simple SQL if not tracked, but we can cache and break early)
+        for (const account of res.rows) {
+            try {
+                const cacheKey = `ext_${account.id}`;
+                const accessToken = await getCachedToken(cacheKey, () => refreshAccessToken(account.refresh_token, account.app_key, account.app_secret));
+                const usageData = await getLiveSpaceUsage(accessToken);
+                const usedMb = usageData.used / (1024 * 1024);
+                const allocatedMb = usageData.allocated / (1024 * 1024);
+                const freeMb = allocatedMb - usedMb;
+
+                if (freeMb >= requiredSizeMb) {
+                    return {
+                        access_token: accessToken,
+                        shard_id: account.id,
+                        shard_ref: String(account.id),
+                        storage_source: 'dropbox_app_credentials',
+                        account_id: account.account_id || null,
+                        uid: account.uid || null,
+                        scope: account.scope || null,
+                        app_name: account.app_name || null,
+                        freeMb
+                    };
+                }
+            } catch (e) {
+                console.warn(`[Storage] External credential ${account.id} check failed: ${e.message}`);
+            }
+        }
+
+        return null;
+    } catch (e) {
+        console.warn('[Storage] External registry check failed:', e.message);
+        return null;
+    } finally {
+        if (client) {
+            try { await client.end(); } catch (_) {}
+        }
     }
 }
 
@@ -241,21 +351,117 @@ async function waitForDeleteJob(token, jobId, shardId) {
 }
 
 async function getAccessTokenForShard(shardId) {
+    return getAccessTokenForReference({
+        storageSource: 'storage_shards',
+        shardRef: String(shardId)
+    });
+}
+
+async function getAccessTokenForReference({ storageSource, shardRef }) {
+    const cacheKey = `ref_${storageSource}_${shardRef}`;
+
+    if (storageSource === 'dropbox_app_credentials') {
+        if (!DROPBOX_MASTER_DB_URL) throw new Error('DROPBOX_MASTER_DB_URL is not configured');
+
+        let externalClient = null;
+        try {
+            externalClient = await tryConnect(DROPBOX_MASTER_DB_URL);
+            const res = await externalClient.query(
+                'SELECT app_key, app_secret, refresh_token FROM dropbox_app_credentials WHERE id = $1',
+                [parseInt(shardRef, 10)]
+            );
+            if (res.rows.length === 0) throw new Error(`External credential ${shardRef} not found`);
+
+            const account = res.rows[0];
+            return await getCachedToken(cacheKey, () => refreshAccessToken(account.refresh_token, account.app_key, account.app_secret));
+        } finally {
+            if (externalClient) {
+                try { await externalClient.end(); } catch (_) {}
+            }
+        }
+    }
+
     let masterClient = null;
     try {
         masterClient = await tryConnect(MASTER_DB_URL);
+        const shardId = parseInt(shardRef, 10);
         const res = await masterClient.query('SELECT * FROM storage_shards WHERE id = $1', [shardId]);
         if (res.rows.length === 0) throw new Error(`Shard ${shardId} not found`);
         
         const account = res.rows[0];
-        return await refreshAccessToken(account.refresh_token, account.app_key, account.app_secret);
+        return await getCachedToken(cacheKey, () => refreshAccessToken(account.refresh_token, account.app_key, account.app_secret));
     } finally {
         if (masterClient) await masterClient.end();
     }
 }
 
+async function getTotalStorageStats() {
+    let totalAllocated = 0;
+    let totalUsed = 0;
+    
+    // We'll gather all active accounts from both databases
+    const allAccounts = [];
+
+    // 1. From storage_shards (Master DB)
+    let masterClient = null;
+    try {
+        masterClient = await tryConnect(MASTER_DB_URL);
+        const res = await masterClient.query('SELECT id, refresh_token, app_key, app_secret FROM storage_shards WHERE is_active = TRUE');
+        allAccounts.push(...res.rows.map(r => ({ ...r, source: 'master' })));
+    } catch (e) {
+        console.error('[Storage Stats] Error fetching from master db:', e.message);
+    } finally {
+        if (masterClient) try { await masterClient.end(); } catch(_) {}
+    }
+
+    // 2. From dropbox_app_credentials (Neon DB)
+    const neonDbUrl = process.env.DROPBOX_NEON_DB || process.env.DROPBOX_MASTER_DB_URL;
+    if (neonDbUrl) {
+        let neonClient = null;
+        try {
+            neonClient = await tryConnect(neonDbUrl);
+            const res = await neonClient.query('SELECT id, refresh_token, app_key, app_secret FROM dropbox_app_credentials');
+            allAccounts.push(...res.rows.map(r => ({ ...r, source: 'neon' })));
+        } catch (e) {
+            console.error('[Storage Stats] Error fetching from neon db:', e.message);
+        } finally {
+            if (neonClient) try { await neonClient.end(); } catch(_) {}
+        }
+    }
+
+    // Process in chunks of 10 to avoid rate limiting
+    const CHUNK_SIZE = 10;
+    for (let i = 0; i < allAccounts.length; i += CHUNK_SIZE) {
+        const chunk = allAccounts.slice(i, i + CHUNK_SIZE);
+        const promises = chunk.map(async (account) => {
+            try {
+                const accessToken = await refreshAccessToken(account.refresh_token, account.app_key, account.app_secret);
+                const usageData = await getLiveSpaceUsage(accessToken);
+                return { allocated: usageData.allocated, used: usageData.used };
+            } catch (err) {
+                console.error(`[Storage Stats] Error fetching usage for account ${account.id} (${account.source}):`, err.message);
+                return { allocated: 0, used: 0 };
+            }
+        });
+
+        const results = await Promise.all(promises);
+        for (const res of results) {
+            totalAllocated += res.allocated;
+            totalUsed += res.used;
+        }
+    }
+
+    return {
+        usedBytes: totalUsed,
+        allocatedBytes: totalAllocated
+    };
+}
+
 module.exports = {
     getFittestStorageAccount,
+    getFittestStorageAccountForNotes,
     getAccessTokenForShard,
-    deletePathsFromShard
+    getAccessTokenForReference,
+    deletePathsFromShard,
+    getTotalStorageStats
 };

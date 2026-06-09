@@ -34,16 +34,13 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
   bool _loading = false;
   List<Map<String, dynamic>> _notes = [];
   List<Map<String, dynamic>> _assets = [];
-  int? _activeNoteId;
+  String? _activeNoteId;
   StreamSubscription<html.MouseEvent>? _webDragOverSub;
   StreamSubscription<html.MouseEvent>? _webDropSub;
   StreamSubscription<html.Event>? _webPasteSub;
 
   bool _previewMode = false;
   final Map<String, String> _assetLinkCache = {};
-
-  static final RegExp _assetImageRegex = RegExp(
-      r'!\[([^\]]*)\]\(asset:([^\s\)]+)(?:\s+"([^"]*)")?\)');
 
   @override
   void initState() {
@@ -73,7 +70,7 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
       event.preventDefault();
       if (_activeNoteId == null || _token == null) return;
 
-      final files = event.dataTransfer.files;
+      final files = event.dataTransfer?.files;
       if (files == null || files.isEmpty) return;
       await _uploadAssetsFromWebFiles(files.toList());
     });
@@ -106,7 +103,7 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
         _notes = items;
       });
       if (_activeNoteId == null && _notes.isNotEmpty) {
-        await _openNote((_notes.first['id'] as num).toInt());
+        await _openNote(_notes.first['id'].toString());
       }
     } catch (e) {
       _showSnack('Failed to load notes: $e', isError: true);
@@ -121,7 +118,7 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
     try {
       final item = await widget.api
           .createNote(_token!, title: 'Untitled note', contentText: '');
-      final id = (item['id'] as num).toInt();
+      final id = item['id'].toString();
       await _refreshNotes();
       await _openNote(id);
     } catch (e) {
@@ -131,7 +128,7 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
     }
   }
 
-  Future<void> _openNote(int id) async {
+  Future<void> _openNote(String id) async {
     if (_token == null) return;
     setState(() => _loading = true);
     try {
@@ -329,80 +326,11 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
         storageShardRef: storageShardRef);
 
     if (mimeType.startsWith('image/')) {
-      _insertImageAtCursor(fileName, width: 480);
+      setState(() {
+        _contentController.text += '\n![$fileName](asset:$fileName)\n';
+      });
       await _saveNote();
     }
-  }
-
-  void _insertTextAtCursor(String insertText) {
-    final text = _contentController.text;
-    final selection = _contentController.selection;
-    final start = selection.start >= 0 ? selection.start : text.length;
-    final end = selection.end >= 0 ? selection.end : text.length;
-    final replaced = text.replaceRange(start, end, insertText);
-    _contentController.text = replaced;
-    _contentController.selection =
-        TextSelection.collapsed(offset: start + insertText.length);
-  }
-
-  void _insertImageAtCursor(String assetName, {int width = 480}) {
-    final token = '\n![$assetName](asset:$assetName "w=$width")\n';
-    setState(() {
-      _insertTextAtCursor(token);
-    });
-  }
-
-  int _parseImageWidth(String? title, {int fallback = 480}) {
-    if (title == null || title.trim().isEmpty) return fallback;
-    final m = RegExp(r'w\s*=\s*(\d+)').firstMatch(title);
-    if (m == null) return fallback;
-    return int.tryParse(m.group(1) ?? '') ?? fallback;
-  }
-
-  Future<void> _resizeAssetInNote(String assetName) async {
-    final escaped = RegExp.escape(assetName);
-    final regex =
-      RegExp('!\\[$escaped\\]\\(asset:$escaped(?:\\s+"([^"]*)")?\\)');
-    final match = regex.firstMatch(_contentController.text);
-    final currentWidth = _parseImageWidth(match?.group(1), fallback: 480);
-    double selected = currentWidth.toDouble();
-
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          title: const Text('Resize image'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text('Width: ${selected.round()} px'),
-              Slider(
-                min: 120,
-                max: 1200,
-                value: selected,
-                onChanged: (v) => setDialogState(() => selected = v),
-              )
-            ],
-          ),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('Cancel')),
-            TextButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('Apply')),
-          ],
-        ),
-      ),
-    );
-
-    if (ok != true) return;
-    final replacement = '![$assetName](asset:$assetName "w=${selected.round()}")';
-    setState(() {
-      _contentController.text =
-          _contentController.text.replaceAllMapped(regex, (_) => replacement);
-    });
-    await _saveNote();
   }
 
   Future<String> _getAssetLink(String fileName) async {
@@ -426,11 +354,6 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
   Future<void> _openAsset(Map<String, dynamic> asset) async {
     if (_token == null) return;
     try {
-      // Only allow opening in browser for web; mobile/desktop should download instead
-      if (!kIsWeb) {
-        _showSnack('Download the file instead to view it', isError: true);
-        return;
-      }
       final link = await widget.api.getNoteMediaTemporaryLink(_token!,
           dropboxPath: asset['dropbox_path']?.toString() ?? '',
           storageSource: asset['storage_source']?.toString() ?? 'storage_shards',
@@ -440,6 +363,67 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
     } catch (e) {
       _showSnack('Failed to open media: $e', isError: true);
     }
+  }
+
+  int _parseImageWidth(String? title, {int fallback = 480}) {
+    if (title == null || title.isEmpty) return fallback;
+    final w = int.tryParse(title);
+    return w ?? fallback;
+  }
+
+  void _resizeAssetInNote(String assetName) async {
+    final widthCtrl = TextEditingController();
+    final width = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: const Text('Resize Image'),
+        content: TextField(
+          controller: widthCtrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(hintText: 'Enter width in pixels (e.g., 300)'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, widthCtrl.text), child: const Text('Set')),
+        ],
+      ),
+    );
+    if (width == null || width.isEmpty) return;
+    final w = int.tryParse(width) ?? 480;
+    
+    setState(() {
+      final text = _contentController.text;
+      final regex = RegExp(r'!\[.*?\]\(asset:' + RegExp.escape(assetName) + r'(?:\s+"[^"]*")?\)');
+      if (regex.hasMatch(text)) {
+        _contentController.text = text.replaceAll(regex, '![$assetName](asset:$assetName "$w")');
+      } else {
+        _contentController.text += '\n![$assetName](asset:$assetName "$w")\n';
+      }
+      _saveNote();
+    });
+  }
+
+  Widget _buildInlineImagePreviewStrip() {
+    final imageAssets = _assets.where((a) => (a['mime_type']?.toString() ?? '').startsWith('image/')).toList();
+    if (imageAssets.isEmpty) return const SizedBox.shrink();
+
+    return SizedBox(
+      height: 40,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: imageAssets.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final assetName = imageAssets[index]['asset_name']?.toString() ?? '';
+          return ActionChip(
+            label: Text(assetName, style: const TextStyle(fontSize: 12)),
+            onPressed: () => _resizeAssetInNote(assetName),
+            backgroundColor: Colors.white10,
+          );
+        },
+      ),
+    );
   }
 
   Future<void> _deleteAsset(Map<String, dynamic> asset) async {
@@ -461,18 +445,14 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
 
     setState(() => _loading = true);
     try {
-      final assetId = (asset['id'] as num).toInt();
+      final assetId = asset['id'].toString();
       await widget.api.deleteNoteAsset(_token!, _activeNoteId!, assetId);
       
       // Remove text reference
       final assetName = asset['asset_name']?.toString() ?? '';
-      final escaped = RegExp.escape(assetName);
       setState(() {
-        _contentController.text = _contentController.text
-            .replaceAllMapped(
-                RegExp(
-                  '\\n?!\\[$escaped\\]\\(asset:$escaped(?:\\s+"[^"]*")?\\)\\n?'),
-                (_) => '');
+        _contentController.text = _contentController.text.replaceAll('\n![$assetName](asset:$assetName)\n', '');
+        _contentController.text = _contentController.text.replaceAll('![$assetName](asset:$assetName)', '');
       });
       await _saveNote();
       
@@ -515,7 +495,7 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
     final path = await FilePicker.platform.saveFile(
       dialogTitle: 'Save export',
       fileName: fileName,
-      bytes: null,
+      bytes: bytes,
     );
     if (path == null) return;
 
@@ -562,95 +542,13 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
     }
   }
 
-  List<Map<String, dynamic>> _extractReferencedImages() {
-    final out = <Map<String, dynamic>>[];
-    for (final m in _assetImageRegex.allMatches(_contentController.text)) {
-      final name = (m.group(2) ?? '').trim();
-      if (name.isEmpty) continue;
-      final title = m.group(3);
-      out.add({
-        'name': name,
-        'width': _parseImageWidth(title, fallback: 480),
-      });
-    }
-    return out;
-  }
-
-  Widget _buildInlineImagePreviewStrip() {
-    final refs = _extractReferencedImages();
-    if (refs.isEmpty) {
-      return Text('No inline images yet',
-          style: GoogleFonts.inter(color: Colors.white54, fontSize: 12));
-    }
-
-    return SizedBox(
-      height: 120,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        itemCount: refs.length,
-        separatorBuilder: (_, __) => const SizedBox(width: 10),
-        itemBuilder: (context, index) {
-          final ref = refs[index];
-          final name = ref['name'].toString();
-          final widthPx = (ref['width'] as int).clamp(120, 1200);
-          final previewWidth = (widthPx / 4).clamp(80, 260).toDouble();
-          return FutureBuilder<String>(
-              future: _getAssetLink(name),
-              builder: (ctx, snap) {
-                final child = (snap.hasData && snap.data!.isNotEmpty)
-                    ? ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.network(snap.data!,
-                            width: previewWidth,
-                            height: 100,
-                            fit: BoxFit.cover),
-                      )
-                    : Container(
-                        width: previewWidth,
-                        height: 100,
-                        alignment: Alignment.center,
-                        decoration: BoxDecoration(
-                          border: Border.all(color: Colors.white24),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2)),
-                      );
-
-                return GestureDetector(
-                  onTap: () => _resizeAssetInNote(name),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      child,
-                      const SizedBox(height: 4),
-                      SizedBox(
-                        width: previewWidth,
-                        child: Text(
-                          '$name (${widthPx}px)',
-                          overflow: TextOverflow.ellipsis,
-                          style: GoogleFonts.inter(
-                              color: Colors.white60, fontSize: 11),
-                        ),
-                      )
-                    ],
-                  ),
-                );
-              });
-        },
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final selected = _activeNoteId;
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isMobile = screenWidth < 600;
+    final keyboardVisible = MediaQuery.of(context).viewInsets.bottom > 0;
 
     return Scaffold(
+      resizeToAvoidBottomInset: false,
       appBar: AppBar(
         title: Text('Notes Studio', style: GoogleFonts.inter()),
         actions: [
@@ -673,280 +571,215 @@ class _NotesEditorScreenState extends State<NotesEditorScreen> {
               icon: const Icon(Icons.delete_outline))
         ],
       ),
-      body: isMobile ? _buildMobileLayout(selected) : _buildDesktopLayout(selected),
-    );
-  }
-
-  Widget _buildMobileLayout(int? selected) {
-    return DefaultTabController(
-      length: 2,
-      child: Column(
+      body: Row(
         children: [
-          TabBar(
-            tabs: [
-              Tab(text: 'Notes (${_notes.length})'),
-              Tab(text: selected != null ? 'Edit' : 'New'),
-            ],
-          ),
-          Expanded(
-            child: TabBarView(
+          SizedBox(
+            width: 260,
+            child: Column(
               children: [
-                // Tab 1: Notes List
-                Column(
-                  children: [
-                    if (_loading) const LinearProgressIndicator(minHeight: 2),
-                    Expanded(
-                      child: _notes.isEmpty
-                          ? Center(
-                              child: Text(
-                                'No notes yet. Tap + to create one.',
-                                style: GoogleFonts.inter(color: Colors.white70),
-                              ),
-                            )
-                          : ListView.builder(
-                              itemCount: _notes.length,
-                              itemBuilder: (context, index) {
-                                final note = _notes[index];
-                                final id = (note['id'] as num).toInt();
-                                final isActive = id == selected;
-                                return ListTile(
-                                  selected: isActive,
-                                  title: Text(note['title']?.toString() ?? 'Untitled',
-                                      maxLines: 1, overflow: TextOverflow.ellipsis),
-                                  subtitle: Text(
-                                    (note['updated_at']?.toString() ?? '').split('T').first,
-                                    style: const TextStyle(fontSize: 12),
-                                  ),
-                                  onTap: () => _openNote(id),
-                                );
-                              },
-                            ),
-                    )
-                  ],
-                ),
-                // Tab 2: Editor
-                selected == null
-                    ? Center(
-                        child: Text(
-                          'Create or select a note',
-                          style: GoogleFonts.inter(color: Colors.white70),
+                if (_loading) const LinearProgressIndicator(minHeight: 2),
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: _notes.length,
+                    itemBuilder: (context, index) {
+                      final note = _notes[index];
+                      final id = note['id'].toString();
+                      final isActive = id == _activeNoteId;
+                      return ListTile(
+                        selected: isActive,
+                        title: Text(note['title']?.toString() ?? 'Untitled'),
+                        subtitle: Text(
+                          (note['updated_at']?.toString() ?? '').split('T').first,
+                          style: const TextStyle(fontSize: 12),
                         ),
-                      )
-                    : _buildNoteEditor(),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDesktopLayout(int? selected) {
-    return Row(
-      children: [
-        SizedBox(
-          width: 260,
-          child: Column(
-            children: [
-              if (_loading) const LinearProgressIndicator(minHeight: 2),
-              Expanded(
-                child: ListView.builder(
-                  itemCount: _notes.length,
-                  itemBuilder: (context, index) {
-                    final note = _notes[index];
-                    final id = (note['id'] as num).toInt();
-                    final isActive = id == selected;
-                    return ListTile(
-                      selected: isActive,
-                      title: Text(note['title']?.toString() ?? 'Untitled'),
-                      subtitle: Text(
-                        (note['updated_at']?.toString() ?? '').split('T').first,
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                      onTap: () => _openNote(id),
-                    );
-                  },
-                ),
-              )
-            ],
-          ),
-        ),
-        const VerticalDivider(width: 1),
-        Expanded(
-          child: selected == null
-              ? Center(
-                  child: Text(
-                    'Create or select a note',
-                    style: GoogleFonts.inter(color: Colors.white70),
+                        onTap: () => _openNote(id),
+                      );
+                    },
                   ),
                 )
-              : _buildNoteEditor(),
-        )
-      ],
-    );
-  }
-
-  Widget _buildNoteEditor() {
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          TextField(
-            controller: _titleController,
-            style: GoogleFonts.inter(fontSize: 20, fontWeight: FontWeight.w600),
-            decoration: const InputDecoration(hintText: 'Note title'),
+              ],
+            ),
           ),
-          const SizedBox(height: 10),
+          const VerticalDivider(width: 1),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  children: [
-                    TextButton(
-                      onPressed: () => setState(() => _previewMode = false),
-                      child: Text('Edit', style: TextStyle(fontWeight: !_previewMode ? FontWeight.bold : FontWeight.normal)),
-                    ),
-                    TextButton(
-                      onPressed: () => setState(() {
-                        _previewMode = true;
-                        _saveNote();
-                      }),
-                      child: Text('Preview', style: TextStyle(fontWeight: _previewMode ? FontWeight.bold : FontWeight.normal)),
-                    ),
-                    if (!_previewMode) ...[
-                      const SizedBox(height: 24, child: VerticalDivider()),
-                      IconButton(icon: const Icon(Icons.format_bold, size: 18), onPressed: () => _insertMarkdown('**', '**'), tooltip: 'Bold'),
-                      IconButton(icon: const Icon(Icons.format_italic, size: 18), onPressed: () => _insertMarkdown('*', '*'), tooltip: 'Italic'),
-                      IconButton(icon: const Icon(Icons.format_list_bulleted, size: 18), onPressed: () => _insertMarkdown('\n- ', ''), tooltip: 'Bullet List'),
-                      IconButton(icon: const Icon(Icons.format_list_numbered, size: 18), onPressed: () => _insertMarkdown('\n1. ', ''), tooltip: 'Numbered List'),
-                      IconButton(icon: const Icon(Icons.code, size: 18), onPressed: () => _insertMarkdown('`', '`'), tooltip: 'Code'),
-                      IconButton(icon: const Icon(Icons.link, size: 18), onPressed: () => _insertMarkdown('[', '](url)'), tooltip: 'Link'),
-                    ],
-                  ],
-                ),
-                Expanded(
-                  child: _previewMode
-                      ? Container(
-                          decoration: BoxDecoration(border: Border.all(color: Colors.white24)),
-                          child: Markdown(
-                            data: _contentController.text.isEmpty ? 'Nothing to preview' : _contentController.text,
-                            sizedImageBuilder: (config) {
-                              if (config.uri.scheme == 'asset') {
-                                final parsedWidth =
-                                    _parseImageWidth(config.title, fallback: 480)
-                                        .toDouble();
-                                return FutureBuilder<String>(
-                                  future: _getAssetLink(config.uri.path),
-                                  builder: (ctx, snap) {
-                                    if (!snap.hasData || snap.data!.isEmpty) {
-                                      return const SizedBox(height: 50, width: 50, child: Center(child: CircularProgressIndicator()));
-                                    }
-                                    return Image.network(
-                                      snap.data!,
-                                      width: parsedWidth,
-                                      fit: BoxFit.contain,
-                                    );
-                                  }
-                                );
-                              }
-                              return Image.network(
-                                config.uri.toString(),
-                                width: config.width,
-                                height: config.height,
-                                fit: BoxFit.contain,
-                              );
-                            },
-                          ),
-                        )
-                      : TextField(
-                          controller: _contentController,
-                          expands: true,
-                          minLines: null,
-                          maxLines: null,
-                          textAlignVertical: TextAlignVertical.top,
-                          decoration: const InputDecoration(
-                            hintText: 'Write text, paste/drag image files, then click image preview chips below to resize.',
-                            border: OutlineInputBorder(),
-                          ),
-                        ),
-                ),
-              ],
-            ),
-          ),
-          if (!_previewMode) ...[
-            const SizedBox(height: 8),
-            Text('Inline image preview (tap image to resize)',
-                style: GoogleFonts.inter(color: Colors.white70, fontSize: 12)),
-            const SizedBox(height: 6),
-            _buildInlineImagePreviewStrip(),
-          ],
-          const SizedBox(height: 10),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                ElevatedButton.icon(
-                  onPressed: _loading ? null : _attachMedia,
-                  icon: const Icon(Icons.attachment),
-                  label: const Text('Attach Media'),
-                ),
-                const SizedBox(width: 10),
-                Text(
-                  '${_assets.length} attachments',
-                  style: GoogleFonts.inter(color: Colors.white70),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 8),
-          SizedBox(
-            height: 120,
-            child: _assets.isEmpty
+            child: selected == null
                 ? Center(
-                    child: Text('No attachments',
-                        style: GoogleFonts.inter(color: Colors.white54)),
+                    child: Text(
+                      'Create or select a note',
+                      style: GoogleFonts.inter(color: Colors.white70),
+                    ),
                   )
-                : ListView.builder(
-                    itemCount: _assets.length,
-                    itemBuilder: (context, index) {
-                      final asset = _assets[index];
-                      return ListTile(
-                        dense: true,
-                        title: Text(asset['asset_name']?.toString() ?? 'asset', overflow: TextOverflow.ellipsis),
-                        subtitle: Text(asset['mime_type']?.toString() ?? '', overflow: TextOverflow.ellipsis),
-                        trailing: SizedBox(
-                          width: 120,
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
+                : Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        TextField(
+                          controller: _titleController,
+                          style: GoogleFonts.inter(fontSize: 20, fontWeight: FontWeight.w600),
+                          decoration: const InputDecoration(hintText: 'Note title'),
+                        ),
+                        const SizedBox(height: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
-                              Flexible(
-                                child: IconButton(
-                                  icon: const Icon(Icons.open_in_new, color: Colors.blueAccent),
-                                  iconSize: 18,
-                                  onPressed: () => _openAsset(asset),
-                                ),
+                              Row(
+                                children: [
+                                  TextButton(
+                                    onPressed: () => setState(() => _previewMode = false),
+                                    child: Text('Edit', style: TextStyle(fontWeight: !_previewMode ? FontWeight.bold : FontWeight.normal)),
+                                  ),
+                                  TextButton(
+                                    onPressed: () => setState(() {
+                                      _previewMode = true;
+                                      _saveNote(); // Save upon preview to ensure data is fresh
+                                    }),
+                                    child: Text('Preview', style: TextStyle(fontWeight: _previewMode ? FontWeight.bold : FontWeight.normal)),
+                                  ),                                    if (!_previewMode) ...[
+                                      const SizedBox(height: 24, child: VerticalDivider()),
+                                      IconButton(icon: const Icon(Icons.format_bold, size: 18), onPressed: () => _insertMarkdown('**', '**'), tooltip: 'Bold'),
+                                      IconButton(icon: const Icon(Icons.format_italic, size: 18), onPressed: () => _insertMarkdown('*', '*'), tooltip: 'Italic'),
+                                      IconButton(icon: const Icon(Icons.format_list_bulleted, size: 18), onPressed: () => _insertMarkdown('\n- ', ''), tooltip: 'Bullet List'),
+                                      IconButton(icon: const Icon(Icons.format_list_numbered, size: 18), onPressed: () => _insertMarkdown('\n1. ', ''), tooltip: 'Numbered List'),
+                                      IconButton(icon: const Icon(Icons.code, size: 18), onPressed: () => _insertMarkdown('`', '`'), tooltip: 'Code'),
+                                      IconButton(icon: const Icon(Icons.link, size: 18), onPressed: () => _insertMarkdown('[', '](url)'), tooltip: 'Link'),
+                                    ],                                ],
                               ),
-                              Flexible(
-                                child: IconButton(
-                                  icon: const Icon(Icons.photo_size_select_large, color: Colors.amberAccent),
-                                  iconSize: 18,
-                                  onPressed: () => _resizeAssetInNote(asset['asset_name']?.toString() ?? ''),
-                                ),
-                              ),
-                              Flexible(
-                                child: IconButton(
-                                  icon: const Icon(Icons.delete, color: Colors.redAccent),
-                                  iconSize: 18,
-                                  onPressed: () => _deleteAsset(asset),
-                                ),
+                              Expanded(
+                                child: _previewMode 
+                                  ? Container(
+                                      decoration: BoxDecoration(border: Border.all(color: Colors.white24)),
+                                      child: Markdown(
+                                        data: _contentController.text.isEmpty ? 'Nothing to preview' : _contentController.text,
+                                        imageBuilder: (uri, title, alt) {
+                                          final parsedWidth = _parseImageWidth(title, fallback: 480).toDouble();
+                                          if (uri.scheme == 'asset') {
+                                            return FutureBuilder<String>(
+                                              future: _getAssetLink(uri.path),
+                                              builder: (ctx, snap) {
+                                                if (!snap.hasData || snap.data!.isEmpty) {
+                                                  return const SizedBox(height: 50, width: 50, child: Center(child: CircularProgressIndicator()));
+                                                }
+                                                return Image.network(
+                                                  snap.data!,
+                                                  width: parsedWidth,
+                                                  fit: BoxFit.contain,
+                                                );
+                                              }
+                                            );
+                                          }
+                                          return Image.network(
+                                            uri.toString(),
+                                            width: parsedWidth,
+                                            fit: BoxFit.contain,
+                                          );
+                                        },
+                                      ),
+                                    )
+                                  : TextField(
+                                      controller: _contentController,
+                                      expands: true,
+                                      minLines: null,
+                                      maxLines: null,
+                                      textAlignVertical: TextAlignVertical.top,
+                                      decoration: const InputDecoration(
+                                        hintText: 'Write text, paste/drag image files, then click image preview chips below to resize.',
+                                        border: OutlineInputBorder(),
+                                      ),
+                                    ),
                               ),
                             ],
                           ),
                         ),
-                      );
-                    },
+                        const SizedBox(height: 10),
+                        if (!keyboardVisible) ...[
+                          SafeArea(
+                            top: false,
+                            left: false,
+                            right: false,
+                            child: Row(
+                              children: [
+                                ElevatedButton.icon(
+                                  onPressed: _loading ? null : _attachMedia,
+                                  icon: const Icon(Icons.attachment),
+                                  label: const Text('Attach Media'),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    'Drag/drop or paste files here (web)',
+                                    style: GoogleFonts.inter(
+                                        color: Colors.white54, fontSize: 12),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Text(
+                                  '${_assets.length} attachments',
+                                  style: GoogleFonts.inter(color: Colors.white70),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          if (!_previewMode) ...[
+                            Text('Inline image preview (tap image to resize)', style: GoogleFonts.inter(color: Colors.white70, fontSize: 12)),
+                            const SizedBox(height: 6),
+                            _buildInlineImagePreviewStrip(),
+                            const SizedBox(height: 8),
+                          ],
+                          SizedBox(
+                            height: 120,
+                            child: _assets.isEmpty
+                                ? Center(
+                                    child: Text('No attachments',
+                                        style: GoogleFonts.inter(color: Colors.white54)),
+                                  )
+                                : ListView.builder(
+                                    itemCount: _assets.length,
+                                    itemBuilder: (context, index) {
+                                      final asset = _assets[index];
+                                      return ListTile(
+                                        dense: true,
+                                        title: Text(asset['asset_name']?.toString() ?? 'asset', overflow: TextOverflow.ellipsis),
+                                        subtitle: Text(asset['mime_type']?.toString() ?? '', overflow: TextOverflow.ellipsis),
+                                        trailing: SizedBox(
+                                          width: 120,
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Flexible(
+                                                child: IconButton(
+                                                  icon: const Icon(Icons.open_in_new, color: Colors.blueAccent),
+                                                  iconSize: 18,
+                                                  onPressed: () => _openAsset(asset),
+                                                ),
+                                              ),
+                                              Flexible(
+                                                child: IconButton(
+                                                  icon: const Icon(Icons.photo_size_select_large, color: Colors.amberAccent),
+                                                  iconSize: 18,
+                                                  onPressed: () => _resizeAssetInNote(asset['asset_name']?.toString() ?? ''),
+                                                ),
+                                              ),
+                                              Flexible(
+                                                child: IconButton(
+                                                  icon: const Icon(Icons.delete, color: Colors.redAccent),
+                                                  iconSize: 18,
+                                                  onPressed: () => _deleteAsset(asset),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                          ),
+                        ]
+                      ],
+                    ),
                   ),
           )
         ],
